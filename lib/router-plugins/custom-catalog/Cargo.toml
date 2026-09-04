@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "dynamo-custom-policy-catalog"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Custom worker-selection policy catalog: sgl-router-cache-aware + sticky-until-saturated"
+
+[dependencies]
+dynamo-kv-router = { workspace = true, features = ["standalone-selection"] }
+sgl-router-cache-aware-dynamo-policy = { git = "https://github.com/ishandhanani/router-sandbox.git", rev = "593a00d526d75e5d2fd97f27ccc6fcf280ecee98" }
+sticky-until-saturated-dynamo-policy = { git = "https://github.com/ishandhanani/router-sandbox.git", rev = "593a00d526d75e5d2fd97f27ccc6fcf280ecee98" }

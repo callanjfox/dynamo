@@ -14,6 +14,7 @@ members = [
     "lib/kv-router",
     "lib/router-plugins/catalog",
     "lib/router-plugins/builtin",
+    "lib/router-plugins/custom-catalog",
     "examples/router/custom-policy-example/soft-pin-repin",
     "examples/router/custom-policy-example/simple-filter-score-pick",
     "examples/router/custom-policy-example/catalog",
@@ -218,3 +219,12 @@ lto = "thin"
 inherits = "release"
 debug = true
 strip = false
+
+# lib/router-plugins/custom-catalog links two router-sandbox policy crates that each
+# declare their own `dynamo-kv-router = { git = "...", branch = "main" }` dependency,
+# separate from this workspace's local lib/kv-router. Without this patch, Cargo treats
+# those as a different crate instance and the WorkerSelectionPolicyRegistry/
+# WorkerSelectionPolicy types they exchange with our catalog would not unify, causing a
+# type-mismatch compile error. Redirect that git dependency at our in-tree crate instead.
+[patch."https://github.com/ai-dynamo/dynamo.git"]
+dynamo-kv-router = { path = "lib/kv-router" }
