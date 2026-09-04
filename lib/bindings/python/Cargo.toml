@@ -138,3 +138,15 @@ tracing-subscriber = { version = "0.3", features = ["registry"] }
 inherits = "release"
 debug = true
 strip = false
+
+# This crate declares its own empty [workspace] above specifically to exclude itself
+# from the root workspace (pyo3 extension module build issues), so it is a SEPARATE
+# Cargo resolution root — the [patch] in the root Cargo.toml does not apply here.
+# lib/router-plugins/custom-catalog links two router-sandbox policy crates that each
+# declare their own `dynamo-kv-router = { git = "...", branch = "main" }` dependency,
+# separate from this workspace's local ../../kv-router. Without this patch, Cargo
+# treats those as a different crate instance and the WorkerSelectionPolicyRegistry/
+# WorkerSelectionPolicy types they exchange with the catalog do not unify, causing a
+# type-mismatch compile error (confirmed: this broke the first build attempt).
+[patch."https://github.com/ai-dynamo/dynamo.git"]
+dynamo-kv-router = { path = "../../kv-router" }
