@@ -3165,14 +3165,22 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
 
     @staticmethod
     def _cache_loss_engine_data(request_output: RequestOutput) -> Dict[str, Any]:
-        """Expose final cache counters for internal router observability."""
+        """Expose final cache counters for internal router observability.
+
+        vLLM v0.28.0's RequestOutput has no num_local_cached_tokens/
+        num_external_cached_tokens/num_external_lookup_tokens fields (verified
+        against vllm.outputs.RequestOutput.__init__) -- those appear to be a
+        future/fork API this PR was written against. The real internal-cache-hit
+        count on this vLLM version is num_cached_tokens. Without a KV connector
+        doing cross-instance cache sharing, there is nothing to report for the
+        external tiers, so they default to 0 rather than gating completeness.
+        """
         prompt_tokens = getattr(request_output, "prompt_token_ids", None)
-        local_hits = getattr(request_output, "num_local_cached_tokens", None)
-        external_hits = getattr(request_output, "num_external_cached_tokens", None)
-        external_lookups = getattr(request_output, "num_external_lookup_tokens", None)
-        values = (local_hits, external_hits, external_lookups)
-        if prompt_tokens is None or any(not isinstance(value, int) for value in values):
+        local_hits = getattr(request_output, "num_cached_tokens", None)
+        if prompt_tokens is None or not isinstance(local_hits, int):
             return {"complete": False}
+        external_hits = getattr(request_output, "num_external_cached_tokens", 0) or 0
+        external_lookups = getattr(request_output, "num_external_lookup_tokens", 0) or 0
         return {
             "complete": True,
             "prompt_tokens": len(prompt_tokens),
