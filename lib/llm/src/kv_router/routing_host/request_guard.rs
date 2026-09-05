@@ -86,6 +86,20 @@ struct CacheLossWorkerOutcome {
     cpu_lookup_tokens: u64,
 }
 
+#[derive(serde::Deserialize)]
+struct AdmissionTimingWorkerOutcome {
+    complete: bool,
+    /// Engine-frontend wall-clock timestamp (seconds since epoch, float).
+    #[serde(default)]
+    arrival_time: f64,
+    /// Engine-core monotonic timestamps (seconds); only their difference is
+    /// meaningful, never compare these to arrival_time or another process's clock.
+    #[serde(default)]
+    queued_ts: f64,
+    #[serde(default)]
+    scheduled_ts: f64,
+}
+
 pub(super) struct CacheLossTracking {
     route: RouteObservation,
     history: Arc<Mutex<CacheHistory>>,
@@ -102,6 +116,22 @@ impl CacheLossTracking {
             route,
             history,
             request,
+        }
+    }
+}
+
+/// Wall-clock instant (ms since epoch) the router made its routing decision for
+/// this request, carried separately from [`CacheLossTracking`] since it answers
+/// a different question (admission latency, not cache reuse) even though it
+/// rides the same request-scoped, `scheduler_tracked`-gated plumbing.
+pub(super) struct AdmissionTimingTracking {
+    dispatched_at_epoch_ms: u64,
+}
+
+impl AdmissionTimingTracking {
+    pub(super) fn new(dispatched_at_epoch_ms: u64) -> Self {
+        Self {
+            dispatched_at_epoch_ms,
         }
     }
 }
@@ -618,6 +648,8 @@ where
     cache_history: Arc<Mutex<CacheHistory>>,
     cache_history_request: Option<CacheHistoryRequest>,
     cache_history_verified: bool,
+    admission_dispatched_at_epoch_ms: Option<u64>,
+    admission_delay_recorded: bool,
     _lora_load: Option<LoraLoadGuard>,
 }
 
@@ -635,6 +667,7 @@ where
         request: &PreprocessedRequest,
         scheduler_tracked: bool,
         cache_loss_tracking: CacheLossTracking,
+        admission_timing_tracking: AdmissionTimingTracking,
     ) -> Self {
         Self::new_kv_with_cleanup(
             request_metrics,
@@ -642,6 +675,7 @@ where
             request,
             scheduler_tracked,
             cache_loss_tracking,
+            admission_timing_tracking,
         )
     }
 
@@ -651,6 +685,7 @@ where
         request: &PreprocessedRequest,
         scheduler_tracked: bool,
         cache_loss_tracking: CacheLossTracking,
+        admission_timing_tracking: AdmissionTimingTracking,
     ) -> Self {
         let chooser = &cleanup.chooser;
         let block_size = chooser.block_size() as usize;
@@ -691,6 +726,9 @@ where
             cache_history: cache_loss_tracking.history,
             cache_history_request: scheduler_tracked.then_some(cache_loss_tracking.request),
             cache_history_verified: false,
+            admission_dispatched_at_epoch_ms: scheduler_tracked
+                .then_some(admission_timing_tracking.dispatched_at_epoch_ms),
+            admission_delay_recorded: false,
             _lora_load: None,
         }
     }
@@ -725,6 +763,8 @@ where
             cache_history: Arc::new(Mutex::new(CacheHistory::new(32, 1))),
             cache_history_request: None,
             cache_history_verified: false,
+            admission_dispatched_at_epoch_ms: None,
+            admission_delay_recorded: false,
             _lora_load: lora_load,
         }
     }
@@ -846,6 +886,7 @@ where
         }
         self.observability.observe_tokens(new_tokens);
         self.observe_cache_loss_worker_outcome(item);
+        self.observe_admission_timing(item);
         let cumulative_osl = self.observability.cumulative_osl();
         let Some(update) = self.output_blocks.observe(cumulative_osl) else {
             return;
@@ -943,6 +984,51 @@ where
             self.cache_history_verified = true;
         }
         self.cache_loss_recorded = true;
+    }
+
+    /// Record how long this request waited between the router's routing
+    /// decision and vLLM admitting (scheduling) it, once the worker reports
+    /// its own timing on the final chunk. Best-effort: silently skips if the
+    /// worker never sent complete timing data (e.g. an older worker image, or
+    /// a request that errored before generating a final chunk) -- this is a
+    /// latency histogram, not a completeness-tracked funnel, so there is no
+    /// "incomplete" counter to fall back to.
+    fn observe_admission_timing(&mut self, item: &Annotated<LLMEngineOutput>) {
+        if self.admission_delay_recorded {
+            return;
+        }
+        let Some(dispatched_at_epoch_ms) = self.admission_dispatched_at_epoch_ms else {
+            return;
+        };
+        let Some(value) = item
+            .data
+            .as_ref()
+            .and_then(|data| data.engine_data.as_ref())
+            .and_then(|data| data.get("admission_timing"))
+        else {
+            return;
+        };
+        self.admission_delay_recorded = true;
+        let Ok(timing) = serde_json::from_value::<AdmissionTimingWorkerOutcome>(value.clone())
+        else {
+            return;
+        };
+        if !timing.complete {
+            return;
+        }
+        // vLLM-internal queue delay: both timestamps are on vLLM's own monotonic
+        // clock, so this diff is exact regardless of clock sync between processes.
+        let vllm_queue_delay_seconds = (timing.scheduled_ts - timing.queued_ts).max(0.0);
+        // Router-dispatch -> vLLM-arrival leg: both wall-clock, but from two
+        // different processes -- accurate only as far as their clocks agree.
+        let dispatched_at_seconds = dispatched_at_epoch_ms as f64 / 1000.0;
+        let dispatch_to_arrival_seconds = (timing.arrival_time - dispatched_at_seconds).max(0.0);
+        let total_seconds = dispatch_to_arrival_seconds + vllm_queue_delay_seconds;
+        self.observability.request_metrics().observe_admission_delay(
+            dispatch_to_arrival_seconds,
+            vllm_queue_delay_seconds,
+            total_seconds,
+        );
     }
 
     fn record_cache_loss_incomplete(&mut self) {

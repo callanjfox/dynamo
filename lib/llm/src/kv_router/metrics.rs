@@ -865,6 +865,9 @@ pub struct RouterRequestMetrics {
     pub cache_loss_history_capacity_bytes: IntGauge,
     pub cache_loss_history_chunks: IntGauge,
     pub cache_loss_history_oldest_chunk_age_seconds: IntGauge,
+    pub admission_dispatch_to_arrival_seconds: prometheus::Histogram,
+    pub admission_vllm_queue_delay_seconds: prometheus::Histogram,
+    pub admission_delay_seconds: prometheus::Histogram,
 }
 
 static ROUTER_REQUEST_METRICS: OnceLock<Arc<RouterRequestMetrics>> = OnceLock::new();
@@ -1078,6 +1081,32 @@ impl RouterRequestMetrics {
                         extra_labels,
                     )
                     .expect("failed to create router_cache_loss_history_oldest_chunk_age_seconds");
+                // Buckets span 0.5ms (fast path) to 10s (heavily queued) log-scale.
+                let admission_buckets = generate_log_buckets(0.0005, 10.0, 15);
+                let admission_dispatch_to_arrival_seconds = metrics
+                    .create_histogram(
+                        &router_metric("admission_dispatch_to_arrival_seconds"),
+                        "Time from the router's dispatch decision to vLLM's engine-frontend receiving the request (network + dispatch transit). Requires synchronized clocks between router and worker processes.",
+                        extra_labels,
+                        Some(admission_buckets.clone()),
+                    )
+                    .expect("failed to create router_admission_dispatch_to_arrival_seconds");
+                let admission_vllm_queue_delay_seconds = metrics
+                    .create_histogram(
+                        &router_metric("admission_vllm_queue_delay_seconds"),
+                        "Time a request spent in vLLM's own scheduler queue before being admitted (scheduled_ts - queued_ts, vLLM-internal monotonic clock only -- always accurate regardless of clock sync)",
+                        extra_labels,
+                        Some(admission_buckets.clone()),
+                    )
+                    .expect("failed to create router_admission_vllm_queue_delay_seconds");
+                let admission_delay_seconds = metrics
+                    .create_histogram(
+                        &router_metric("admission_delay_seconds"),
+                        "Total time from the router's routing decision to vLLM admitting (scheduling) the request: dispatch_to_arrival + vllm_queue_delay",
+                        extra_labels,
+                        Some(admission_buckets),
+                    )
+                    .expect("failed to create router_admission_delay_seconds");
                 Arc::new(Self {
                     requests_total,
                     time_to_first_token_seconds,
@@ -1100,6 +1129,9 @@ impl RouterRequestMetrics {
                     cache_loss_history_capacity_bytes,
                     cache_loss_history_chunks,
                     cache_loss_history_oldest_chunk_age_seconds,
+                    admission_dispatch_to_arrival_seconds,
+                    admission_vllm_queue_delay_seconds,
+                    admission_delay_seconds,
                 })
             })
             .clone()
@@ -1119,6 +1151,24 @@ impl RouterRequestMetrics {
     pub fn observe_cache_loss_input(&self, prompt_tokens: u64) {
         self.cache_loss_observation_input_tokens_total
             .inc_by(prompt_tokens);
+    }
+
+    /// Record end-to-end admission timing for one request: how long it took
+    /// from the router's routing decision to vLLM admitting (scheduling) it,
+    /// split into the cross-process (dispatch-to-arrival) and vLLM-internal
+    /// (queue) legs so a spike can be attributed to network/dispatch overhead
+    /// versus the worker's own scheduler being backed up.
+    pub fn observe_admission_delay(
+        &self,
+        dispatch_to_arrival_seconds: f64,
+        vllm_queue_delay_seconds: f64,
+        total_seconds: f64,
+    ) {
+        self.admission_dispatch_to_arrival_seconds
+            .observe(dispatch_to_arrival_seconds);
+        self.admission_vllm_queue_delay_seconds
+            .observe(vllm_queue_delay_seconds);
+        self.admission_delay_seconds.observe(total_seconds);
     }
 
     pub fn observe_cache_loss_funnel(&self, stages: [u64; CACHE_LOSS_FUNNEL_STAGES.len()]) {

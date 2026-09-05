@@ -3190,6 +3190,35 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         }
 
     @staticmethod
+    def _admission_timing_engine_data(request_output: RequestOutput) -> Dict[str, Any]:
+        """Expose vLLM's own per-request admission timing for router-side latency
+        accounting -- how long a request sat in vLLM's queue before being admitted
+        (scheduled), so the router can report end-to-end time from its routing
+        decision to vLLM actually starting on the request.
+
+        request_output.metrics (vllm.v1.metrics.stats.RequestStateStats) already
+        carries this: arrival_time is an engine-frontend wall-clock timestamp
+        (comparable across processes, assuming synchronized clocks -- true within
+        a cluster under normal NTP/chrony operation); queued_ts/scheduled_ts are
+        engine-core *monotonic* timestamps, safe to diff against each other but
+        not against arrival_time or any other process's clock.
+        """
+        metrics = getattr(request_output, "metrics", None)
+        arrival_time = getattr(metrics, "arrival_time", None) if metrics else None
+        queued_ts = getattr(metrics, "queued_ts", None) if metrics else None
+        scheduled_ts = getattr(metrics, "scheduled_ts", None) if metrics else None
+        # RequestStateStats defaults these to 0.0 rather than None when unset.
+        values = (arrival_time, queued_ts, scheduled_ts)
+        if any(not isinstance(v, float) or v <= 0.0 for v in values):
+            return {"complete": False}
+        return {
+            "complete": True,
+            "arrival_time": arrival_time,
+            "queued_ts": queued_ts,
+            "scheduled_ts": scheduled_ts,
+        }
+
+    @staticmethod
     def _extract_logprobs(
         output, num_output_tokens_so_far: int, tokenizer=None
     ) -> tuple[list[float] | None, list[list[dict]] | None]:
@@ -3360,6 +3389,9 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                         out.setdefault("engine_data", {})[
                             "cache_loss"
                         ] = BaseWorkerHandler._cache_loss_engine_data(res)
+                        out.setdefault("engine_data", {})[
+                            "admission_timing"
+                        ] = BaseWorkerHandler._admission_timing_engine_data(res)
                         if prompt_logprobs_payload is not None:
                             _attach_prompt_logprobs_engine_data(
                                 out, prompt_logprobs_payload

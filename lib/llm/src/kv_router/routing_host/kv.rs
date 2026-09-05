@@ -5,7 +5,10 @@ use super::*;
 use crate::kv_router::{
     FindBestMatchAdmission,
     minimal_cache_loss::{CacheHistoryRequest, RouteObservation},
-    routing_host::{kv_selection::SelectionOutcome, request_guard::CacheLossTracking},
+    routing_host::{
+        kv_selection::SelectionOutcome,
+        request_guard::{AdmissionTimingTracking, CacheLossTracking},
+    },
 };
 
 impl<Sel> RoutingHost<Sel>
@@ -370,6 +373,13 @@ where
             selected_router_tokens: selection.cached_tokens as u64,
         }
         .bounded();
+        // Wall-clock (not Instant -- this crosses into the worker's process for the
+        // admission-delay metric, so it needs an epoch, not a process-local monotonic
+        // clock) snapshot of the routing decision, for admission-delay accounting.
+        let dispatched_at_epoch_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         let mut guard = match cleanup {
             Some(cleanup) => RequestGuard::new_kv_with_cleanup(
                 self.request_metrics.clone(),
@@ -381,6 +391,7 @@ where
                     Arc::clone(cache_history),
                     cache_history_request,
                 ),
+                AdmissionTimingTracking::new(dispatched_at_epoch_ms),
             ),
             None => RequestGuard::new_kv(
                 Arc::clone(chooser),
@@ -395,6 +406,7 @@ where
                     Arc::clone(cache_history),
                     cache_history_request,
                 ),
+                AdmissionTimingTracking::new(dispatched_at_epoch_ms),
             ),
         };
 

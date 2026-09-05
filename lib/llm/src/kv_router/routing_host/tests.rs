@@ -35,7 +35,7 @@ use crate::{
     kv_router::{
         RoutingLoadContext,
         minimal_cache_loss::{CacheHistory, CacheHistoryRequest, RouteObservation},
-        routing_host::request_guard::CacheLossTracking,
+        routing_host::request_guard::{AdmissionTimingTracking, CacheLossTracking},
     },
     local_model::runtime_config::ModelRuntimeConfig,
     lora::{LoraReplicaConfig, LoraRoutingTable, LoraStateTracker},
@@ -68,6 +68,10 @@ fn untracked_cache_loss_tracking() -> CacheLossTracking {
         Arc::new(parking_lot::Mutex::new(CacheHistory::new(1, 1))),
         CacheHistoryRequest::new(vec![], None, None, None, 1, false),
     )
+}
+
+fn untracked_admission_timing_tracking() -> AdmissionTimingTracking {
+    AdmissionTimingTracking::new(0)
 }
 
 async fn test_load_context(client: &Client) -> Arc<RoutingLoadContext> {
@@ -724,6 +728,7 @@ async fn terminal_item_does_not_skip_transport_eof() {
             Arc::new(parking_lot::Mutex::new(CacheHistory::new(1, 1))),
             CacheHistoryRequest::new(vec![1], None, None, None, 1, false),
         ),
+        untracked_admission_timing_tracking(),
     );
     let monitored = monitor_response_stream(source, context, guard);
     tokio::pin!(monitored);
@@ -795,6 +800,7 @@ async fn shutdown_cancellation_drains_trailing_engine_shutdown_error() {
         &request(),
         false,
         untracked_cache_loss_tracking(),
+        untracked_admission_timing_tracking(),
     );
     let monitored = monitor_response_stream(source, context, guard);
     tokio::pin!(monitored);
@@ -843,6 +849,7 @@ async fn client_cancellation_still_ends_stream_without_draining() {
         &request(),
         false,
         untracked_cache_loss_tracking(),
+        untracked_admission_timing_tracking(),
     );
     let monitored = monitor_response_stream(source, context, guard);
     tokio::pin!(monitored);
@@ -883,6 +890,7 @@ async fn drain_without_trailing_error_gives_up_at_the_deadline() {
         &request(),
         false,
         untracked_cache_loss_tracking(),
+        untracked_admission_timing_tracking(),
     );
     let monitored = monitor_response_stream(source, context, guard);
     tokio::pin!(monitored);
@@ -940,6 +948,7 @@ async fn trailing_error_within_the_drain_window_still_reaches_migration() {
         &request(),
         false,
         untracked_cache_loss_tracking(),
+        untracked_admission_timing_tracking(),
     );
     let monitored = monitor_response_stream(source, context, guard);
     tokio::pin!(monitored);
@@ -988,6 +997,7 @@ async fn always_ready_terminals_cannot_starve_the_drain_deadline() {
         &request(),
         false,
         untracked_cache_loss_tracking(),
+        untracked_admission_timing_tracking(),
     );
     let monitored = monitor_response_stream(source, context, guard);
     tokio::pin!(monitored);
