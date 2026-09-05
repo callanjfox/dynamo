@@ -577,7 +577,13 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
         }
     }
 
-    pub(crate) async fn worker_lookup_stats(&self) -> WorkerLookupStats {
+    /// Live per-worker block counts from the real routing index, fed directly
+    /// by KV add/remove events - not test-only, not bounded by any separate
+    /// byte budget. `pub` (not `pub(crate)`) so lib/llm can sample this on an
+    /// interval for a Prometheus gauge; each call round-trips through every
+    /// worker's event-processing task, so callers should poll on a multi-second
+    /// interval rather than per-request.
+    pub async fn worker_lookup_stats(&self) -> WorkerLookupStats {
         let mut receivers = Vec::new();
         for channel in &self.worker_event_channels {
             let (resp_tx, resp_rx) = oneshot::channel();

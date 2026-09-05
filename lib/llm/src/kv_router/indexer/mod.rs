@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use dynamo_kv_router::{
@@ -127,6 +127,72 @@ async fn dump_local_events(
         }));
     }
     Ok(events)
+}
+
+/// Samples the router's REAL live routing index - not the bounded cache-loss
+/// history ledger (`CacheHistory`, dynamo_component_router_cache_loss_history_*,
+/// a fixed byte budget unrelated to GPU state), and not the retired
+/// `kv_cache_events_applied` event counter (drifted under duplicate-store
+/// events) - and publishes it as a Prometheus gauge, in tokens, per worker.
+/// `worker_lookup_stats()` round-trips through every worker's event-processing
+/// task, so this samples on a multi-second interval rather than per-event or
+/// per-request, keeping the overhead off the request-handling hot path.
+fn spawn_live_index_gauge_sampler(
+    component: &Component,
+    primary: Arc<ThreadPoolIndexer<ConcurrentRadixTreeCompressed>>,
+    block_size: u32,
+    cancellation_token: CancellationToken,
+) {
+    let gauge = match component.metrics().create_intgaugevec(
+        "router_live_index_tokens",
+        "Live KV blocks tracked by the router's real routing index, per worker, in tokens \
+         (block_count x block_size). Fed directly by KV add/remove events - the router's \
+         actual current view of fleet residency, distinct from the bounded cache-loss \
+         history ledger (dynamo_component_router_cache_loss_history_*), which answers a \
+         different question and is not tied to real GPU state.",
+        &["worker_id", "dp_rank"],
+        &[],
+    ) {
+        Ok(gauge) => gauge,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to create router_live_index_tokens gauge: {e}. Live index size will not be exported."
+            );
+            return;
+        }
+    };
+
+    tokio::spawn(async move {
+        let mut known_workers: HashSet<(u64, u32)> = HashSet::new();
+        loop {
+            tokio::select! {
+                _ = cancellation_token.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+            }
+            let stats = primary.worker_lookup_stats().await;
+            let mut seen_this_round: HashSet<(u64, u32)> = HashSet::new();
+            for (worker, block_count) in &stats.worker_blocks {
+                let key = (worker.worker_id, worker.dp_rank);
+                seen_this_round.insert(key);
+                known_workers.insert(key);
+                let tokens = (*block_count as u64).saturating_mul(u64::from(block_size));
+                gauge
+                    .with_label_values(&[&worker.worker_id.to_string(), &worker.dp_rank.to_string()])
+                    .set(tokens as i64);
+            }
+            // A worker with a genuinely empty index (fully evicted, or gone) is
+            // filtered out of `worker_blocks` entirely (see
+            // WorkerLookupStats::from_worker_block_counts) - without this, its
+            // gauge would silently freeze at its last nonzero value forever
+            // instead of correctly reading 0.
+            for (worker_id, dp_rank) in known_workers.difference(&seen_this_round) {
+                gauge
+                    .with_label_values(&[&worker_id.to_string(), &dp_rank.to_string()])
+                    .set(0);
+            }
+            known_workers = seen_this_round;
+        }
+    });
 }
 
 impl Indexer {
@@ -286,13 +352,20 @@ impl Indexer {
 
         if kv_router_config.router_event_threads > 1 {
             let kv_indexer_metrics = KvIndexerMetrics::from_component(component);
+            let primary = Arc::new(ThreadPoolIndexer::new_with_metrics(
+                ConcurrentRadixTreeCompressed::new(),
+                kv_router_config.router_event_threads as usize,
+                block_size,
+                Some(kv_indexer_metrics.clone()),
+            ));
+            spawn_live_index_gauge_sampler(
+                component,
+                primary.clone(),
+                block_size,
+                cancellation_token.child_token(),
+            );
             return Ok(Self::Concurrent {
-                primary: Arc::new(ThreadPoolIndexer::new_with_metrics(
-                    ConcurrentRadixTreeCompressed::new(),
-                    kv_router_config.router_event_threads as usize,
-                    block_size,
-                    Some(kv_indexer_metrics.clone()),
-                )),
+                primary,
                 lower_tier: LowerTierIndexers::new_with_metrics(
                     kv_router_config.router_event_threads as usize,
                     block_size,
