@@ -25,6 +25,7 @@ pub(crate) use dynamo_kv_router::indexer::TieredMatchDetails;
 #[allow(unused_imports)]
 pub(crate) use dynamo_kv_router::indexer::WireTieredMatchDetails;
 use dynamo_runtime::component::Component;
+use dynamo_runtime::metrics::MetricsHierarchy;
 use tokio_util::sync::CancellationToken;
 
 mod embedding_cache;
