@@ -151,7 +151,13 @@ fn spawn_live_index_gauge_sampler(
          actual current view of fleet residency, distinct from the bounded cache-loss \
          history ledger (dynamo_component_router_cache_loss_history_*), which answers a \
          different question and is not tied to real GPU state.",
-        &["worker_id", "dp_rank"],
+        // NOT "worker_id" - that name is auto-injected as a const label
+        // identifying this component (the router/frontend) itself, and
+        // collides with any variable label of the same name (confirmed live:
+        // "Variable label name 'worker_id' conflicts with auto-injected const
+        // label"). "kv_worker_id" names the downstream vLLM worker this
+        // gauge is actually about, which is a different thing entirely.
+        &["kv_worker_id", "dp_rank"],
         &[],
     ) {
         Ok(gauge) => gauge,
