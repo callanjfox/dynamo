@@ -202,6 +202,88 @@ fn spawn_live_index_gauge_sampler(
     });
 }
 
+/// Samples fleet-wide KV-cache redundancy from the router's live index - how
+/// much of what's tracked is duplicated across workers versus genuinely
+/// unique, which a raw per-worker capacity/usage number can't distinguish
+/// (a fleet that "looks" 75% full could be 75% unique content, or a much
+/// smaller unique set duplicated several times over - e.g. a session
+/// getting hopped between workers a lot, leaving its prefix re-materialized
+/// on each one). Diagnostic-only: `ConcurrentRadixTreeCompressed::
+/// redundancy_stats` walks the whole tree (see its own doc comment), so
+/// this samples far less often than `spawn_live_index_gauge_sampler`'s 3s -
+/// 30s keeps the walk's cost off anything latency-sensitive while still
+/// being live enough to watch during a benchmark run. Has not been through
+/// this crate's AGENTS.md-mandated benchmark pass or review; not cleared
+/// for a production-scale deployment.
+fn spawn_kv_redundancy_gauge_sampler(
+    component: &Component,
+    primary: Arc<ThreadPoolIndexer<ConcurrentRadixTreeCompressed>>,
+    cancellation_token: CancellationToken,
+) {
+    let metrics = component.metrics();
+    let distinct_blocks_gauge = match metrics.create_intgauge(
+        "router_kv_index_distinct_blocks",
+        "Distinct KV blocks tracked anywhere in the fleet's live routing index - the unique-content \
+         denominator for router_kv_index_total_block_copies. Diagnostic-only, sampled on a slow \
+         background interval; not yet benchmarked at production scale.",
+        &[],
+    ) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to create router_kv_index_distinct_blocks gauge: {e}. KV redundancy will not be exported."
+            );
+            return;
+        }
+    };
+    let total_copies_gauge = match metrics.create_intgauge(
+        "router_kv_index_total_block_copies",
+        "Sum, across every distinct tracked block, of how many workers hold a copy of it - equal \
+         to router_kv_index_distinct_blocks when nothing in the fleet is duplicated, higher means \
+         real duplication (e.g. a session's prefix re-materializing on a second worker after a \
+         router hop). Diagnostic-only, sampled on a slow background interval.",
+        &[],
+    ) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to create router_kv_index_total_block_copies gauge: {e}. KV redundancy will not be exported."
+            );
+            return;
+        }
+    };
+    let redundancy_ratio_gauge = match metrics.create_gauge(
+        "router_kv_index_redundancy_ratio",
+        "router_kv_index_total_block_copies / router_kv_index_distinct_blocks - 1.0 means no \
+         duplication anywhere in the fleet, 2.0 means the average tracked block exists on two \
+         workers, etc. Diagnostic-only, sampled on a slow background interval.",
+        &[],
+    ) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to create router_kv_index_redundancy_ratio gauge: {e}. KV redundancy will not be exported."
+            );
+            return;
+        }
+    };
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancellation_token.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+            }
+            let stats = primary.redundancy_stats();
+            distinct_blocks_gauge.set(stats.distinct_blocks as i64);
+            total_copies_gauge.set(stats.total_block_copies as i64);
+            if let Some(ratio) = stats.redundancy_ratio() {
+                redundancy_ratio_gauge.set(ratio);
+            }
+        }
+    });
+}
+
 impl Indexer {
     /// Publish a control-plane projection snapshot for subsequent lookups.
     ///
@@ -369,6 +451,11 @@ impl Indexer {
                 component,
                 primary.clone(),
                 block_size,
+                cancellation_token.child_token(),
+            );
+            spawn_kv_redundancy_gauge_sampler(
+                component,
+                primary.clone(),
                 cancellation_token.child_token(),
             );
             return Ok(Self::Concurrent {

@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{
     AnchorRef, AnchorTask, EventKind, EventWarningKind, KvIndexerMetrics, KvRouterError,
-    MatchDetails, PreBoundEventCounters, SyncIndexer, WorkerLookupStats, WorkerTask,
+    MatchDetails, PreBoundEventCounters, RedundancyStats, SyncIndexer, WorkerLookupStats,
+    WorkerTask,
 };
 use crate::cleanup::{CleanupGuard, CleanupState};
 use crate::lookup_update::update_arc_lookup_for_keys;
@@ -30,6 +31,7 @@ use types::*;
 
 mod dump;
 mod matches;
+mod redundancy;
 mod remove;
 mod repair;
 mod store;

@@ -18,8 +18,8 @@ use tokio::sync::oneshot;
 use super::{
     ApproximateLruClient, ApproximateLruCommandSink, ApproximateLruIncarnation,
     ApproximateLruLease, ApproximateLruStats, ApproximateLruTask, ApproximateRetentionConfig,
-    KvIndexerInterface, KvIndexerMetrics, KvRouterError, ShardSizeSnapshot, SyncIndexer,
-    WorkerLookupStats, WorkerTask, panic_payload_message,
+    KvIndexerInterface, KvIndexerMetrics, KvRouterError, RedundancyStats, ShardSizeSnapshot,
+    SyncIndexer, WorkerLookupStats, WorkerTask, panic_payload_message,
 };
 #[cfg(feature = "bench")]
 use super::{
@@ -1094,6 +1094,18 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
     ) -> Result<(), KvRouterError> {
         self.record_routing_decision_hashes(worker, local_hashes, sequence_hashes)
             .await
+    }
+}
+
+// Concretely-typed (not generic over T: SyncIndexer) since redundancy_stats
+// is only implemented for ConcurrentRadixTreeCompressed - a synchronous,
+// direct read of the shared backend (no per-worker-thread round-trip like
+// worker_lookup_stats needs, since this walks the one shared tree directly
+// rather than each thread's own local reverse-lookup map). Diagnostic-only,
+// see redundancy.rs's own doc comment for the caveats.
+impl ThreadPoolIndexer<super::concurrent_radix_tree_compressed::ConcurrentRadixTreeCompressed> {
+    pub fn redundancy_stats(&self) -> RedundancyStats {
+        self.backend.redundancy_stats()
     }
 }
 
