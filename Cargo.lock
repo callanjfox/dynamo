@@ -2460,6 +2460,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dynamo-custom-policy-catalog"
+version = "1.5.0"
+dependencies = [
+ "dynamo-kv-router",
+ "sgl-router-cache-aware-dynamo-policy",
+ "sticky-until-saturated-dynamo-policy",
+]
+
+[[package]]
 name = "dynamo-custom-policy-example-catalog"
 version = "1.5.0"
 dependencies = [
@@ -8938,6 +8947,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sgl-router-cache-aware-dynamo-policy"
+version = "0.1.0"
+source = "git+https://github.com/ishandhanani/router-sandbox.git?rev=593a00d526d75e5d2fd97f27ccc6fcf280ecee98#593a00d526d75e5d2fd97f27ccc6fcf280ecee98"
+dependencies = [
+ "dynamo-kv-router",
+]
+
+[[package]]
 name = "sha1"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9207,6 +9224,16 @@ checksum = "cffa8a2e517b4e9f270c47e1c4120df90506d9451c1efa67e3698d66446d30ce"
 dependencies = [
  "libc",
  "winapi",
+]
+
+[[package]]
+name = "sticky-until-saturated-dynamo-policy"
+version = "0.1.0"
+source = "git+https://github.com/ishandhanani/router-sandbox.git?rev=593a00d526d75e5d2fd97f27ccc6fcf280ecee98#593a00d526d75e5d2fd97f27ccc6fcf280ecee98"
+dependencies = [
+ "dynamo-kv-router",
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
