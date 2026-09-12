@@ -218,28 +218,31 @@ fn spawn_live_index_gauge_sampler(
 fn spawn_kv_redundancy_gauge_sampler(
     component: &Component,
     primary: Arc<ThreadPoolIndexer<ConcurrentRadixTreeCompressed>>,
+    block_size: u32,
     cancellation_token: CancellationToken,
 ) {
     let metrics = component.metrics();
-    let distinct_blocks_gauge = match metrics.create_intgauge(
-        "router_kv_index_distinct_blocks",
-        "Distinct KV blocks tracked anywhere in the fleet's live routing index - the unique-content \
-         denominator for router_kv_index_total_block_copies. Diagnostic-only, sampled on a slow \
-         background interval; not yet benchmarked at production scale.",
+    let distinct_tokens_gauge = match metrics.create_intgauge(
+        "router_kv_index_distinct_tokens",
+        "Distinct KV content tracked anywhere in the fleet's live routing index, in tokens \
+         (distinct_blocks x block_size) - the unique-content denominator for \
+         router_kv_index_total_token_copies. Diagnostic-only, sampled on a slow background \
+         interval; not yet benchmarked at production scale.",
         &[],
     ) {
         Ok(g) => g,
         Err(e) => {
             tracing::warn!(
-                "Failed to create router_kv_index_distinct_blocks gauge: {e}. KV redundancy will not be exported."
+                "Failed to create router_kv_index_distinct_tokens gauge: {e}. KV redundancy will not be exported."
             );
             return;
         }
     };
     let total_copies_gauge = match metrics.create_intgauge(
-        "router_kv_index_total_block_copies",
-        "Sum, across every distinct tracked block, of how many workers hold a copy of it - equal \
-         to router_kv_index_distinct_blocks when nothing in the fleet is duplicated, higher means \
+        "router_kv_index_total_token_copies",
+        "Sum, across every distinct tracked block's token content, of how many workers hold a \
+         copy of it (total_block_copies x block_size) - equal to \
+         router_kv_index_distinct_tokens when nothing in the fleet is duplicated, higher means \
          real duplication (e.g. a session's prefix re-materializing on a second worker after a \
          router hop). Diagnostic-only, sampled on a slow background interval.",
         &[],
@@ -247,16 +250,17 @@ fn spawn_kv_redundancy_gauge_sampler(
         Ok(g) => g,
         Err(e) => {
             tracing::warn!(
-                "Failed to create router_kv_index_total_block_copies gauge: {e}. KV redundancy will not be exported."
+                "Failed to create router_kv_index_total_token_copies gauge: {e}. KV redundancy will not be exported."
             );
             return;
         }
     };
     let redundancy_ratio_gauge = match metrics.create_gauge(
         "router_kv_index_redundancy_ratio",
-        "router_kv_index_total_block_copies / router_kv_index_distinct_blocks - 1.0 means no \
-         duplication anywhere in the fleet, 2.0 means the average tracked block exists on two \
-         workers, etc. Diagnostic-only, sampled on a slow background interval.",
+        "router_kv_index_total_token_copies / router_kv_index_distinct_tokens - 1.0 means no \
+         duplication anywhere in the fleet, 2.0 means the average tracked content exists on two \
+         workers, etc. block_size cancels out of this ratio, so it reads identically whether \
+         computed from tokens or blocks. Diagnostic-only, sampled on a slow background interval.",
         &[],
     ) {
         Ok(g) => g,
@@ -275,8 +279,10 @@ fn spawn_kv_redundancy_gauge_sampler(
                 _ = tokio::time::sleep(Duration::from_secs(30)) => {}
             }
             let stats = primary.redundancy_stats();
-            distinct_blocks_gauge.set(stats.distinct_blocks as i64);
-            total_copies_gauge.set(stats.total_block_copies as i64);
+            let distinct_tokens = stats.distinct_blocks.saturating_mul(u64::from(block_size));
+            let total_token_copies = stats.total_block_copies.saturating_mul(u64::from(block_size));
+            distinct_tokens_gauge.set(distinct_tokens as i64);
+            total_copies_gauge.set(total_token_copies as i64);
             if let Some(ratio) = stats.redundancy_ratio() {
                 redundancy_ratio_gauge.set(ratio);
             }
@@ -307,38 +313,40 @@ fn spawn_kv_redundancy_gauge_sampler(
 fn spawn_lower_tier_redundancy_gauge_sampler(
     component: &Component,
     lower_tier: LowerTierIndexers,
+    block_size: u32,
     cancellation_token: CancellationToken,
 ) {
     let metrics = component.metrics();
-    let distinct_blocks_gauge = match metrics.create_intgauge(
-        "router_kv_index_distinct_blocks_host_pinned",
-        "Distinct KV blocks tracked in the fleet's host-pinned (secondary-cache, e.g. KVCR G2) \
-         lower-tier index - the unique-content denominator for \
-         router_kv_index_total_block_copies_host_pinned. Diagnostic-only, sampled on a slow \
-         background interval; not yet benchmarked at production scale.",
+    let distinct_tokens_gauge = match metrics.create_intgauge(
+        "router_kv_index_distinct_tokens_host_pinned",
+        "Distinct KV content tracked in the fleet's host-pinned (secondary-cache, e.g. KVCR G2) \
+         lower-tier index, in tokens (distinct_blocks x block_size) - the unique-content \
+         denominator for router_kv_index_total_token_copies_host_pinned. Diagnostic-only, \
+         sampled on a slow background interval; not yet benchmarked at production scale.",
         &[],
     ) {
         Ok(g) => g,
         Err(e) => {
             tracing::warn!(
-                "Failed to create router_kv_index_distinct_blocks_host_pinned gauge: {e}. \
+                "Failed to create router_kv_index_distinct_tokens_host_pinned gauge: {e}. \
                  Lower-tier KV redundancy will not be exported."
             );
             return;
         }
     };
     let total_copies_gauge = match metrics.create_intgauge(
-        "router_kv_index_total_block_copies_host_pinned",
-        "Sum, across every distinct tracked host-pinned-tier block, of how many workers hold a \
-         copy of it - equal to router_kv_index_distinct_blocks_host_pinned when nothing in the \
-         fleet's host-pinned tier is duplicated, higher means real duplication. \
-         Diagnostic-only, sampled on a slow background interval.",
+        "router_kv_index_total_token_copies_host_pinned",
+        "Sum, across every distinct tracked host-pinned-tier block's token content, of how many \
+         workers hold a copy of it (total_block_copies x block_size) - equal to \
+         router_kv_index_distinct_tokens_host_pinned when nothing in the fleet's host-pinned \
+         tier is duplicated, higher means real duplication. Diagnostic-only, sampled on a slow \
+         background interval.",
         &[],
     ) {
         Ok(g) => g,
         Err(e) => {
             tracing::warn!(
-                "Failed to create router_kv_index_total_block_copies_host_pinned gauge: {e}. \
+                "Failed to create router_kv_index_total_token_copies_host_pinned gauge: {e}. \
                  Lower-tier KV redundancy will not be exported."
             );
             return;
@@ -346,10 +354,11 @@ fn spawn_lower_tier_redundancy_gauge_sampler(
     };
     let redundancy_ratio_gauge = match metrics.create_gauge(
         "router_kv_index_redundancy_ratio_host_pinned",
-        "router_kv_index_total_block_copies_host_pinned / \
-         router_kv_index_distinct_blocks_host_pinned - 1.0 means no duplication anywhere in the \
-         fleet's host-pinned tier, 2.0 means the average tracked block exists on two workers, \
-         etc. Diagnostic-only, sampled on a slow background interval.",
+        "router_kv_index_total_token_copies_host_pinned / \
+         router_kv_index_distinct_tokens_host_pinned - 1.0 means no duplication anywhere in the \
+         fleet's host-pinned tier, 2.0 means the average tracked content exists on two workers, \
+         etc. block_size cancels out of this ratio, so it reads identically whether computed \
+         from tokens or blocks. Diagnostic-only, sampled on a slow background interval.",
         &[],
     ) {
         Ok(g) => g,
@@ -373,8 +382,10 @@ fn spawn_lower_tier_redundancy_gauge_sampler(
                 continue;
             };
             let stats = host_pinned.redundancy_stats();
-            distinct_blocks_gauge.set(stats.distinct_blocks as i64);
-            total_copies_gauge.set(stats.total_block_copies as i64);
+            let distinct_tokens = stats.distinct_blocks.saturating_mul(u64::from(block_size));
+            let total_token_copies = stats.total_block_copies.saturating_mul(u64::from(block_size));
+            distinct_tokens_gauge.set(distinct_tokens as i64);
+            total_copies_gauge.set(total_token_copies as i64);
             if let Some(ratio) = stats.redundancy_ratio() {
                 redundancy_ratio_gauge.set(ratio);
             }
@@ -501,20 +512,22 @@ fn spawn_lower_tier_resident_age_gauge_sampler(
 fn spawn_kv_demand_gauge_sampler(
     component: &Component,
     primary: Arc<ThreadPoolIndexer<ConcurrentRadixTreeCompressed>>,
+    block_size: u32,
     cancellation_token: CancellationToken,
 ) {
     let metrics = component.metrics();
     let make_gauge = |suffix: &str, window_desc: &str| {
-        let name = format!("router_kv_index_demand_distinct_blocks_{suffix}");
+        let name = format!("router_kv_index_demand_distinct_tokens_{suffix}");
         metrics
             .create_intgauge(
                 &name,
                 &format!(
-                    "Distinct KV blocks this fleet's primary (device/G1) index has observed \
-                     stored at all over the trailing {window_desc}, regardless of current \
-                     residency - a load-average-style \"is my active working set trending up\" \
-                     signal, not a capacity-sizing number (use the offline trace-based approach \
-                     in DASHBOARD_METRICS_ENGINEERING_PLAN.md section 2a for that). Diagnostic-only, \
+                    "Distinct KV content (in tokens: distinct blocks x block_size) this fleet's \
+                     primary (device/G1) index has observed stored at all over the trailing \
+                     {window_desc}, regardless of current residency - a load-average-style \
+                     \"is my active working set trending up\" signal, not a capacity-sizing \
+                     number (use the offline trace-based approach in \
+                     DASHBOARD_METRICS_ENGINEERING_PLAN.md section 2a for that). Diagnostic-only, \
                      sampled on a slow background interval; not yet benchmarked at production \
                      scale. Resets to 0 on every router restart with no recovery path.",
                 ),
@@ -542,9 +555,10 @@ fn spawn_kv_demand_gauge_sampler(
                 _ = tokio::time::sleep(Duration::from_secs(30)) => {}
             }
             let counts = primary.demand_distinct_blocks();
-            gauge_1m.set(counts.last_1m as i64);
-            gauge_5m.set(counts.last_5m as i64);
-            gauge_15m.set(counts.last_15m as i64);
+            let block_size = u64::from(block_size);
+            gauge_1m.set((counts.last_1m as u64).saturating_mul(block_size) as i64);
+            gauge_5m.set((counts.last_5m as u64).saturating_mul(block_size) as i64);
+            gauge_15m.set((counts.last_15m as u64).saturating_mul(block_size) as i64);
         }
     });
 }
@@ -556,20 +570,22 @@ fn spawn_kv_demand_gauge_sampler(
 fn spawn_lower_tier_demand_gauge_sampler(
     component: &Component,
     lower_tier: LowerTierIndexers,
+    block_size: u32,
     cancellation_token: CancellationToken,
 ) {
     let metrics = component.metrics();
     let make_gauge = |suffix: &str, window_desc: &str| {
-        let name = format!("router_kv_index_demand_distinct_blocks_{suffix}_host_pinned");
+        let name = format!("router_kv_index_demand_distinct_tokens_{suffix}_host_pinned");
         metrics
             .create_intgauge(
                 &name,
                 &format!(
-                    "Distinct KV blocks this fleet's host-pinned (secondary-cache, e.g. KVCR \
-                     G2) lower-tier index has observed stored at all over the trailing \
-                     {window_desc}, regardless of current residency. Diagnostic-only, sampled \
-                     on a slow background interval; not yet benchmarked at production scale. \
-                     Resets to 0 on every router restart with no recovery path.",
+                    "Distinct KV content (in tokens: distinct blocks x block_size) this fleet's \
+                     host-pinned (secondary-cache, e.g. KVCR G2) lower-tier index has observed \
+                     stored at all over the trailing {window_desc}, regardless of current \
+                     residency. Diagnostic-only, sampled on a slow background interval; not yet \
+                     benchmarked at production scale. Resets to 0 on every router restart with \
+                     no recovery path.",
                 ),
                 &[],
             )
@@ -600,9 +616,10 @@ fn spawn_lower_tier_demand_gauge_sampler(
                 continue;
             };
             let counts = host_pinned.demand_distinct_blocks();
-            gauge_1m.set(counts.last_1m as i64);
-            gauge_5m.set(counts.last_5m as i64);
-            gauge_15m.set(counts.last_15m as i64);
+            let block_size = u64::from(block_size);
+            gauge_1m.set((counts.last_1m as u64).saturating_mul(block_size) as i64);
+            gauge_5m.set((counts.last_5m as u64).saturating_mul(block_size) as i64);
+            gauge_15m.set((counts.last_15m as u64).saturating_mul(block_size) as i64);
         }
     });
 }
@@ -779,6 +796,7 @@ impl Indexer {
             spawn_kv_redundancy_gauge_sampler(
                 component,
                 primary.clone(),
+                block_size,
                 cancellation_token.child_token(),
             );
             spawn_kv_resident_age_gauge_sampler(
@@ -789,6 +807,7 @@ impl Indexer {
             spawn_kv_demand_gauge_sampler(
                 component,
                 primary.clone(),
+                block_size,
                 cancellation_token.child_token(),
             );
             let lower_tier = LowerTierIndexers::new_with_metrics(
@@ -799,6 +818,7 @@ impl Indexer {
             spawn_lower_tier_redundancy_gauge_sampler(
                 component,
                 lower_tier.clone(),
+                block_size,
                 cancellation_token.child_token(),
             );
             spawn_lower_tier_resident_age_gauge_sampler(
@@ -809,6 +829,7 @@ impl Indexer {
             spawn_lower_tier_demand_gauge_sampler(
                 component,
                 lower_tier.clone(),
+                block_size,
                 cancellation_token.child_token(),
             );
             return Ok(Self::Concurrent {
