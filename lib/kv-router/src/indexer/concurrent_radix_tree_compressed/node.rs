@@ -263,6 +263,29 @@ impl Node {
             .collect()
     }
 
+    /// Counts-only sibling of `dump_snapshot` for the fleet-wide redundancy
+    /// walk (see `redundancy.rs`) - same per-node locking (a brief read of
+    /// `shape_gate` then `state`, released immediately after), same
+    /// `live_children` filter as `live_children()`/`dump_snapshot()` above,
+    /// but reads only lengths/sums instead of cloning the actual edge and
+    /// worker data out.
+    pub(super) fn redundancy_counts(&self) -> RedundancyNodeCounts {
+        let _gate = self.shape_gate.read();
+        let state = self.state.read();
+        let live_children: Vec<_> = self
+            .children
+            .values_snapshot()
+            .into_iter()
+            .filter(|child| child.state.read().has_any_workers() || !child.children.is_empty())
+            .collect();
+        RedundancyNodeCounts {
+            edge_len: state.edge.len(),
+            full_edge_workers: state.full_edge_workers.len(),
+            partial_cutoff_sum: state.worker_cutoffs.values().sum(),
+            live_children,
+        }
+    }
+
     pub(super) fn dump_snapshot(&self) -> DumpNodeSnapshot {
         let _gate = self.shape_gate.read();
         let state = self.state.read();

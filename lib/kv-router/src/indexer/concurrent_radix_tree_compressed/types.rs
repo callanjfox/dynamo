@@ -82,6 +82,19 @@ impl HashSequence for AnchoredHashSequence<'_> {
     }
 }
 
+/// Counts-only view of one node for `redundancy_stats()` - unlike
+/// `DumpNodeSnapshot`, deliberately does NOT clone `edge`/`full_edge_workers`/
+/// `worker_cutoffs` out (those are only needed as data by the event-dump
+/// path; a fleet-wide redundancy walk only needs their lengths/sums), so a
+/// full-tree walk allocates one `Vec<SharedNode>` (Arc clones, cheap) per
+/// node instead of three extra Vecs per node on top of that.
+pub(super) struct RedundancyNodeCounts {
+    pub(super) edge_len: usize,
+    pub(super) full_edge_workers: usize,
+    pub(super) partial_cutoff_sum: usize,
+    pub(super) live_children: Vec<SharedNode>,
+}
+
 pub(super) struct DumpNodeSnapshot {
     pub(super) edge: Vec<(LocalBlockHash, ExternalSequenceBlockHash)>,
     pub(super) full_edge_workers: Vec<WorkerWithDpRank>,

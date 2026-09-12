@@ -592,6 +592,36 @@ impl WorkerLookupStats {
     }
 }
 
+/// Fleet-wide KV-cache redundancy diagnostic (how much of the router's live
+/// index is genuinely unique content versus copies of the same block on more
+/// than one worker - e.g. a session's prefix re-materializing on a second
+/// worker after a router hop, or cache-aware routing simply not being
+/// perfect). Diagnostic-only - see
+/// `ConcurrentRadixTreeCompressed::redundancy_stats` for the computation and
+/// its own caveats (this has not been through a benchmark pass; only ever
+/// sampled on a slow background interval, never on a per-request path).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RedundancyStats {
+    /// Distinct blocks tracked anywhere in the fleet's live index.
+    pub distinct_blocks: u64,
+    /// Sum, across every distinct block, of how many workers hold a copy of
+    /// it (full-coverage workers count their whole shared edge length;
+    /// partial-coverage workers count only their own covered prefix).
+    /// Equal to `distinct_blocks` when nothing is duplicated anywhere in the
+    /// fleet; higher means real duplication.
+    pub total_block_copies: u64,
+}
+
+impl RedundancyStats {
+    /// 1.0 = no duplication anywhere in the fleet; 2.0 = the average
+    /// tracked block exists on two workers, etc. `None` when the index is
+    /// empty (nothing to divide by yet).
+    pub fn redundancy_ratio(&self) -> Option<f64> {
+        (self.distinct_blocks > 0)
+            .then(|| self.total_block_copies as f64 / self.distinct_blocks as f64)
+    }
+}
+
 pub enum WorkerTask {
     Event(RouterEvent),
     EventWithAck {

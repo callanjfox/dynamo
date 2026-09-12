@@ -22,7 +22,9 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 #[cfg(feature = "bench")]
 use super::WorkerObservationState;
-use super::{EventKind, KvIndexerMetrics, SyncIndexer, WorkerLookupStats, WorkerTask};
+use super::{
+    EventKind, KvIndexerMetrics, RedundancyStats, SyncIndexer, WorkerLookupStats, WorkerTask,
+};
 use crate::protocols::{
     ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData, KvCacheEventError, KvCacheStoreData,
     KvCacheStoredBlockData, LocalBlockHash, OverlapScores, ResetScope, ResidencyDomain,
@@ -130,6 +132,23 @@ impl EdgeOwnersEntry {
             Self::Single { child_hash, .. }
             | Self::Pair { child_hash, .. }
             | Self::Multi { child_hash, .. } => *child_hash,
+        }
+    }
+
+    /// How many distinct owners (workers or cache owners) currently hold this
+    /// edge - the lower-tier counterpart to the primary radix tree's
+    /// `full_edge_workers`/`worker_cutoffs` counts in `redundancy_counts()`.
+    /// Used only by `LowerTierIndexer::redundancy_stats()` (diagnostic-only,
+    /// see that method's doc comment) - not on any per-request path.
+    fn owner_count(&self) -> usize {
+        match self {
+            Self::Single { .. } => 1,
+            Self::Pair { .. } => 2,
+            Self::Multi {
+                workers,
+                exact_owners,
+                ..
+            } => workers.len() + exact_owners.len(),
         }
     }
 
@@ -415,6 +434,28 @@ impl LowerTierIndexer {
         Self {
             edges: DashMap::with_hasher(FxBuildHasher),
         }
+    }
+
+    /// Per-tier redundancy diagnostic, same shape/purpose as
+    /// `ConcurrentRadixTreeCompressed::redundancy_stats()`
+    /// (`indexer/concurrent_radix_tree_compressed/redundancy.rs`) but computed
+    /// against this tier's own flat edge map rather than a tree - the two
+    /// backends are structurally unrelated (this one is a `DashMap`, not a
+    /// radix tree), so this is a new, independent walk, not shared code.
+    ///
+    /// Cost: a single `DashMap` iteration, O(this tier's own edge count) -
+    /// cheaper in absolute terms than the primary tree's BFS walk since this
+    /// tier is capacity-bounded per worker (e.g. KVCR's own G2 slot cap)
+    /// rather than fleet-wide-unbounded. Like the primary tree's version,
+    /// this is diagnostic-only: not benchmarked, only ever intended to be
+    /// called from a slow background sampler, never a per-request path.
+    pub fn redundancy_stats(&self) -> RedundancyStats {
+        let mut stats = RedundancyStats::default();
+        for entry in self.edges.iter() {
+            stats.distinct_blocks += 1;
+            stats.total_block_copies += entry.value().owner_count() as u64;
+        }
+        stats
     }
 
     fn apply_event(
@@ -1519,6 +1560,46 @@ mod tests {
             .query_contiguous_hits(&local_hashes(&[11]), &continuations);
         assert_eq!(hits.get(&worker_dp0), Some(&0));
         assert_eq!(hits.get(&worker_dp1), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn redundancy_stats_counts_distinct_blocks_and_owner_copies() {
+        let index = ThreadPoolIndexer::new(LowerTierIndexer::new(), 2, 1);
+
+        // Nothing stored yet - an empty tier should report zero of everything
+        // and no ratio (nothing to divide by).
+        let empty = index.redundancy_stats();
+        assert_eq!(empty.distinct_blocks, 0);
+        assert_eq!(empty.total_block_copies, 0);
+        assert_eq!(empty.redundancy_ratio(), None);
+
+        // One worker stores a 2-block chain - two distinct edges, one owner
+        // each, so no duplication yet (ratio 1.0). `dump_events` is used
+        // purely as a barrier here (as in the other tests in this module) -
+        // `apply_event` dispatches to a worker thread, so it's not
+        // guaranteed landed in the shared backend until something syncs
+        // with that thread.
+        index
+            .apply_event(store_event(29, 0, 0, None, &[101, 102], &[1001, 1002]))
+            .await;
+        let _ = index.dump_events().await.unwrap();
+        let one_worker = index.redundancy_stats();
+        assert_eq!(one_worker.distinct_blocks, 2);
+        assert_eq!(one_worker.total_block_copies, 2);
+        assert_eq!(one_worker.redundancy_ratio(), Some(1.0));
+
+        // A second worker stores the exact same chain (same external
+        // hashes) - same two edges, now with two owners each: distinct
+        // block count is unchanged, but every copy is duplicated, so the
+        // ratio should double to 2.0.
+        index
+            .apply_event(store_event(30, 0, 1, None, &[101, 102], &[1001, 1002]))
+            .await;
+        let _ = index.dump_events().await.unwrap();
+        let two_workers = index.redundancy_stats();
+        assert_eq!(two_workers.distinct_blocks, 2);
+        assert_eq!(two_workers.total_block_copies, 4);
+        assert_eq!(two_workers.redundancy_ratio(), Some(2.0));
     }
 
     #[tokio::test]

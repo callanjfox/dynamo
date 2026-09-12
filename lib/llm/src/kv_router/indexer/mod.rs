@@ -12,7 +12,7 @@ use dynamo_kv_router::{
         KvIndexer, KvIndexerInterface, KvIndexerMetrics, KvRouterError, LowerTierIndexers,
         ThreadPoolIndexer, record_unsupported_residency_event,
     },
-    protocols::{DpRank, KvCacheEventData, ResidencyProjection, RouterEvent, WorkerId},
+    protocols::{DpRank, KvCacheEventData, ResidencyProjection, RouterEvent, StorageTier, WorkerId},
 };
 
 // Re-export tiered-match types so internal callers (`indexer::TieredMatchDetails`)
@@ -21,6 +21,7 @@ pub(crate) use dynamo_kv_router::indexer::TieredMatchDetails;
 #[allow(unused_imports)]
 pub(crate) use dynamo_kv_router::indexer::WireTieredMatchDetails;
 use dynamo_runtime::component::Component;
+use dynamo_runtime::metrics::MetricsHierarchy;
 use tokio_util::sync::CancellationToken;
 
 mod embedding_cache;
@@ -90,6 +91,379 @@ async fn dump_local_events(
         }));
     }
     Ok(events)
+}
+
+/// Fleet-wide KV-cache redundancy for the primary (device/G1) index: how much of the
+/// router's live index is genuinely unique content versus copies of the same block on
+/// more than one worker (e.g. a session's prefix re-materializing on a second worker
+/// after a router hop, or cache-aware routing simply not being perfect). Reads
+/// `ThreadPoolIndexer::redundancy_stats()`, which walks the whole tree (see its own doc
+/// comment), so this samples far less often than a live-index gauge would - 30s keeps
+/// the walk's cost off anything latency-sensitive while still being live enough to
+/// watch during a benchmark run. Has not been through this crate's AGENTS.md-mandated
+/// benchmark pass or review; not cleared for a production-scale deployment.
+fn spawn_kv_redundancy_gauge_sampler(
+    component: &Component,
+    primary: Arc<ThreadPoolIndexer<ConcurrentRadixTreeCompressed>>,
+    cancellation_token: CancellationToken,
+) {
+    let metrics = component.metrics();
+    let distinct_blocks_gauge = match metrics.create_intgauge(
+        "router_kv_index_distinct_blocks",
+        "Distinct KV blocks tracked anywhere in the fleet's live routing index - the unique-content \
+         denominator for router_kv_index_total_block_copies. Diagnostic-only, sampled on a slow \
+         background interval; not yet benchmarked at production scale.",
+        &[],
+    ) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to create router_kv_index_distinct_blocks gauge: {e}. KV redundancy will not be exported."
+            );
+            return;
+        }
+    };
+    let total_copies_gauge = match metrics.create_intgauge(
+        "router_kv_index_total_block_copies",
+        "Sum, across every distinct tracked block, of how many workers hold a copy of it - equal \
+         to router_kv_index_distinct_blocks when nothing in the fleet is duplicated, higher means \
+         real duplication (e.g. a session's prefix re-materializing on a second worker after a \
+         router hop). Diagnostic-only, sampled on a slow background interval.",
+        &[],
+    ) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to create router_kv_index_total_block_copies gauge: {e}. KV redundancy will not be exported."
+            );
+            return;
+        }
+    };
+    let redundancy_ratio_gauge = match metrics.create_gauge(
+        "router_kv_index_redundancy_ratio",
+        "router_kv_index_total_block_copies / router_kv_index_distinct_blocks - 1.0 means no \
+         duplication anywhere in the fleet, 2.0 means the average tracked block exists on two \
+         workers, etc. Diagnostic-only, sampled on a slow background interval.",
+        &[],
+    ) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to create router_kv_index_redundancy_ratio gauge: {e}. KV redundancy will not be exported."
+            );
+            return;
+        }
+    };
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancellation_token.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+            }
+            let stats = primary.redundancy_stats();
+            distinct_blocks_gauge.set(stats.distinct_blocks as i64);
+            total_copies_gauge.set(stats.total_block_copies as i64);
+            if let Some(ratio) = stats.redundancy_ratio() {
+                redundancy_ratio_gauge.set(ratio);
+            }
+        }
+    });
+}
+
+/// Lower-tier (secondary-cache, e.g. KVCR host-pinned/G2) counterpart to
+/// `spawn_kv_redundancy_gauge_sampler` above - same purpose and shape, but
+/// samples `LowerTierIndexer::redundancy_stats()` (a `DashMap` edge-map walk,
+/// `indexer/lower_tier.rs`) instead of the primary radix tree's BFS. The two
+/// backends are structurally unrelated, so this reads a genuinely different
+/// index, not a relabeled view of the same one.
+///
+/// Scoped to `StorageTier::HostPinned` only (the one lower tier this
+/// deployment actually configures) rather than iterating every possible
+/// tier - `LowerTierIndexers` allocates each tier lazily on first event, so
+/// `get()` returns `None` (silently skipped, not an error) until this
+/// worker's fleet has offloaded at least one block to that tier.
+///
+/// Metric names are tier-suffixed rather than sharing the primary gauges'
+/// names with a `tier` label: the primary gauges above were registered as
+/// plain (unlabeled) gauges via `create_intgauge(..., &[])`, and retrofitting
+/// a label dimension onto an already-registered bare gauge name risks a
+/// Prometheus registration conflict - out of scope for this basic-
+/// functionality pass. Diagnostic-only, same caveats as the primary sampler
+/// (not benchmarked, background-only, never a per-request path).
+fn spawn_lower_tier_redundancy_gauge_sampler(
+    component: &Component,
+    lower_tier: LowerTierIndexers,
+    cancellation_token: CancellationToken,
+) {
+    let metrics = component.metrics();
+    let distinct_blocks_gauge = match metrics.create_intgauge(
+        "router_kv_index_distinct_blocks_host_pinned",
+        "Distinct KV blocks tracked in the fleet's host-pinned (secondary-cache, e.g. KVCR G2) \
+         lower-tier index - the unique-content denominator for \
+         router_kv_index_total_block_copies_host_pinned. Diagnostic-only, sampled on a slow \
+         background interval; not yet benchmarked at production scale.",
+        &[],
+    ) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to create router_kv_index_distinct_blocks_host_pinned gauge: {e}. \
+                 Lower-tier KV redundancy will not be exported."
+            );
+            return;
+        }
+    };
+    let total_copies_gauge = match metrics.create_intgauge(
+        "router_kv_index_total_block_copies_host_pinned",
+        "Sum, across every distinct tracked host-pinned-tier block, of how many workers hold a \
+         copy of it - equal to router_kv_index_distinct_blocks_host_pinned when nothing in the \
+         fleet's host-pinned tier is duplicated, higher means real duplication. \
+         Diagnostic-only, sampled on a slow background interval.",
+        &[],
+    ) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to create router_kv_index_total_block_copies_host_pinned gauge: {e}. \
+                 Lower-tier KV redundancy will not be exported."
+            );
+            return;
+        }
+    };
+    let redundancy_ratio_gauge = match metrics.create_gauge(
+        "router_kv_index_redundancy_ratio_host_pinned",
+        "router_kv_index_total_block_copies_host_pinned / \
+         router_kv_index_distinct_blocks_host_pinned - 1.0 means no duplication anywhere in the \
+         fleet's host-pinned tier, 2.0 means the average tracked block exists on two workers, \
+         etc. Diagnostic-only, sampled on a slow background interval.",
+        &[],
+    ) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to create router_kv_index_redundancy_ratio_host_pinned gauge: {e}. \
+                 Lower-tier KV redundancy will not be exported."
+            );
+            return;
+        }
+    };
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancellation_token.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+            }
+            let Some(host_pinned) = lower_tier.get(StorageTier::HostPinned) else {
+                // Lazily allocated on first event - nothing to sample yet.
+                continue;
+            };
+            let stats = host_pinned.redundancy_stats();
+            distinct_blocks_gauge.set(stats.distinct_blocks as i64);
+            total_copies_gauge.set(stats.total_block_copies as i64);
+            if let Some(ratio) = stats.redundancy_ratio() {
+                redundancy_ratio_gauge.set(ratio);
+            }
+        }
+    });
+}
+
+/// Live/resident block age for the primary (device/G1) index
+/// (`KVCR_INDEX_HEALTH_DESIGN.md` 1b): how old is the data currently sitting in the fleet's
+/// live routing index, as min/p50/p99/max seconds since each block was first observed
+/// stored. Reads `ThreadPoolIndexer::resident_age_percentiles()`, which walks only the
+/// `age_tracking` side-table (see that module) - never the primary tree itself. Same slow
+/// 30s interval and diagnostic-only status as the redundancy samplers above; not yet
+/// benchmarked at production scale. A restart resets every tracked insertion time (no
+/// recovery path), so expect misleadingly low ages for a while after any router restart.
+fn spawn_kv_resident_age_gauge_sampler(
+    component: &Component,
+    primary: Arc<ThreadPoolIndexer<ConcurrentRadixTreeCompressed>>,
+    cancellation_token: CancellationToken,
+) {
+    let metrics = component.metrics();
+    let resident_age_gauge = match metrics.create_gaugevec(
+        "router_kv_index_resident_age_seconds",
+        "Age (seconds since first observed stored) of blocks currently resident in the fleet's \
+         live primary (device/G1) routing index, by stat (min/p50/p99/max). Diagnostic-only, \
+         sampled on a slow background interval; not yet benchmarked at production scale. \
+         Expect misleadingly low values for a while after any router restart - tracked \
+         insertion times are not recoverable across a restart.",
+        &["stat"],
+        &[],
+    ) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to create router_kv_index_resident_age_seconds gauge: {e}. \
+                 Resident-age reporting will not be exported."
+            );
+            return;
+        }
+    };
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancellation_token.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+            }
+            let Some(stats) = primary.resident_age_percentiles() else {
+                continue;
+            };
+            resident_age_gauge.with_label_values(&["min"]).set(stats.min);
+            resident_age_gauge.with_label_values(&["p50"]).set(stats.p50);
+            resident_age_gauge.with_label_values(&["p99"]).set(stats.p99);
+            resident_age_gauge.with_label_values(&["max"]).set(stats.max);
+        }
+    });
+}
+
+/// Lower-tier (host-pinned/G2) counterpart to `spawn_kv_resident_age_gauge_sampler` above -
+/// same purpose and mechanism (reads the same `age_tracking` side-table type, this time the
+/// one owned by the host-pinned `ThreadPoolIndexer<LowerTierIndexer>`), tier-suffixed metric
+/// name for the same registration-conflict reason as the redundancy samplers. Scoped to
+/// `StorageTier::HostPinned` only, same lazy-allocation caveat as
+/// `spawn_lower_tier_redundancy_gauge_sampler`.
+fn spawn_lower_tier_resident_age_gauge_sampler(
+    component: &Component,
+    lower_tier: LowerTierIndexers,
+    cancellation_token: CancellationToken,
+) {
+    let metrics = component.metrics();
+    let resident_age_gauge = match metrics.create_gaugevec(
+        "router_kv_index_resident_age_seconds_host_pinned",
+        "Age (seconds since first observed stored) of blocks currently resident in the fleet's \
+         host-pinned (secondary-cache, e.g. KVCR G2) lower-tier index, by stat \
+         (min/p50/p99/max). Diagnostic-only, sampled on a slow background interval; not yet \
+         benchmarked at production scale. Expect misleadingly low values for a while after any \
+         router restart - tracked insertion times are not recoverable across a restart.",
+        &["stat"],
+        &[],
+    ) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to create router_kv_index_resident_age_seconds_host_pinned gauge: {e}. \
+                 Lower-tier resident-age reporting will not be exported."
+            );
+            return;
+        }
+    };
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancellation_token.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+            }
+            let Some(host_pinned) = lower_tier.get(StorageTier::HostPinned) else {
+                continue;
+            };
+            let Some(stats) = host_pinned.resident_age_percentiles() else {
+                continue;
+            };
+            resident_age_gauge.with_label_values(&["min"]).set(stats.min);
+            resident_age_gauge.with_label_values(&["p50"]).set(stats.p50);
+            resident_age_gauge.with_label_values(&["p99"]).set(stats.p99);
+            resident_age_gauge.with_label_values(&["max"]).set(stats.max);
+        }
+    });
+}
+
+/// Rolling window for the cumulative distinct-block ("unconstrained demand") gauge below -
+/// how far back "distinct content this fleet has been asked to serve" looks before an entry
+/// ages out. Matching the other samplers in this file, this is a fixed constant rather than a
+/// new CLI/env knob: this is diagnostic-only tooling, not a routing-affecting parameter.
+const DEMAND_TRACKING_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Cumulative distinct-block ("unconstrained demand", `DASHBOARD_METRICS_ENGINEERING_PLAN.md`
+/// section 2b) gauge for the primary (device/G1) index: how much *distinct* content has this
+/// fleet been asked to serve over the trailing `DEMAND_TRACKING_WINDOW`, independent of how much
+/// of it is currently resident. Reads `ThreadPoolIndexer::demand_distinct_blocks()`, which walks
+/// only the `demand_tracking` side-table (see that module) - never the primary tree itself.
+/// Same slow 30s interval and diagnostic-only status as the redundancy/age samplers above; not
+/// yet benchmarked at production scale (`DASHBOARD_METRICS_ENGINEERING_PLAN.md` section 7).
+fn spawn_kv_demand_gauge_sampler(
+    component: &Component,
+    primary: Arc<ThreadPoolIndexer<ConcurrentRadixTreeCompressed>>,
+    cancellation_token: CancellationToken,
+) {
+    let metrics = component.metrics();
+    let demand_gauge = match metrics.create_intgauge(
+        "router_kv_index_demand_distinct_blocks",
+        "Distinct KV blocks this fleet's primary (device/G1) index has observed stored at all \
+         over the trailing 24h, regardless of current residency - an estimate of true \
+         unconstrained cache demand, unlike router_kv_index_distinct_blocks (which only counts \
+         what is resident right now and is therefore capped by whatever capacity already \
+         exists). Diagnostic-only, sampled on a slow background interval; not yet benchmarked \
+         at production scale. Resets to 0 on every router restart with no recovery path.",
+        &[],
+    ) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to create router_kv_index_demand_distinct_blocks gauge: {e}. \
+                 Demand tracking will not be exported."
+            );
+            return;
+        }
+    };
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancellation_token.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+            }
+            let count = primary.demand_distinct_blocks(DEMAND_TRACKING_WINDOW);
+            demand_gauge.set(count as i64);
+        }
+    });
+}
+
+/// Lower-tier (host-pinned/G2) counterpart to `spawn_kv_demand_gauge_sampler` above - same
+/// purpose and mechanism, tier-suffixed metric name for the same registration-conflict reason
+/// as the redundancy/age samplers. Scoped to `StorageTier::HostPinned` only, same
+/// lazy-allocation caveat as `spawn_lower_tier_redundancy_gauge_sampler`.
+fn spawn_lower_tier_demand_gauge_sampler(
+    component: &Component,
+    lower_tier: LowerTierIndexers,
+    cancellation_token: CancellationToken,
+) {
+    let metrics = component.metrics();
+    let demand_gauge = match metrics.create_intgauge(
+        "router_kv_index_demand_distinct_blocks_host_pinned",
+        "Distinct KV blocks this fleet's host-pinned (secondary-cache, e.g. KVCR G2) lower-tier \
+         index has observed stored at all over the trailing 24h, regardless of current \
+         residency. Diagnostic-only, sampled on a slow background interval; not yet benchmarked \
+         at production scale. Resets to 0 on every router restart with no recovery path.",
+        &[],
+    ) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to create router_kv_index_demand_distinct_blocks_host_pinned gauge: {e}. \
+                 Lower-tier demand tracking will not be exported."
+            );
+            return;
+        }
+    };
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancellation_token.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+            }
+            let Some(host_pinned) = lower_tier.get(StorageTier::HostPinned) else {
+                continue;
+            };
+            let count = host_pinned.demand_distinct_blocks(DEMAND_TRACKING_WINDOW);
+            demand_gauge.set(count as i64);
+        }
+    });
 }
 
 impl Indexer {
@@ -219,18 +593,50 @@ impl Indexer {
 
         if kv_router_config.router_event_threads > 1 {
             let kv_indexer_metrics = KvIndexerMetrics::from_component(component);
+            let primary = Arc::new(ThreadPoolIndexer::new_with_metrics(
+                ConcurrentRadixTreeCompressed::new(),
+                kv_router_config.router_event_threads as usize,
+                block_size,
+                Some(kv_indexer_metrics.clone()),
+            ));
+            spawn_kv_redundancy_gauge_sampler(
+                component,
+                primary.clone(),
+                cancellation_token.child_token(),
+            );
+            spawn_kv_resident_age_gauge_sampler(
+                component,
+                primary.clone(),
+                cancellation_token.child_token(),
+            );
+            spawn_kv_demand_gauge_sampler(
+                component,
+                primary.clone(),
+                cancellation_token.child_token(),
+            );
+            let lower_tier = LowerTierIndexers::new_with_metrics(
+                kv_router_config.router_event_threads as usize,
+                block_size,
+                Some(kv_indexer_metrics),
+            );
+            spawn_lower_tier_redundancy_gauge_sampler(
+                component,
+                lower_tier.clone(),
+                cancellation_token.child_token(),
+            );
+            spawn_lower_tier_resident_age_gauge_sampler(
+                component,
+                lower_tier.clone(),
+                cancellation_token.child_token(),
+            );
+            spawn_lower_tier_demand_gauge_sampler(
+                component,
+                lower_tier.clone(),
+                cancellation_token.child_token(),
+            );
             return Ok(Self::Concurrent {
-                primary: Arc::new(ThreadPoolIndexer::new_with_metrics(
-                    ConcurrentRadixTreeCompressed::new(),
-                    kv_router_config.router_event_threads as usize,
-                    block_size,
-                    Some(kv_indexer_metrics.clone()),
-                )),
-                lower_tier: LowerTierIndexers::new_with_metrics(
-                    kv_router_config.router_event_threads as usize,
-                    block_size,
-                    Some(kv_indexer_metrics),
-                ),
+                primary,
+                lower_tier,
                 approx,
                 primary_records_routing_decisions: false,
             });

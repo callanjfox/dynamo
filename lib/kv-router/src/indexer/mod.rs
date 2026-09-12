@@ -31,8 +31,10 @@
 //!
 //! This module provides a scalable and efficient way to manage and retrieve data blocks for LLM inference, leveraging a global KV cache to optimize performance.
 
+mod age_tracking;
 mod branch_sharded;
 mod compressed_radix;
+mod demand_tracking;
 mod shard_handle;
 
 use std::any::Any;
@@ -78,6 +80,11 @@ pub mod radix_tree;
 
 #[cfg(test)]
 mod tests;
+
+// Crate-internal only (deliberately not swept into the `pub use *` block below): a
+// diagnostic side-table, not part of this crate's public API.
+use age_tracking::AgeTracker;
+use demand_tracking::DemandTracker;
 
 // Re-export everything that was public in the old single-file module.
 pub use branch_sharded::*;
