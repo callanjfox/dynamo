@@ -9,9 +9,16 @@ authors.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Custom worker-selection policy catalog: sgl-router-cache-aware + sticky-until-saturated"
+description = "Custom worker-selection policy catalog: sgl-router-cache-aware (+ -16/-8 imbalance-threshold variants) + sticky-until-saturated"
 
 [dependencies]
 dynamo-kv-router = { workspace = true, features = ["standalone-selection"] }
-sgl-router-cache-aware-dynamo-policy = { git = "https://github.com/ishandhanani/router-sandbox.git", rev = "593a00d526d75e5d2fd97f27ccc6fcf280ecee98" }
-sticky-until-saturated-dynamo-policy = { git = "https://github.com/ishandhanani/router-sandbox.git", rev = "593a00d526d75e5d2fd97f27ccc6fcf280ecee98" }
+# sgl-router-cache-aware-16/-8 (imbalance-threshold variants) only exist on this fork branch
+# (upstream ishandhanani/router-sandbox does not have write access from this session and has
+# not merged them yet: https://github.com/ishandhanani/router-sandbox/pull/new/add-imbalance-threshold-variants).
+# All four entries are pinned to the same fork/rev for consistency; re-point back to
+# ishandhanani/router-sandbox once that PR (or an equivalent) merges upstream.
+sgl-router-cache-aware-dynamo-policy = { git = "https://github.com/callanjfox/router-sandbox.git", rev = "a75ee3cb44c5383246bc9485dc9359dc746d5317" }
+sticky-until-saturated-dynamo-policy = { git = "https://github.com/callanjfox/router-sandbox.git", rev = "a75ee3cb44c5383246bc9485dc9359dc746d5317" }
+sgl-router-cache-aware-16-dynamo-policy = { git = "https://github.com/callanjfox/router-sandbox.git", rev = "a75ee3cb44c5383246bc9485dc9359dc746d5317" }
+sgl-router-cache-aware-8-dynamo-policy = { git = "https://github.com/callanjfox/router-sandbox.git", rev = "a75ee3cb44c5383246bc9485dc9359dc746d5317" }

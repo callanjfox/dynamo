@@ -1,0 +1,193 @@
+# syntax=docker/dockerfile:1.7
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Forked from ai-dynamo/kvcr's Dockerfile.quick-start (2026-09-10). The only change from
+# upstream: the `dynamo-builder` stage builds from this repo's checked-out working tree
+# (our `custom-cacheloss-routers-metrics` branch) instead of a fresh `git clone` of
+# upstream ai-dynamo/dynamo at a bare ref. Everything else - the pinned vLLM overlay, the
+# final base image, env vars - is unchanged from KVCR's own validated combination.
+#
+# Build from the dynamo/ repo root so the build context is this checkout:
+#   cd /home/callan/projects/building_dynamo/dynamo
+#   DOCKER_BUILDKIT=1 docker build \
+#     --build-arg KVCR_VLLM_REPO=https://github.com/vllm-project/vllm.git \
+#     --build-arg KVCR_VLLM_REF=35ab7457aafa89d6849e40d01401c69ffff8e33a \
+#     -f container/Dockerfile.kvcr-custom \
+#     -t dynamobuilds:kvcr-custom-spike .
+#
+# See RUNBOOK_KVCR.md for the full compatibility investigation and plan.
+
+ARG VLLM_IMAGE=vllm/vllm-openai:nightly-8efa13b700f1836657699cae2503dc2feab27fa0@sha256:83be0b4f532c5a851c655e914dc3a276e52265e4045402d2e36316a11e4b5dc9
+
+# The pinned vLLM image is the compatibility base KVCR itself validates against. It predates
+# Dynamo's per-DP-rank `control_ports` contract in Dynamo's own released runtime image, so we
+# use it as-is rather than our own container/rendered.Dockerfile pipeline for this spike -
+# swapping the base is a separate follow-up once this combination is proven.
+FROM rust:1.93-bookworm AS build-base
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake git libclang-dev libhwloc-dev libudev-dev pkg-config \
+    protobuf-compiler python3-dev python3-pip python3-venv wget unzip \
+ && rm -rf /var/lib/apt/lists/*
+# Deviation from upstream KVCR's Dockerfile.quick-start: apt's protobuf-compiler alone is not
+# enough to build lib/sidecar/vllm/proto/inference.proto, which imports the well-known
+# google/protobuf/struct.proto type - that crate did not exist yet at KVCR's pinned Dynamo
+# commit (dcdc9d0f, 2026-08-17), only appearing somewhere in the 65 commits between there and
+# our rebase target. Fetch the same pinned modern protoc release our own
+# container/templates/wheel_builder.Dockerfile already uses (its zip bundles the well-known
+# types' include/ directory), confirmed root cause: 2026-09-10 build failure -
+# "google/protobuf/struct.proto: File not found."
+RUN set -eux; \
+    PROTOC_VERSION=25.3; \
+    PROTOC_ZIP="protoc-${PROTOC_VERSION}-linux-x86_64.zip"; \
+    wget --tries=3 --waitretry=5 -O /tmp/protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/${PROTOC_ZIP}"; \
+    rm -f /usr/local/bin/protoc /usr/bin/protoc; \
+    unzip -o /tmp/protoc.zip -d /usr/local bin/protoc include/*; \
+    chmod +x /usr/local/bin/protoc; \
+    ln -s /usr/local/bin/protoc /usr/bin/protoc; \
+    rm -f /tmp/protoc.zip; \
+    protoc --version
+ENV PROTOC=/usr/local/bin/protoc
+
+# Require callers to select an immutable public adapter revision explicitly, same as upstream.
+FROM build-base AS vllm-kvcr-source
+ARG KVCR_VLLM_REPO=PUBLIC_VLLM_PR_REPOSITORY_PENDING
+ARG KVCR_VLLM_REF=PUBLIC_VLLM_PR_COMMIT_PENDING
+RUN if [ "${KVCR_VLLM_REPO}" = "PUBLIC_VLLM_PR_REPOSITORY_PENDING" ] \
+      || [ "${KVCR_VLLM_REF}" = "PUBLIC_VLLM_PR_COMMIT_PENDING" ]; then \
+      echo "Set KVCR_VLLM_REPO to the public vLLM repository." >&2; \
+      echo "Set KVCR_VLLM_REF to a specific pinned KVCR adapter commit SHA." >&2; \
+      exit 1; \
+    fi \
+ && git init /src/vllm-kvcr \
+ && git -C /src/vllm-kvcr remote add origin "${KVCR_VLLM_REPO}" \
+ && git -C /src/vllm-kvcr fetch --depth 1 origin "${KVCR_VLLM_REF}" \
+ && git -C /src/vllm-kvcr checkout --detach FETCH_HEAD \
+ && test "$(git -C /src/vllm-kvcr rev-parse HEAD)" = "${KVCR_VLLM_REF}"
+WORKDIR /src/vllm-kvcr
+RUN mkdir -p /overlay \
+ && cp --parents \
+      vllm/distributed/kv_events.py \
+      vllm/distributed/kv_transfer/kv_connector/v1/offloading/events.py \
+      vllm/v1/kv_offload/base.py \
+      vllm/v1/kv_offload/tiering/factory.py \
+      vllm/v1/kv_offload/tiering/kvcr/__init__.py \
+      vllm/v1/kv_offload/tiering/kvcr/manager.py \
+      /overlay/
+
+# --- The only stage that differs from upstream Dockerfile.quick-start ---
+# Build Dynamo from THIS repo's working tree (our custom-cacheloss-routers-metrics branch,
+# rebased past commit 8b030e0 so it speaks the per-DP-rank control_ports hint contract KVCR
+# requires) instead of a fresh clone of upstream ai-dynamo/dynamo at a bare ref.
+FROM build-base AS dynamo-builder
+COPY . /src/dynamo
+RUN python3 -m venv /venv \
+ && /venv/bin/pip install --no-cache-dir "maturin[patchelf]"
+RUN cd /src/dynamo/lib/bindings/python \
+ && /venv/bin/maturin build \
+      --release \
+      --features select-service,kv-indexer \
+      --out /wheels
+RUN cd /src/dynamo \
+ && /venv/bin/pip wheel --no-deps . --wheel-dir /wheels
+# --- end of the differing stage ---
+
+FROM ${VLLM_IMAGE}
+USER root
+ARG NCCL_VERSION=2.30.7
+
+# KVCR's recovery journal reaches libatomic for the 8-byte acquire/release cursor operations
+# CPython does not expose. The runtime image needs it even though it is not a Python
+# distribution and cannot be a pyproject dependency.
+RUN apt-get update && apt-get install -y --no-install-recommends libatomic1 \
+ && rm -rf /var/lib/apt/lists/*
+
+# Install the compatible Dynamo router-hint build (ours, not upstream's).
+COPY --from=dynamo-builder /wheels /tmp/dynamo-wheels
+RUN python3 -m pip install --no-cache-dir \
+      --no-deps \
+      /tmp/dynamo-wheels/ai_dynamo_runtime-*.whl \
+ && python3 -m pip install --no-cache-dir \
+      --no-deps \
+      /tmp/dynamo-wheels/ai_dynamo-*.whl \
+ && rm -rf /tmp/dynamo-wheels
+
+# KVCR itself is still pulled from its own repo checkout, not vendored here - unrelated to our
+# changes. Cloned at build time so this Dockerfile has no separate build-context dependency on
+# a second local checkout.
+# Pinned, not just latest main: upstream's Dockerfile.quick-start assumes it is built with a
+# build context that IS a kvcr checkout (COPY pyproject.toml/README.md/src from context), so it
+# carries no explicit kvcr<->vLLM-overlay version pin at all - that pairing is implicit in
+# "whatever commit you happen to have checked out." A fresh `git clone` of kvcr's main branch
+# here breaks that implicit pairing. Confirmed via smoke test (2026-09-10): main tip
+# (`cbe0517`) fails to import - `vllm/v1/kv_offload/tiering/kvcr/manager.py` (part of the
+# pinned KVCR_VLLM_REF overlay) imports `kvcr.config.KeyHintAdapter`, which kvcr commit
+# `361a2a1` ("Move router hint parsing into KVCR", #14) renamed to `KeyAdapter`. Pinned to
+# `106c56a` (kvcr's initial commit, predates that rename) after verifying every name
+# manager.py imports from `kvcr`/`kvcr.config`/`kvcr.control_channels`/`kvcr.policy` exists
+# there.
+FROM build-base AS kvcr-source
+ARG KVCR_REF=106c56ae0d446abd0439627f16384e8cb4defa9b
+RUN echo "KVCR_REF resolved to: ${KVCR_REF}" \
+ && git init /src/kvcr \
+ && git -C /src/kvcr remote add origin https://github.com/ai-dynamo/kvcr.git \
+ && git -C /src/kvcr fetch --depth 1 origin "${KVCR_REF}" \
+ && git -C /src/kvcr checkout --detach FETCH_HEAD \
+ && test "$(git -C /src/kvcr rev-parse HEAD)" = "${KVCR_REF}"
+
+FROM ${VLLM_IMAGE} AS final
+USER root
+ARG NCCL_VERSION=2.30.7
+RUN apt-get update && apt-get install -y --no-install-recommends libatomic1 \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=dynamo-builder /wheels /tmp/dynamo-wheels
+RUN python3 -m pip install --no-cache-dir --no-deps /tmp/dynamo-wheels/ai_dynamo_runtime-*.whl \
+ && python3 -m pip install --no-cache-dir --no-deps /tmp/dynamo-wheels/ai_dynamo-*.whl \
+ && rm -rf /tmp/dynamo-wheels
+COPY --from=kvcr-source /src/kvcr/pyproject.toml /src/kvcr/README.md /opt/kvcr-src/
+COPY --from=kvcr-source /src/kvcr/src /opt/kvcr-src/src
+
+# Index-health metrics (2026-09-11, KVCR_INDEX_HEALTH_DESIGN.md section 2b): G2 resident-age
+# gauge, patched into KVCR's own get_stats() before it's installed as a package.
+COPY container/kvcr_g2_age_patch.py /tmp/kvcr_g2_age_patch.py
+RUN python3 /tmp/kvcr_g2_age_patch.py /opt/kvcr-src/src/kvcr/core.py \
+ && rm -f /tmp/kvcr_g2_age_patch.py
+
+RUN python3 -m pip install --no-cache-dir /opt/kvcr-src \
+ && python3 -m pip install --no-cache-dir "nvidia-nccl-cu13==${NCCL_VERSION}"
+
+# Overlay the six vLLM files fetched from the public KVCR integration commit.
+COPY --from=vllm-kvcr-source /overlay/vllm /tmp/kvcr-vllm-overlay/vllm
+RUN VLLM_DIR="$(python3 -c 'import os, vllm; print(os.path.dirname(vllm.__file__))')" \
+ && cp -a /tmp/kvcr-vllm-overlay/vllm/. "${VLLM_DIR}/" \
+ && rm -rf /tmp/kvcr-vllm-overlay
+
+# TEMPORARY debug instrumentation (2026-09-10, RUNBOOK_KVCR.md): trace whether any
+# self-describing offload event ever reaches _take_stored_event with a non-CPU medium
+# (i.e. a secondary-tier/KVCR completion), to empirically resolve whether the connector
+# ever emits a tier-tagged event for the KVCR cascade at all. Remove once resolved.
+COPY container/kvcr_debug_patch.py /tmp/kvcr_debug_patch.py
+RUN VLLM_DIR="$(python3 -c 'import os, vllm; print(os.path.dirname(vllm.__file__))')" \
+ && python3 /tmp/kvcr_debug_patch.py "${VLLM_DIR}/distributed/kv_transfer/kv_connector/v1/offloading/events.py" \
+ && rm -f /tmp/kvcr_debug_patch.py
+
+# Index-health metrics (2026-09-11, KVCR_INDEX_HEALTH_DESIGN.md section 2b): registers the
+# vllm:kvcr_g2_resident_age_seconds gauge definition the kvcr_g2_age_patch.py step above emits.
+COPY container/kvcr_manager_metrics_patch.py /tmp/kvcr_manager_metrics_patch.py
+RUN VLLM_DIR="$(python3 -c 'import os, vllm; print(os.path.dirname(vllm.__file__))')" \
+ && python3 /tmp/kvcr_manager_metrics_patch.py "${VLLM_DIR}/v1/kv_offload/tiering/kvcr/manager.py" \
+ && rm -f /tmp/kvcr_manager_metrics_patch.py
+
+ENV DYN_REQUEST_PLANE=tcp \
+    DYN_EVENT_PLANE=zmq \
+    DYN_DISCOVERY_BACKEND=file \
+    DYN_FILE_KV=/tmp/dynamo-kvcr-quick-start \
+    PYTHONHASHSEED=0 \
+    VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=1
+
+# The `vllm` user in this base image has no matching `vllm` group (gid 0/root) - confirmed via
+# `id vllm` against the pinned image, 2026-09-10.
+RUN mkdir -p /home/vllm/.cache/huggingface && chown -R vllm:root /home/vllm/.cache
+WORKDIR /workspace
+USER vllm
+ENTRYPOINT []
