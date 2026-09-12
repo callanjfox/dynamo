@@ -247,6 +247,21 @@ const BLOCK_LIFETIME_HELP: &str = "Age (seconds) of a KV block at the moment it 
 #[cfg(feature = "metrics")]
 const BLOCK_LIFETIME_LABELS: &[&str] = &["tier"];
 
+/// Explicit buckets for `block_lifetime_seconds`, spanning sub-second turnover through several
+/// hours of retention. Prometheus's stock default buckets top out at 10s, which collapses the
+/// overwhelming majority of real block lifetimes (this tier's whole purpose - especially the
+/// host-pinned/G2 tier, meant for longer retention than device memory - is content living well
+/// past 10 seconds) into the `+Inf` bucket, making `histogram_quantile()` on p50/p99 meaningless.
+/// Every other histogram in this crate/its sibling (`lib/llm/src/kv_router/metrics.rs`) tunes
+/// its buckets to the metric's expected range; this one originally didn't.
+#[cfg(feature = "metrics")]
+fn block_lifetime_buckets() -> Vec<f64> {
+    vec![
+        0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0, 7200.0,
+        14400.0,
+    ]
+}
+
 #[cfg(all(feature = "metrics", feature = "runtime-protocols"))]
 static KV_INDEXER_METRICS: OnceLock<Arc<KvIndexerMetrics>> = OnceLock::new();
 
@@ -282,7 +297,8 @@ impl KvIndexerMetrics {
                 CKF_MUTATION_LABELS,
             )?,
             HistogramVec::new(
-                HistogramOpts::new(BLOCK_LIFETIME_NAME, BLOCK_LIFETIME_HELP),
+                HistogramOpts::new(BLOCK_LIFETIME_NAME, BLOCK_LIFETIME_HELP)
+                    .buckets(block_lifetime_buckets()),
                 BLOCK_LIFETIME_LABELS,
             )?,
         ))
@@ -331,7 +347,7 @@ impl KvIndexerMetrics {
                             BLOCK_LIFETIME_HELP,
                             BLOCK_LIFETIME_LABELS,
                             &[],
-                            None,
+                            Some(block_lifetime_buckets()),
                         ),
                     ) {
                         (
