@@ -12,7 +12,7 @@ use dynamo_runtime::component::Component;
 #[cfg(all(feature = "metrics", feature = "runtime-protocols"))]
 use dynamo_runtime::metrics::MetricsHierarchy;
 #[cfg(feature = "metrics")]
-use prometheus::{IntCounter, IntCounterVec, Opts};
+use prometheus::{HistogramOpts, HistogramVec, IntCounter, IntCounterVec, Opts};
 
 use crate::protocols::{KvCacheEventData, KvCacheEventError, RouterEvent};
 
@@ -178,6 +178,11 @@ pub struct KvIndexerMetrics {
     /// Counters for CKF mutation outcomes that are finer-grained than event status.
     #[cfg(feature = "metrics")]
     pub ckf_mutation: IntCounterVec,
+    /// Age-at-eviction (`KVCR_INDEX_HEALTH_DESIGN.md` 1a/2a), observed via `age_tracking`'s
+    /// event-stream side-table, not backend-internal state - see that module's docs.
+    /// Diagnostic-only, not yet through this crate's benchmark/review pass.
+    #[cfg(feature = "metrics")]
+    pub block_lifetime_seconds: HistogramVec,
 }
 
 /// Metric status labels.
@@ -229,6 +234,18 @@ const CKF_MUTATION_NAME: &str = "dynamo_kvrouter_ckf_mutation_total";
 const CKF_MUTATION_HELP: &str = "Total number of CKF block-level mutation outcomes";
 #[cfg(feature = "metrics")]
 const CKF_MUTATION_LABELS: &[&str] = &["outcome"];
+#[cfg(all(feature = "metrics", feature = "runtime-protocols"))]
+const BLOCK_LIFETIME_SUFFIX: &str = "router_kv_index_block_lifetime_seconds";
+#[cfg(feature = "metrics")]
+const BLOCK_LIFETIME_NAME: &str = "dynamo_kvrouter_router_kv_index_block_lifetime_seconds";
+#[cfg(feature = "metrics")]
+const BLOCK_LIFETIME_HELP: &str = "Age (seconds) of a KV block at the moment it was evicted \
+    from the tier it lived in, observed via the router event stream. Diagnostic-only, biased \
+    toward short-lived blocks (survivorship bias) - answers how fast the cache is turning \
+    over, not how stale currently-resident data is. Expect a burst of misleadingly short \
+    lifetimes right after any router restart (no recovery for pre-restart insertion times).";
+#[cfg(feature = "metrics")]
+const BLOCK_LIFETIME_LABELS: &[&str] = &["tier"];
 
 #[cfg(all(feature = "metrics", feature = "runtime-protocols"))]
 static KV_INDEXER_METRICS: OnceLock<Arc<KvIndexerMetrics>> = OnceLock::new();
@@ -239,11 +256,13 @@ impl KvIndexerMetrics {
         kv_cache_events_applied: IntCounterVec,
         kv_cache_event_warnings: IntCounterVec,
         ckf_mutation: IntCounterVec,
+        block_lifetime_seconds: HistogramVec,
     ) -> Self {
         Self {
             kv_cache_events_applied,
             kv_cache_event_warnings,
             ckf_mutation,
+            block_lifetime_seconds,
         }
     }
 
@@ -262,6 +281,10 @@ impl KvIndexerMetrics {
                 Opts::new(CKF_MUTATION_NAME, CKF_MUTATION_HELP),
                 CKF_MUTATION_LABELS,
             )?,
+            HistogramVec::new(
+                HistogramOpts::new(BLOCK_LIFETIME_NAME, BLOCK_LIFETIME_HELP),
+                BLOCK_LIFETIME_LABELS,
+            )?,
         ))
     }
 
@@ -272,6 +295,7 @@ impl KvIndexerMetrics {
         registry.register(Box::new(metrics.kv_cache_events_applied.clone()))?;
         registry.register(Box::new(metrics.kv_cache_event_warnings.clone()))?;
         registry.register(Box::new(metrics.ckf_mutation.clone()))?;
+        registry.register(Box::new(metrics.block_lifetime_seconds.clone()))?;
         Ok(metrics)
     }
 
@@ -302,17 +326,26 @@ impl KvIndexerMetrics {
                             CKF_MUTATION_LABELS,
                             &[],
                         ),
+                        component.metrics().create_histogramvec(
+                            BLOCK_LIFETIME_SUFFIX,
+                            BLOCK_LIFETIME_HELP,
+                            BLOCK_LIFETIME_LABELS,
+                            &[],
+                            None,
+                        ),
                     ) {
                         (
                             Ok(kv_cache_events_applied),
                             Ok(kv_cache_event_warnings),
                             Ok(ckf_mutation),
+                            Ok(block_lifetime_seconds),
                         ) => Arc::new(Self::new(
                             kv_cache_events_applied,
                             kv_cache_event_warnings,
                             ckf_mutation,
+                            block_lifetime_seconds,
                         )),
-                        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+                        (Err(e), ..) | (_, Err(e), ..) | (_, _, Err(e), _) | (_, _, _, Err(e)) => {
                             tracing::warn!("Failed to create kv indexer metrics from component: {}. Using unregistered metrics as fallback.", e);
                             Arc::new(Self::new_unregistered())
                         }
@@ -379,6 +412,19 @@ impl KvIndexerMetrics {
         }
         #[cfg(not(feature = "metrics"))]
         let _ = (self, event_type, result);
+    }
+
+    /// Records one age-at-eviction sample (`KVCR_INDEX_HEALTH_DESIGN.md` 1a/2a). `tier` is
+    /// `"device"` or `"host_pinned"` (see `age_tracking::tier_label`).
+    pub fn observe_block_lifetime(&self, tier: &str, age_seconds: f64) {
+        #[cfg(feature = "metrics")]
+        {
+            self.block_lifetime_seconds
+                .with_label_values(&[tier])
+                .observe(age_seconds);
+        }
+        #[cfg(not(feature = "metrics"))]
+        let _ = (self, tier, age_seconds);
     }
 
     pub fn increment_event_warning(&self, warning_kind: &'static str) {

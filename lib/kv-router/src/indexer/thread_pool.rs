@@ -16,10 +16,10 @@ use rustc_hash::FxBuildHasher;
 use tokio::sync::oneshot;
 
 use super::{
-    ApproximateLruClient, ApproximateLruCommandSink, ApproximateLruIncarnation,
+    AgeTracker, ApproximateLruClient, ApproximateLruCommandSink, ApproximateLruIncarnation,
     ApproximateLruLease, ApproximateLruStats, ApproximateLruTask, ApproximateRetentionConfig,
-    KvIndexerInterface, KvIndexerMetrics, KvRouterError, RedundancyStats, ShardSizeSnapshot,
-    SyncIndexer, WorkerLookupStats, WorkerTask, panic_payload_message,
+    DemandTracker, KvIndexerInterface, KvIndexerMetrics, KvRouterError, RedundancyStats,
+    ShardSizeSnapshot, SyncIndexer, WorkerLookupStats, WorkerTask, panic_payload_message,
 };
 #[cfg(feature = "bench")]
 use super::{
@@ -93,6 +93,23 @@ pub struct ThreadPoolIndexer<T: SyncIndexer> {
 
     /// Whether approximate routing decisions use request-scoped LRU leases.
     approximate_lru_enabled: bool,
+
+    /// Diagnostic-only age-at-eviction side-table (`KVCR_INDEX_HEALTH_DESIGN.md` 1a/2a) - see
+    /// `age_tracking` module docs. Observes the same event stream dispatched to `backend`
+    /// below, entirely independent of it.
+    age_tracker: AgeTracker,
+
+    /// Diagnostic-only cumulative distinct-block ("unconstrained demand",
+    /// `DASHBOARD_METRICS_ENGINEERING_PLAN.md` section 2b) side-table - see `demand_tracking`
+    /// module docs. Observes the same event stream as `age_tracker` above, but keyed by block
+    /// hash alone (not per-worker-copy) and never evicted on `Remove`/`Cleared`.
+    demand_tracker: DemandTracker,
+
+    /// Own copy of the metrics handle passed to `new_with_metrics*`, kept here (in addition
+    /// to the clone already threaded into each worker-thread closure for `backend.worker()`)
+    /// so `enqueue_event`/`apply_event_and_wait` - which run on `&self`, not inside a worker
+    /// thread - can feed `age_tracker`'s observations into `observe_block_lifetime`.
+    metrics: Option<Arc<KvIndexerMetrics>>,
 
     #[cfg(feature = "bench")]
     observation_active: AtomicBool,
@@ -330,6 +347,9 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
             prune_pump_cancel,
             synthetic_event_id,
             approximate_lru_enabled,
+            age_tracker: AgeTracker::new(),
+            demand_tracker: DemandTracker::new(),
+            metrics,
             #[cfg(feature = "bench")]
             observation_active: AtomicBool::new(false),
         }
@@ -677,6 +697,8 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
 
     /// Enqueue an event and report whether the worker queue accepted it.
     pub fn enqueue_event(&self, event: RouterEvent) -> Result<(), KvRouterError> {
+        self.age_tracker.observe_event(&event, self.metrics.as_deref());
+        self.demand_tracker.observe_event(&event);
         let (thread_idx, second_idx) = self.event_thread_indices(&event);
         if let Some(second_idx) = second_idx {
             self.worker_event_channels[thread_idx]
@@ -698,6 +720,8 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
 
     /// Apply one event on its worker lane and wait for the backend result.
     pub async fn apply_event_and_wait(&self, event: RouterEvent) -> Result<(), KvRouterError> {
+        self.age_tracker.observe_event(&event, self.metrics.as_deref());
+        self.demand_tracker.observe_event(&event);
         let (thread_idx, second_idx) = self.event_thread_indices(&event);
         let enqueue = |idx: usize, event: RouterEvent| {
             let (resp_tx, resp_rx) = oneshot::channel();
@@ -727,6 +751,26 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
             }
         }
         Ok(())
+    }
+
+    /// Live/resident block-age percentiles (`KVCR_INDEX_HEALTH_DESIGN.md` 1b), min/p50/p99/max
+    /// seconds since insertion across every block this indexer's `age_tracker` side-table
+    /// currently considers resident. Generic over `T` (unlike `redundancy_stats()`, which
+    /// needs separate concrete impls per backend) because this reads only the age-tracking
+    /// side-table, never `backend`'s own structures - see `age_tracking` module docs.
+    /// `None` when nothing has been tracked yet. Diagnostic-only, same O(index size) cost
+    /// class as `redundancy_stats()` - call from a slow background sampler only.
+    pub fn resident_age_percentiles(&self) -> Option<super::age_tracking::AgeStats> {
+        self.age_tracker.resident_age_percentiles()
+    }
+
+    /// Cumulative distinct-block ("unconstrained demand") counts over the three
+    /// 1m/5m/15m windows (`DASHBOARD_METRICS_ENGINEERING_PLAN.md` section 2b) - see
+    /// `demand_tracking` module docs. Prunes entries older than the longest (15m) window as a
+    /// side effect, so this must only be called from a slow background sampler, same as
+    /// `resident_age_percentiles` above - not a read-only query.
+    pub fn demand_distinct_blocks(&self) -> super::demand_tracking::DemandWindowCounts {
+        self.demand_tracker.prune_and_count_windows()
     }
 
     /// Wait until every worker queue has completed tasks accepted before this call.
@@ -1104,6 +1148,17 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
 // rather than each thread's own local reverse-lookup map). Diagnostic-only,
 // see redundancy.rs's own doc comment for the caveats.
 impl ThreadPoolIndexer<super::concurrent_radix_tree_compressed::ConcurrentRadixTreeCompressed> {
+    pub fn redundancy_stats(&self) -> RedundancyStats {
+        self.backend.redundancy_stats()
+    }
+}
+
+// Lower-tier counterpart to the impl above - same rationale (concretely
+// typed rather than generic over T: SyncIndexer, direct synchronous read of
+// the shared backend, diagnostic-only). `LowerTierIndexer::redundancy_stats`
+// walks a flat DashMap edge map, structurally unrelated to the primary
+// tree's radix-tree BFS, so this is independent code, not shared logic.
+impl ThreadPoolIndexer<super::LowerTierIndexer> {
     pub fn redundancy_stats(&self) -> RedundancyStats {
         self.backend.redundancy_stats()
     }
