@@ -13,23 +13,40 @@
 //! diagnostic-only addition should not have to clear, and should not risk by touching that
 //! code at all. This module never reads or writes either backend's state.
 //!
-//! **Tradeoff, stated plainly**: this tracks "how long has this (worker, dp_rank, block)
-//! triple been observed as stored, from the event stream's point of view" - not the
-//! backend's own authoritative internal state. If a backend silently rejects a Store or
-//! Remove event (a real possibility - see `KvIndexerMetrics::increment_event_applied`'s
-//! `status` outcomes), this side-table can drift from what the backend actually holds.
-//! Given the metric this feeds is already documented as approximate/diagnostic-only
-//! ("how fast is the cache turning over," not an exact per-block guarantee), this is an
-//! intentional, reasoned trade of perfect fidelity for zero risk to the protected hot-path
-//! structures. Same restart caveat as the rest of this design: a process restart loses all
-//! tracked insertion times with no recovery, so expect a burst of misleadingly short
-//! lifetimes right after any router restart (correction 7 in the design doc).
+//! **Tradeoff, stated plainly**: this tracks "how long has this (residency owner, block)
+//! pair been observed as stored, from the event stream's point of view" - not the backend's
+//! own authoritative internal state. If a backend silently rejects a Store or Remove event
+//! (a real possibility - see `KvIndexerMetrics::increment_event_applied`'s `status`
+//! outcomes), this side-table can drift from what the backend actually holds. Given the
+//! metric this feeds is already documented as approximate/diagnostic-only ("how fast is the
+//! cache turning over," not an exact per-block guarantee), this is an intentional, reasoned
+//! trade of perfect fidelity for zero risk to the protected hot-path structures. Same restart
+//! caveat as the rest of this design: a process restart loses all tracked insertion times
+//! with no recovery, so expect a burst of misleadingly short lifetimes right after any
+//! router restart (correction 7 in the design doc).
+//!
+//! **Keyed by `ResidencyOwner`, not raw `(worker_id, dp_rank)`** (fixed after an adversarial
+//! review caught the original version keying every event by its literal `worker_id`,
+//! including `CacheOwner`-domain events - e.g. KVCR host-pinned/G2 residency - whose whole
+//! design point is a stable identity that survives worker failover. A `CacheOwner` event's
+//! wire `worker_id` is `attachment_worker.worker_id`: whichever worker currently holds the
+//! attachment (`lib/llm/src/kv_router/publisher/state_agent.rs`), which changes across a
+//! worker replacement even though the logical owner does not. Keying by raw `worker_id`
+//! meant a `Removed`/`Cleared` event after any such replacement could never match the entry
+//! inserted under the old `worker_id`, permanently orphaning it - unbounded slow growth in
+//! `inserted_at`, and `resident_age_percentiles()`'s p99/max skewed upward forever by phantom
+//! entries. `RouterEvent::residency_owner()` already resolves the correct stable identity for
+//! both domains (`Worker(WorkerWithDpRank)` or `CacheOwner(CacheOwnerId)`) - the same
+//! resolution `LowerTierIndexer::apply_event` already relies on for its own real backend
+//! state, so this fix makes the diagnostic side-table agree with the actual backend's
+//! notion of ownership instead of silently disagreeing with it.
 //!
 //! Cost: O(1) DashMap op per stored/removed block (insert-if-absent on Store, remove +
 //! histogram observe on Remove) for 1a/2a, same event volume the backend already processes -
-//! no new per-event scanning. `Cleared` does a bounded retain-scan over this tracker's own
-//! (typically small, capacity-bounded) entry set for the one worker being cleared, not the
-//! whole fleet.
+//! no new per-event scanning. `Cleared` does a full scan of this tracker's own entry set
+//! (a `retain` over every tracked entry, filtering by the resolved `ResidencyOwner`) - bounded
+//! by this side-table's own size, not the whole fleet, but O(this tracker's size) rather than
+//! O(1), same cost class as `resident_age_percentiles` below.
 //!
 //! 1b (`resident_age_percentiles`) is a different cost class: it walks every entry this
 //! tracker currently holds (which is, at any moment, exactly the set of blocks this tier
@@ -52,8 +69,7 @@ use crate::protocols::*;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct AgeKey {
-    worker_id: WorkerId,
-    dp_rank: DpRank,
+    owner: ResidencyOwner,
     block_hash: ExternalSequenceBlockHash,
 }
 
@@ -76,10 +92,16 @@ impl AgeTracker {
         let tier_label = tier_label(event.storage_tier);
         match &event.event.data {
             KvCacheEventData::Stored(store) => {
+                // An event whose residency domain can't be resolved (e.g. a CacheOwner-domain
+                // store on the device tier, which `resolved_residency_domain()` rejects) is
+                // silently skipped here, same as an event this tracker never saw - there is no
+                // owner identity to key it by.
+                let Ok(owner) = event.residency_owner() else {
+                    return;
+                };
                 for block in &store.blocks {
                     let key = AgeKey {
-                        worker_id: event.worker_id,
-                        dp_rank: event.event.dp_rank,
+                        owner,
                         block_hash: block.block_hash,
                     };
                     // Insert-if-absent: a duplicate/redundant store for an already-tracked
@@ -89,10 +111,12 @@ impl AgeTracker {
                 }
             }
             KvCacheEventData::Removed(remove) => {
+                let Ok(owner) = event.residency_owner() else {
+                    return;
+                };
                 for block_hash in &remove.block_hashes {
                     let key = AgeKey {
-                        worker_id: event.worker_id,
-                        dp_rank: event.event.dp_rank,
+                        owner,
                         block_hash: *block_hash,
                     };
                     // Blocks this tracker never saw stored (pre-dates this process, or a
@@ -105,11 +129,37 @@ impl AgeTracker {
                     }
                 }
             }
+            // Mirrors `LowerTierIndexer::apply_event`'s Cleared handling exactly (same
+            // `reset_scope()`/`ResidencyOwner` resolution), so this side-table purges the same
+            // entries the real backend would - not the "current worker_id" this event happens
+            // to carry, which for a CacheOwner-domain clear may not be the worker that owns
+            // any of the entries being cleared.
             KvCacheEventData::Cleared => {
-                let worker_id = event.worker_id;
-                let dp_rank = event.event.dp_rank;
-                self.inserted_at
-                    .retain(|key, _| key.worker_id != worker_id || key.dp_rank != dp_rank);
+                let Ok(Some(scope)) = event.reset_scope() else {
+                    return;
+                };
+                let worker_owner = ResidencyOwner::worker(WorkerWithDpRank::new(
+                    event.worker_id,
+                    event.event.dp_rank,
+                ));
+                match scope {
+                    ResetScope::All => {
+                        let cache_owner = event.state_source.map(ResidencyOwner::cache_owner);
+                        self.inserted_at.retain(|key, _| {
+                            key.owner != worker_owner && Some(key.owner) != cache_owner
+                        });
+                    }
+                    ResetScope::Domain(ResidencyDomain::Worker) => {
+                        self.inserted_at.retain(|key, _| key.owner != worker_owner);
+                    }
+                    ResetScope::Domain(ResidencyDomain::CacheOwner) => {
+                        let Some(cache_owner_id) = event.state_source else {
+                            return;
+                        };
+                        let cache_owner = ResidencyOwner::cache_owner(cache_owner_id);
+                        self.inserted_at.retain(|key, _| key.owner != cache_owner);
+                    }
+                }
             }
         }
     }
@@ -161,7 +211,60 @@ fn tier_label(tier: StorageTier) -> &'static str {
 #[cfg(all(test, feature = "metrics"))]
 mod tests {
     use super::*;
+    use crate::identity::{
+        CacheOwnerId, CacheSemanticsId, DcId, IdentitySource, IndexerDomainId, PoolId,
+        RoutingScopeId, StableDpSlotId,
+    };
     use crate::indexer::metrics::KvIndexerMetrics;
+
+    fn cache_owner_id() -> CacheOwnerId {
+        CacheOwnerId::new(
+            PoolId::new(
+                IndexerDomainId::new(
+                    CacheSemanticsId::new([1; 16], IdentitySource::Explicit),
+                    RoutingScopeId::new([2; 16], IdentitySource::Explicit),
+                ),
+                DcId::new(3),
+            ),
+            StableDpSlotId::new([4; 16], IdentitySource::Explicit),
+        )
+    }
+
+    fn cache_owner_store_event(worker_id: WorkerId, hash: u64, tier: StorageTier) -> RouterEvent {
+        RouterEvent::with_cache_owner(
+            worker_id,
+            KvCacheEvent {
+                event_id: 1,
+                data: KvCacheEventData::Stored(KvCacheStoreData {
+                    parent_hash: None,
+                    start_position: None,
+                    blocks: vec![KvCacheStoredBlockData {
+                        block_hash: ExternalSequenceBlockHash(hash),
+                        tokens_hash: LocalBlockHash(hash),
+                        mm_extra_info: None,
+                    }],
+                }),
+                dp_rank: 0,
+            },
+            tier,
+            cache_owner_id(),
+        )
+    }
+
+    fn cache_owner_remove_event(worker_id: WorkerId, hash: u64, tier: StorageTier) -> RouterEvent {
+        RouterEvent::with_cache_owner(
+            worker_id,
+            KvCacheEvent {
+                event_id: 2,
+                data: KvCacheEventData::Removed(KvCacheRemoveData {
+                    block_hashes: vec![ExternalSequenceBlockHash(hash)],
+                }),
+                dp_rank: 0,
+            },
+            tier,
+            cache_owner_id(),
+        )
+    }
 
     fn store_event(worker_id: WorkerId, dp_rank: DpRank, hash: u64, tier: StorageTier) -> RouterEvent {
         RouterEvent::with_storage_tier(
@@ -275,13 +378,52 @@ mod tests {
 
         assert_eq!(tracker.inserted_at.len(), 1);
         assert!(
-            tracker
-                .inserted_at
-                .contains_key(&AgeKey {
-                    worker_id: 2,
-                    dp_rank: 0,
-                    block_hash: ExternalSequenceBlockHash(43),
-                })
+            tracker.inserted_at.contains_key(&AgeKey {
+                owner: ResidencyOwner::worker(WorkerWithDpRank::new(2, 0)),
+                block_hash: ExternalSequenceBlockHash(43),
+            })
+        );
+    }
+
+    /// Regression test for the bug an adversarial review caught: a `CacheOwner`-domain block
+    /// (e.g. KVCR host-pinned/G2 residency) must remain trackable across a worker failover,
+    /// since its stable identity is the cache owner, not whichever worker currently holds the
+    /// attachment. Before the fix (keying by raw `worker_id`), the `Removed` event below -
+    /// carrying the *new* worker's id, exactly as `state_agent.rs` really emits it after a
+    /// reattachment - would never match the entry inserted under the *old* worker's id, so it
+    /// would leak forever and never record a lifetime sample.
+    #[test]
+    fn cache_owner_identity_survives_worker_failover() {
+        let tracker = AgeTracker::new();
+        let metrics = KvIndexerMetrics::new_unregistered();
+
+        // Worker 1 holds the attachment when the block is first stored.
+        tracker.observe_event(
+            &cache_owner_store_event(1, 99, StorageTier::HostPinned),
+            Some(&metrics),
+        );
+        assert_eq!(tracker.inserted_at.len(), 1);
+
+        // The attachment fails over to worker 2 - same cache owner, different worker_id on
+        // the wire - and worker 2 is the one that reports the eventual removal.
+        tracker.observe_event(
+            &cache_owner_remove_event(2, 99, StorageTier::HostPinned),
+            Some(&metrics),
+        );
+
+        assert_eq!(
+            tracker.inserted_at.len(),
+            0,
+            "the entry must be found and removed via the stable cache-owner identity, \
+             not orphaned under worker 1's id"
+        );
+        assert_eq!(
+            metrics
+                .block_lifetime_seconds
+                .with_label_values(&["host_pinned"])
+                .get_sample_count(),
+            1,
+            "the lifetime sample must still be recorded despite the worker_id change"
         );
     }
 }
