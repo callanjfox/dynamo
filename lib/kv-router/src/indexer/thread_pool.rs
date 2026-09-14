@@ -764,6 +764,16 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
         self.age_tracker.resident_age_percentiles()
     }
 
+    /// Live/resident block count for this index, grouped by worker - see
+    /// `AgeTracker::resident_block_counts_by_worker` for the mechanism and its
+    /// `CacheOwner`-domain caveat. Same diagnostic-only, background-sampler-only status as
+    /// `resident_age_percentiles` above.
+    pub fn resident_block_counts_by_worker(
+        &self,
+    ) -> std::collections::HashMap<crate::protocols::WorkerWithDpRank, usize> {
+        self.age_tracker.resident_block_counts_by_worker()
+    }
+
     /// Cumulative distinct-block ("unconstrained demand") counts over the three
     /// 1m/5m/15m windows (`DASHBOARD_METRICS_ENGINEERING_PLAN.md` section 2b) - see
     /// `demand_tracking` module docs. Prunes entries older than the longest (15m) window as a

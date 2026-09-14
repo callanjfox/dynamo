@@ -59,6 +59,7 @@
 //! doc draft assumed - avoids a second new data structure: the set of "things currently
 //! tracked here" already is the live/resident set 1b needs.
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use dashmap::DashMap;
@@ -186,6 +187,31 @@ impl AgeTracker {
             p99: pct(0.99),
             max: ages[n - 1],
         })
+    }
+
+    /// Live/resident block count, grouped by worker (2026-09-14 follow-up to
+    /// `KVCR_INDEX_HEALTH_DESIGN.md`: "how hard would it be to have metrics on G1/G2 usage per
+    /// worker" - answered here for the tier this tracker serves). Reuses the exact same live
+    /// entry set `resident_age_percentiles()` already walks, just grouped by owner instead of
+    /// collapsed to one set of percentiles - no new bookkeeping, same O(this tracker's live
+    /// size) cost class, same "background sampler only" caveat.
+    ///
+    /// `CacheOwner`-domain entries (a KVCR/cross-worker-shared G2 tier's stable identity, not
+    /// produced by a local-only-G2 deployment - see the module docs' "Keyed by
+    /// `ResidencyOwner`" section) are skipped: attributing one to "a worker" would require
+    /// resolving the current cache-owner-to-worker attachment, which this diagnostic
+    /// side-table deliberately does not do. They simply don't appear in the result, same as a
+    /// worker with a fully-evicted (empty) index - the caller must treat "absent" as 0, not
+    /// skip updating that worker's gauge (see `spawn_live_index_gauge_sampler`'s
+    /// `known_workers`/`seen_this_round` handling for the established pattern).
+    pub(super) fn resident_block_counts_by_worker(&self) -> HashMap<WorkerWithDpRank, usize> {
+        let mut counts = HashMap::new();
+        for entry in self.inserted_at.iter() {
+            if let ResidencyOwner::Worker(worker) = entry.key().owner {
+                *counts.entry(worker).or_insert(0usize) += 1;
+            }
+        }
+        counts
     }
 }
 
@@ -383,6 +409,45 @@ mod tests {
                 block_hash: ExternalSequenceBlockHash(43),
             })
         );
+    }
+
+    #[test]
+    fn resident_block_counts_by_worker_groups_by_owner() {
+        let tracker = AgeTracker::new();
+        tracker.observe_event(&store_event(1, 0, 42, StorageTier::Device), None);
+        tracker.observe_event(&store_event(1, 0, 43, StorageTier::Device), None);
+        tracker.observe_event(&store_event(2, 0, 44, StorageTier::Device), None);
+
+        let counts = tracker.resident_block_counts_by_worker();
+        assert_eq!(
+            counts.get(&WorkerWithDpRank::new(1, 0)),
+            Some(&2),
+            "worker 1 has two resident blocks"
+        );
+        assert_eq!(
+            counts.get(&WorkerWithDpRank::new(2, 0)),
+            Some(&1),
+            "worker 2 has one resident block"
+        );
+        assert_eq!(counts.len(), 2, "no phantom or missing workers");
+    }
+
+    #[test]
+    fn resident_block_counts_by_worker_skips_cache_owner_entries() {
+        let tracker = AgeTracker::new();
+        tracker.observe_event(
+            &cache_owner_store_event(1, 99, StorageTier::HostPinned),
+            None,
+        );
+        tracker.observe_event(&store_event(2, 0, 100, StorageTier::HostPinned), None);
+
+        let counts = tracker.resident_block_counts_by_worker();
+        assert_eq!(
+            counts.len(),
+            1,
+            "the CacheOwner-domain entry must not appear under any worker key"
+        );
+        assert_eq!(counts.get(&WorkerWithDpRank::new(2, 0)), Some(&1));
     }
 
     /// Regression test for the bug an adversarial review caught: a `CacheOwner`-domain block

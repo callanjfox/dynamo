@@ -499,6 +499,74 @@ fn spawn_lower_tier_resident_age_gauge_sampler(
     });
 }
 
+/// Per-worker live/resident KV size for the host-pinned (G2) lower-tier index (2026-09-14,
+/// "how hard would it be to have metrics on G1/G2 usage per worker"). G1 already has this -
+/// `spawn_live_index_gauge_sampler`'s `router_live_index_tokens{kv_worker_id,dp_rank}`, sourced
+/// straight from the primary backend's own `worker_lookup_stats()` - so this only fills the G2
+/// gap, using `ThreadPoolIndexer::resident_block_counts_by_worker()` (reads the same
+/// `age_tracking` side-table `spawn_lower_tier_resident_age_gauge_sampler` already reads, this
+/// time grouped by worker instead of collapsed to percentiles - no new bookkeeping). Same 10s
+/// interval, diagnostic-only status, and zero-on-missing-worker handling as
+/// `spawn_live_index_gauge_sampler`. `CacheOwner`-domain residency (a KVCR/cross-worker-shared
+/// G2 tier only) is not attributable to a single worker and is silently excluded - see
+/// `AgeTracker::resident_block_counts_by_worker`'s own doc comment.
+fn spawn_lower_tier_resident_blocks_by_worker_gauge_sampler(
+    component: &Component,
+    lower_tier: LowerTierIndexers,
+    block_size: u32,
+    cancellation_token: CancellationToken,
+) {
+    let gauge = match component.metrics().create_intgaugevec(
+        "router_kv_index_resident_tokens_host_pinned",
+        "Live KV blocks currently resident in the fleet's host-pinned (secondary-cache, e.g. \
+         KVCR G2) lower-tier index, per worker, in tokens (block_count x block_size). \
+         Diagnostic-only (sourced from the age_tracking side-table, not the lower-tier backend \
+         itself - see age_tracking module docs), sampled on a slow background interval; not yet \
+         benchmarked at production scale.",
+        &["kv_worker_id", "dp_rank"],
+        &[],
+    ) {
+        Ok(gauge) => gauge,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to create router_kv_index_resident_tokens_host_pinned gauge: {e}. \
+                 Lower-tier per-worker resident size will not be exported."
+            );
+            return;
+        }
+    };
+
+    tokio::spawn(async move {
+        let mut known_workers: HashSet<(u64, u32)> = HashSet::new();
+        loop {
+            tokio::select! {
+                _ = cancellation_token.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+            }
+            let Some(host_pinned) = lower_tier.get(StorageTier::HostPinned) else {
+                continue;
+            };
+            let counts = host_pinned.resident_block_counts_by_worker();
+            let mut seen_this_round: HashSet<(u64, u32)> = HashSet::new();
+            for (worker, block_count) in &counts {
+                let key = (worker.worker_id, worker.dp_rank);
+                seen_this_round.insert(key);
+                known_workers.insert(key);
+                let tokens = (*block_count as u64).saturating_mul(u64::from(block_size));
+                gauge
+                    .with_label_values(&[&worker.worker_id.to_string(), &worker.dp_rank.to_string()])
+                    .set(tokens as i64);
+            }
+            for (worker_id, dp_rank) in known_workers.difference(&seen_this_round) {
+                gauge
+                    .with_label_values(&[&worker_id.to_string(), &dp_rank.to_string()])
+                    .set(0);
+            }
+            known_workers = seen_this_round;
+        }
+    });
+}
+
 /// Cumulative distinct-block ("unconstrained demand", `DASHBOARD_METRICS_ENGINEERING_PLAN.md`
 /// section 2b) gauges for the primary (device/G1) index, reported as three simultaneous
 /// load-average-style windows (1m/5m/15m) rather than one fixed window - see
@@ -828,6 +896,12 @@ impl Indexer {
             spawn_lower_tier_resident_age_gauge_sampler(
                 component,
                 lower_tier.clone(),
+                cancellation_token.child_token(),
+            );
+            spawn_lower_tier_resident_blocks_by_worker_gauge_sampler(
+                component,
+                lower_tier.clone(),
+                block_size,
                 cancellation_token.child_token(),
             );
             spawn_lower_tier_demand_gauge_sampler(
