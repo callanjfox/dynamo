@@ -567,6 +567,111 @@ fn spawn_lower_tier_resident_blocks_by_worker_gauge_sampler(
     });
 }
 
+/// G1/G2 cross-tier content overlap (2026-09-14, "how much of G1 is in G2" - asked earlier this
+/// engagement, answered here rather than left as a design sketch). Reads
+/// `ThreadPoolIndexer::resident_block_hashes()` from BOTH tiers (reusing the same
+/// `age_tracking` side-tables every other diagnostic in this file already reads) and
+/// intersects the two sets - block hashes are content-addressed, so a hash present in both
+/// tiers' sets means that exact block's content is genuinely duplicated across tiers, not a
+/// coincidence. Distinct from `router_kv_index_redundancy_ratio`, which measures
+/// *within*-tier duplication (the same block on more than one worker in the SAME tier); this
+/// measures *across*-tier duplication instead.
+///
+/// Exports both directions, since they answer different questions:
+/// - `router_kv_index_g1_in_g2_pct`: how much of what's live in G1 has already been copied
+///   into G2 (a promote/copy-on-store design would trend this high; a pure "G2 only holds
+///   what G1 evicted" design should trend near 0, since content leaves G1 before landing in
+///   G2, not while it's still there).
+/// - `router_kv_index_g2_in_g1_pct`: how much of what's in G2 is a duplicate of still-live G1
+///   content rather than genuinely G1-evicted-only content - directly diagnoses whether G2 is
+///   doing proper eviction (disjoint from G1) or copy-on-store/promotion-on-hit (overlapping).
+///
+/// Same 10s interval, diagnostic-only status, and O(both tiers' live size) cost class as
+/// every other sampler in this family - this one does two side-table scans instead of one,
+/// so it is the most expensive of the group; revisit if it ever needs to run faster than the
+/// redundancy sampler.
+fn spawn_g1_g2_overlap_gauge_sampler(
+    component: &Component,
+    primary: Arc<ThreadPoolIndexer<ConcurrentRadixTreeCompressed>>,
+    lower_tier: LowerTierIndexers,
+    block_size: u32,
+    cancellation_token: CancellationToken,
+) {
+    let metrics = component.metrics();
+    let overlap_tokens_gauge = match metrics.create_intgauge(
+        "router_kv_index_g1_g2_overlap_tokens",
+        "KV content (in tokens: distinct blocks x block_size) resident in BOTH the primary \
+         (G1/device) and host-pinned (G2) live indexes at once - real cross-tier duplication, \
+         not within-tier (see router_kv_index_redundancy_ratio for that). Diagnostic-only, \
+         sampled on a slow background interval; not yet benchmarked at production scale.",
+        &[],
+    ) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to create router_kv_index_g1_g2_overlap_tokens gauge: {e}. \
+                 G1/G2 overlap will not be exported."
+            );
+            return;
+        }
+    };
+    let g1_in_g2_pct_gauge = match metrics.create_gauge(
+        "router_kv_index_g1_in_g2_pct",
+        "Percentage of G1's (device) distinct live content that is also currently resident in \
+         G2 (host-pinned). Diagnostic-only, sampled on a slow background interval.",
+        &[],
+    ) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to create router_kv_index_g1_in_g2_pct gauge: {e}. \
+                 G1/G2 overlap will not be exported."
+            );
+            return;
+        }
+    };
+    let g2_in_g1_pct_gauge = match metrics.create_gauge(
+        "router_kv_index_g2_in_g1_pct",
+        "Percentage of G2's (host-pinned) distinct live content that is also currently \
+         resident in G1 (device) - high values indicate copy-on-store/promotion-on-hit \
+         behavior; values near 0 indicate G2 holds only genuinely G1-evicted content. \
+         Diagnostic-only, sampled on a slow background interval.",
+        &[],
+    ) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to create router_kv_index_g2_in_g1_pct gauge: {e}. \
+                 G1/G2 overlap will not be exported."
+            );
+            return;
+        }
+    };
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancellation_token.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+            }
+            let Some(host_pinned) = lower_tier.get(StorageTier::HostPinned) else {
+                continue;
+            };
+            let g1_hashes = primary.resident_block_hashes();
+            let g2_hashes = host_pinned.resident_block_hashes();
+            let overlap = g1_hashes.intersection(&g2_hashes).count() as u64;
+
+            overlap_tokens_gauge.set(overlap.saturating_mul(u64::from(block_size)) as i64);
+            if !g1_hashes.is_empty() {
+                g1_in_g2_pct_gauge.set(100.0 * overlap as f64 / g1_hashes.len() as f64);
+            }
+            if !g2_hashes.is_empty() {
+                g2_in_g1_pct_gauge.set(100.0 * overlap as f64 / g2_hashes.len() as f64);
+            }
+        }
+    });
+}
+
 /// Cumulative distinct-block ("unconstrained demand", `DASHBOARD_METRICS_ENGINEERING_PLAN.md`
 /// section 2b) gauges for the primary (device/G1) index, reported as three simultaneous
 /// load-average-style windows (1m/5m/15m) rather than one fixed window - see
@@ -906,6 +1011,13 @@ impl Indexer {
             );
             spawn_lower_tier_demand_gauge_sampler(
                 component,
+                lower_tier.clone(),
+                block_size,
+                cancellation_token.child_token(),
+            );
+            spawn_g1_g2_overlap_gauge_sampler(
+                component,
+                primary.clone(),
                 lower_tier.clone(),
                 block_size,
                 cancellation_token.child_token(),

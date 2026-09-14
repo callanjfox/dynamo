@@ -59,7 +59,7 @@
 //! doc draft assumed - avoids a second new data structure: the set of "things currently
 //! tracked here" already is the live/resident set 1b needs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use dashmap::DashMap;
@@ -212,6 +212,22 @@ impl AgeTracker {
             }
         }
         counts
+    }
+
+    /// Distinct block hashes currently resident anywhere in this tier, fleet-wide, deduplicated
+    /// across owners (2026-09-14, "how much of G1 is in G2" - answered by intersecting this
+    /// tracker's set against the other tier's own `AgeTracker`, one instance per tier, at the
+    /// call site in `lib/llm`). Block hashes are content-addressed - the same hash resident in
+    /// both tiers' sets means that exact block's content is duplicated across tiers, not merely
+    /// a coincidence - so a plain set intersection is a real cross-tier overlap measurement,
+    /// not an approximation. Same reuse-the-existing-side-table reasoning, cost class, and
+    /// background-sampler-only caveat as `resident_age_percentiles`/
+    /// `resident_block_counts_by_worker` above.
+    pub(super) fn resident_block_hashes(&self) -> HashSet<ExternalSequenceBlockHash, FxBuildHasher> {
+        self.inserted_at
+            .iter()
+            .map(|entry| entry.key().block_hash)
+            .collect()
     }
 }
 
@@ -448,6 +464,20 @@ mod tests {
             "the CacheOwner-domain entry must not appear under any worker key"
         );
         assert_eq!(counts.get(&WorkerWithDpRank::new(2, 0)), Some(&1));
+    }
+
+    #[test]
+    fn resident_block_hashes_dedupes_across_owners() {
+        let tracker = AgeTracker::new();
+        // Same block hash tracked under two different workers - still one distinct hash.
+        tracker.observe_event(&store_event(1, 0, 42, StorageTier::Device), None);
+        tracker.observe_event(&store_event(2, 0, 42, StorageTier::Device), None);
+        tracker.observe_event(&store_event(1, 0, 43, StorageTier::Device), None);
+
+        let hashes = tracker.resident_block_hashes();
+        assert_eq!(hashes.len(), 2);
+        assert!(hashes.contains(&ExternalSequenceBlockHash(42)));
+        assert!(hashes.contains(&ExternalSequenceBlockHash(43)));
     }
 
     /// Regression test for the bug an adversarial review caught: a `CacheOwner`-domain block

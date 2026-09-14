@@ -774,6 +774,17 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
         self.age_tracker.resident_block_counts_by_worker()
     }
 
+    /// Distinct block hashes currently resident anywhere in this tier, fleet-wide - see
+    /// `AgeTracker::resident_block_hashes` for the mechanism. Intended to be intersected
+    /// against the equivalent set from the *other* tier's `ThreadPoolIndexer` at the call
+    /// site, to measure real cross-tier (G1/G2) content overlap.
+    pub fn resident_block_hashes(
+        &self,
+    ) -> std::collections::HashSet<crate::protocols::ExternalSequenceBlockHash, rustc_hash::FxBuildHasher>
+    {
+        self.age_tracker.resident_block_hashes()
+    }
+
     /// Cumulative distinct-block ("unconstrained demand") counts over the three
     /// 1m/5m/15m windows (`DASHBOARD_METRICS_ENGINEERING_PLAN.md` section 2b) - see
     /// `demand_tracking` module docs. Prunes entries older than the longest (15m) window as a
