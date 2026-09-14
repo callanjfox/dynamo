@@ -25,7 +25,7 @@
 //! never-pruned membership set as a real, unbounded memory-growth risk, not a free addition):
 //! this tracker is bounded by *time*, not by an arbitrary entry cap - and a 15-minute longest
 //! window is a materially smaller bound than the single 24h window this module originally
-//! shipped with. [`DemandTracker::prune_and_count_windows`] is called from the same slow (30s)
+//! shipped with. [`DemandTracker::prune_and_count_windows`] is called from the same 10s (dropped from an original 30s on 2026-09-14)
 //! background sampler tick that already reads `resident_age_percentiles`/`redundancy_stats` -
 //! the same cost class, not a new one - and evicts any entry whose first-seen time is older
 //! than the longest (15m) window while counting all three thresholds in that same single pass.
@@ -35,7 +35,7 @@
 //! Per-event cost is a single DashMap insert-if-absent on `Stored` only (`Removed`/`Cleared`
 //! are no-ops here) - the same O(1)-per-event class already accepted for `AgeTracker`, and
 //! unaffected by having three windows instead of one, since all three read the same underlying
-//! `first_seen` timestamp - only the once-per-30s counting pass does three comparisons per
+//! `first_seen` timestamp - only the once-per-10s counting pass does three comparisons per
 //! entry instead of one.
 //!
 //! Like `AgeTracker`, this never reads or writes either backend's own structures, so it is not

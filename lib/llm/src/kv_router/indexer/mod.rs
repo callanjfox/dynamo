@@ -210,11 +210,13 @@ fn spawn_live_index_gauge_sampler(
 /// getting hopped between workers a lot, leaving its prefix re-materialized
 /// on each one). Diagnostic-only: `ConcurrentRadixTreeCompressed::
 /// redundancy_stats` walks the whole tree (see its own doc comment), so
-/// this samples far less often than `spawn_live_index_gauge_sampler`'s 3s -
-/// 30s keeps the walk's cost off anything latency-sensitive while still
-/// being live enough to watch during a benchmark run. Has not been through
-/// this crate's AGENTS.md-mandated benchmark pass or review; not cleared
-/// for a production-scale deployment.
+/// this still samples less often than `spawn_live_index_gauge_sampler`'s 3s -
+/// 10s (dropped from an original 30s on 2026-09-14, to compare against
+/// AIPerf's own finer-grained timeslices) keeps the walk's cost off
+/// anything latency-sensitive while giving 3x the resolution of the
+/// original interval. Has not been through this crate's AGENTS.md-mandated
+/// benchmark pass or review; not cleared for a production-scale deployment -
+/// re-check this cost class specifically if lowering the interval further.
 fn spawn_kv_redundancy_gauge_sampler(
     component: &Component,
     primary: Arc<ThreadPoolIndexer<ConcurrentRadixTreeCompressed>>,
@@ -276,7 +278,7 @@ fn spawn_kv_redundancy_gauge_sampler(
         loop {
             tokio::select! {
                 _ = cancellation_token.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                _ = tokio::time::sleep(Duration::from_secs(10)) => {}
             }
             let stats = primary.redundancy_stats();
             let distinct_tokens = stats.distinct_blocks.saturating_mul(u64::from(block_size));
@@ -375,7 +377,7 @@ fn spawn_lower_tier_redundancy_gauge_sampler(
         loop {
             tokio::select! {
                 _ = cancellation_token.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                _ = tokio::time::sleep(Duration::from_secs(10)) => {}
             }
             let Some(host_pinned) = lower_tier.get(StorageTier::HostPinned) else {
                 // Lazily allocated on first event - nothing to sample yet.
@@ -397,10 +399,11 @@ fn spawn_lower_tier_redundancy_gauge_sampler(
 /// (`KVCR_INDEX_HEALTH_DESIGN.md` 1b): how old is the data currently sitting in the fleet's
 /// live routing index, as min/p50/p99/max seconds since each block was first observed
 /// stored. Reads `ThreadPoolIndexer::resident_age_percentiles()`, which walks only the
-/// `age_tracking` side-table (see that module) - never the primary tree itself. Same slow
-/// 30s interval and diagnostic-only status as the redundancy samplers above; not yet
-/// benchmarked at production scale. A restart resets every tracked insertion time (no
-/// recovery path), so expect misleadingly low ages for a while after any router restart.
+/// `age_tracking` side-table (see that module) - never the primary tree itself. Same 10s
+/// interval (see the redundancy sampler's own doc comment for why 10s, not the original 30s)
+/// and diagnostic-only status as the redundancy samplers above; not yet benchmarked at
+/// production scale. A restart resets every tracked insertion time (no recovery path), so
+/// expect misleadingly low ages for a while after any router restart.
 fn spawn_kv_resident_age_gauge_sampler(
     component: &Component,
     primary: Arc<ThreadPoolIndexer<ConcurrentRadixTreeCompressed>>,
@@ -431,7 +434,7 @@ fn spawn_kv_resident_age_gauge_sampler(
         loop {
             tokio::select! {
                 _ = cancellation_token.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                _ = tokio::time::sleep(Duration::from_secs(10)) => {}
             }
             let Some(stats) = primary.resident_age_percentiles() else {
                 continue;
@@ -480,7 +483,7 @@ fn spawn_lower_tier_resident_age_gauge_sampler(
         loop {
             tokio::select! {
                 _ = cancellation_token.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                _ = tokio::time::sleep(Duration::from_secs(10)) => {}
             }
             let Some(host_pinned) = lower_tier.get(StorageTier::HostPinned) else {
                 continue;
@@ -502,8 +505,9 @@ fn spawn_lower_tier_resident_age_gauge_sampler(
 /// `demand_tracking`'s module docs for why three windows and not one, and why this answers "is
 /// my active working set trending up right now," not a capacity-sizing number. Reads
 /// `ThreadPoolIndexer::demand_distinct_blocks()`, which walks only the `demand_tracking`
-/// side-table (see that module) - never the primary tree itself. Same slow 30s interval and
-/// diagnostic-only status as the redundancy/age samplers above; not yet benchmarked at
+/// side-table (see that module) - never the primary tree itself. Same 10s interval (see the
+/// redundancy sampler's own doc comment for why 10s, not the original 30s) and diagnostic-only
+/// status as the redundancy/age samplers above; not yet benchmarked at
 /// production scale (`DASHBOARD_METRICS_ENGINEERING_PLAN.md` section 7). Three separate metric
 /// names rather than one name with a `window` label, matching the `_host_pinned` samplers'
 /// reasoning elsewhere in this file (avoids retrofitting a label dimension onto an
@@ -552,7 +556,7 @@ fn spawn_kv_demand_gauge_sampler(
         loop {
             tokio::select! {
                 _ = cancellation_token.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                _ = tokio::time::sleep(Duration::from_secs(10)) => {}
             }
             let counts = primary.demand_distinct_blocks();
             let block_size = u64::from(block_size);
@@ -610,7 +614,7 @@ fn spawn_lower_tier_demand_gauge_sampler(
         loop {
             tokio::select! {
                 _ = cancellation_token.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                _ = tokio::time::sleep(Duration::from_secs(10)) => {}
             }
             let Some(host_pinned) = lower_tier.get(StorageTier::HostPinned) else {
                 continue;
