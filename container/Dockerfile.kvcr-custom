@@ -178,6 +178,22 @@ RUN VLLM_DIR="$(python3 -c 'import os, vllm; print(os.path.dirname(vllm.__file__
  && python3 /tmp/kvcr_manager_metrics_patch.py "${VLLM_DIR}/v1/kv_offload/tiering/kvcr/manager.py" \
  && rm -f /tmp/kvcr_manager_metrics_patch.py
 
+# G2 real total-block-capacity metric (2026-09-14, RUNBOOK_KVCR.md): our deployment runs
+# vLLM's own generic OffloadingConnector (no KVCR secondary tier), so the three files above
+# are dead code for us at runtime - this targets the actual code path instead:
+# vllm/v1/kv_offload/cpu/{common,spec,manager}.py, part of the STOCK vLLM base image (not
+# the KVCR PR overlay), which already computes an exact per-worker G2 block count internally
+# (CPUOffloadingSpec.num_blocks, from cpu_bytes_to_use / vLLM's own real per-block byte size)
+# but never exports it as its own metric - only uses it as cpu_cache_usage_perc's hidden
+# denominator. Exposes it as vllm:kv_offload_cpu_num_blocks, replacing the dashboard's
+# externally-derived Qwen3.5-2B-architecture estimate with vLLM's own exact value.
+COPY container/g2_capacity_common_patch.py container/g2_capacity_spec_patch.py container/g2_capacity_manager_patch.py /tmp/
+RUN VLLM_DIR="$(python3 -c 'import os, vllm; print(os.path.dirname(vllm.__file__))')" \
+ && python3 /tmp/g2_capacity_common_patch.py "${VLLM_DIR}/v1/kv_offload/cpu/common.py" \
+ && python3 /tmp/g2_capacity_spec_patch.py "${VLLM_DIR}/v1/kv_offload/cpu/spec.py" \
+ && python3 /tmp/g2_capacity_manager_patch.py "${VLLM_DIR}/v1/kv_offload/cpu/manager.py" \
+ && rm -f /tmp/g2_capacity_common_patch.py /tmp/g2_capacity_spec_patch.py /tmp/g2_capacity_manager_patch.py
+
 ENV DYN_REQUEST_PLANE=tcp \
     DYN_EVENT_PLANE=zmq \
     DYN_DISCOVERY_BACKEND=file \
