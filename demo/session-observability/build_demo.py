@@ -50,6 +50,9 @@ LIVE_RUNS = [
     ("ax_mixed", "AgentX, partial coverage", "30% of sessions without headers",
      "A shorter AgentX run through the same router, where about 30% of the sessions are sent without Dynamo session headers. "
      "{workers} mock workers, {gpu}k tokens of GPU cache{host_note}. The coverage panel shows how much of the traffic the session metrics describe."),
+    ("ax_trace", "AgentX, routing decisions", "GPU + host, router_selection trace on",
+     "A shorter AgentX run with the router's per-candidate cost trace (router_selection records) turned on, "
+     "{workers} mock workers, {gpu}k tokens of GPU cache{host_note}. The routing decisions panel shows how the router chose between workers."),
     ("heavy", "Synthetic, live", "Real router, mock workers",
      "The production router with the session index on, {workers} mock workers ({gpu}k tokens of GPU cache), "
      "and a synthetic client sending Dynamo session headers."),
@@ -242,6 +245,11 @@ def live_run(directory):
         "isl": percentiles([r["prompt_tokens"] for r in ok if r.get("prompt_tokens")]),
         "osl": percentiles([r["completion_tokens"] for r in ok if r.get("completion_tokens")]),
     }
+    selection = []
+    if (directory / "selection.jsonl").exists():
+        t0_ms = t0 * 1000
+        selection = [{**r, "now_ms": int(r["t_ms"] - t0_ms)} for r in read_jsonl(directory / "selection.jsonl")]
+    meta["selection"] = selection
     return rows, sessions, meta, request_stats
 
 
@@ -275,6 +283,7 @@ def main():
                 host_note=host_note,
                 sessions=len(sessions),
             ),
+            "selection": meta.get("selection", []),
             "workers": meta["workers"],
             "meta_window": meta["active_window_s"],
             "demandIsSum": not any(r.get("distinct_demand") for r in rows),

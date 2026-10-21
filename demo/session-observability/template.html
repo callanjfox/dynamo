@@ -223,6 +223,15 @@
     <div class="chart" id="c21"></div>
   </div>
 
+  <div class="card" id="card-select">
+    <h2>Routing decisions</h2>
+    <p class="note">From the router's per-candidate cost trace (router_selection records), per 60 second window. A tie means the best cost was shared by several workers, so the pick was arbitrary. The top-worker share is the busiest worker's share of the decisions that were not ties: near 25% with four workers means decisions are spread, near 100% means the cost function keeps choosing the same worker.</p>
+    <div class="legend" id="leg22"></div>
+    <div class="chart" id="c22"></div>
+    <div class="legend" id="leg23"></div>
+    <div class="chart" id="c23"></div>
+  </div>
+
   <div class="card" id="card-funnel">
     <h2>Cache reuse funnel</h2>
     <p class="note">Share of prompt tokens at each step in each 60 second window. The top line is what the session history says could be reused if nothing had been evicted (from the session index, covered traffic only); the steps below it are what the router and the worker find. F2 is the prefix the router estimates is cached on the best eligible worker. F3 is the same on the worker it chose. F4 is what the worker reports reusing. The table has the cumulative totals.</p>
@@ -346,6 +355,9 @@ const REF = [
     ["kv_selected_cached_prefix_tokens_total", "counter", "F3: the same on the worker the router chose."],
     ["kv_worker_reused_tokens_total", "counter", "F4: tokens the worker reports reusing."],
     ["output_sequence_tokens", "histogram", "Output tokens per request."],
+  ]],
+  ["Routing decisions (already in Dynamo, #16395)", [
+    ["router_selection trace record", "trace", "One record per routed request with every candidate worker and the cost the router gave it (DYN_REQUEST_TRACE_RECORDS=router_selection). Not a Prometheus metric: it is a request-trace record, summarized here per minute."],
   ]],
   ["Compute health (already in Dynamo)", [
     ["frontend time_to_first_token_seconds", "histogram", "Request arrival to first token."],
@@ -662,6 +674,19 @@ function render(idx) {
     if (capHost > 0) sres.push({ name: "Busiest worker, host resident", color: "--s3", values: wr.map((w) => w.resident_max_host) });
     legend("#leg21", sres);
     lineChart($("#c21"), { x: t, series: sres, refs: wrefs, fmtY: fmtTok, fmtTip: fmtTok, label: "Resident per worker" });
+  }
+
+  // 7a. routing decisions
+  const sel = run.selection || [];
+  $("#card-select").style.display = sel.length ? "" : "none";
+  if (sel.length) {
+    const st = sel.map((r) => r.now_ms / MIN);
+    const s22 = [{ name: "Decisions that were ties", color: "--s2", values: sel.map((r) => 100 * r.tie_share) }, { name: "Busiest worker's share of the other decisions", color: "--s1", values: sel.map((r) => (r.top_worker_share == null ? 0 : 100 * r.top_worker_share)) }];
+    legend("#leg22", s22);
+    lineChart($("#c22"), { x: st, series: s22, max: 100, fmtY: (v) => Math.round(v) + "%", fmtTip: (v) => v.toFixed(0) + "%", label: "Routing decisions" });
+    const s23 = [{ name: "Mean gap between best and second-best cost", color: "--s3", values: sel.map((r) => r.margin) }];
+    legend("#leg23", s23);
+    lineChart($("#c23"), { x: st, series: s23, fmtY: (v) => v.toFixed(1), fmtTip: (v) => v.toFixed(2), label: "Cost gap between candidates" });
   }
 
   // 7. funnel
