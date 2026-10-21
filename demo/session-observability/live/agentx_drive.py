@@ -74,14 +74,15 @@ class Replay:
             "prompt": token_ids(salt, q["hash_ids"], block_size),
             "max_tokens": max(1, min(q["out"], self.args.max_output)),
             "stream": False,
-            "nvext": {"ignore_eos": True},
         }
         started = time.time()
         row = {"t": started, "session": sid, "parent": parent, "turn": index,
                "recorded_in": q["in"], "recorded_out": q["out"]}
         try:
             async with http.post(f"{self.args.url}/v1/completions", json=body, headers=headers) as resp:
-                data = await resp.json()
+                data = await resp.json(content_type=None)
+                if resp.status != 200:
+                    row["error_body"] = str(data)[:300]
                 usage = data.get("usage") or {}
                 row.update(status=resp.status, latency_s=time.time() - started,
                            prompt_tokens=usage.get("prompt_tokens"),
