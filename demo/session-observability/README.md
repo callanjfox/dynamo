@@ -11,6 +11,7 @@ Switch scenarios with the buttons, or `index.html?run=0|1|2`.
 | 0 | 15 tasks | GPU only |
 | 1 | 40 tasks | GPU only |
 | 2 | 40 tasks | GPU + host |
+| 3 | live, 40 tasks | real router, mock workers, GPU only |
 
 All runs use 4 workers with 6000 GPU blocks each (384k tokens). Run 2 adds 12000 host blocks per
 worker.
@@ -29,6 +30,30 @@ python3 build_demo.py
 
 The router breaks ties between idle workers at random, so numbers move a little between runs.
 `data/final/` holds the runs behind the committed `index.html`.
+
+## Live run
+
+The fourth scenario is the production path: a real frontend and KV router with
+`--enable-session-prefix-index`, mock workers, and a client that sends the Dynamo session headers
+(`x-dynamo-session-id`, `x-dynamo-parent-session-id`, `x-dynamo-session-final`). Nothing in it is
+replayed. The page reads the router's real `/metrics` and its `session_summary` log.
+
+```bash
+# in a venv with the repo's python on PYTHONPATH and a built ai-dynamo-runtime wheel
+OUT=/root/live/run1 WORKERS=4 BLOCKS=2500 SESSIONS=40 RAMP_S=240 GROWTH_WORDS=700 WINDOW=60 TTL=120 \
+  live/run_live.sh
+# then copy meta.json, metrics.jsonl, requests.jsonl and the extracted summaries.jsonl
+# into data/live/heavy/ and run build_demo.py
+```
+
+`live/run_live.sh` starts the frontend and mocker with file discovery (no etcd or NATS), `live/scrape.py`
+polls `/metrics`, and `live/drive.py` generates the sessions. `summaries.jsonl` is the frontend log's
+`dynamo_session_summary` lines. The committed run: 4 workers with 2500 GPU blocks each (160k tokens),
+137 sessions, 1172 requests, all 200.
+
+Caveats: the client does not resend model output in later prompts, so each turn's output tokens count as
+thrash (about 38k of the 1.73M recomputed here, so 2%). Demand is the router's per-session sum, which overstates distinct demand,
+especially with subagents that start from their parent's prompt. There is no host tier in the live run.
 
 ## Output
 

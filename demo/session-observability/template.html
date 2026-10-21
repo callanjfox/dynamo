@@ -108,7 +108,7 @@
 <body>
 <div class="wrap">
   <h1>Session observability demo</h1>
-  <p class="sub">A synthetic agent workload replayed through the Dynamo mocker. The router's session index tracks each session; a stats tracker turns that into the working set, thrash and per-session figures below.</p>
+  <p class="sub" id="intro">A synthetic agent workload replayed through the Dynamo mocker. The router's session index tracks each session; a stats tracker turns that into the working set, thrash and per-session figures below.</p>
 
   <div class="tabs" id="tabs"></div>
   <p class="blurb" id="blurb"></p>
@@ -117,7 +117,7 @@
 
   <div class="card">
     <h2>Working set against capacity</h2>
-    <p class="note">Demand is the distinct tokens the active sessions will present next. Resident is what each tier holds. A shared prefix is counted once in both.</p>
+    <p class="note" id="note1">Demand is the distinct tokens the active sessions will present next. Resident is what each tier holds. A shared prefix is counted once in both.</p>
     <div class="legend" id="leg1"></div>
     <div class="chart" id="c1"></div>
   </div>
@@ -162,7 +162,7 @@
     <div class="scroll" id="top"></div>
   </div>
 
-  <p class="foot">Synthetic workload, not a customer trace. Time is simulated. Active means the session had activity within 5 minutes and has not ended. Thrash is estimated from the prior turn's input plus output against what the index holds, so it carries up to one block of rounding per turn.</p>
+  <p class="foot" id="foot">Synthetic workload, not a customer trace. Time is simulated. Active means the session had activity within 5 minutes and has not ended. Thrash is estimated from the prior turn's input plus output against what the index holds, so it carries up to one block of rounding per turn.</p>
 </div>
 
 <script>
@@ -318,6 +318,12 @@ function render(idx) {
 
   document.querySelectorAll(".tab").forEach((b, i) => b.setAttribute("aria-pressed", String(i === idx)));
   $("#blurb").textContent = run.blurb;
+  if (!window.DEFAULT_FOOT) window.DEFAULT_FOOT = $("#foot").textContent;
+  $("#foot").textContent = run.foot || window.DEFAULT_FOOT;
+  if (!window.DEFAULT_INTRO) { window.DEFAULT_INTRO = $("#intro").textContent; window.DEFAULT_NOTE1 = $("#note1").textContent; }
+  $("#intro").textContent = run.intro || window.DEFAULT_INTRO;
+  $("#note1").textContent = run.note1 || window.DEFAULT_NOTE1;
+  const demandName = run.demandIsSum ? "Demand (sum over active sessions)" : "Demand (active sessions)";
 
   const peak = Math.max(...demand);
   const th = last.thrash, thTotal = th.recomputed + th.reloaded_host + th.reloaded_disk;
@@ -326,7 +332,7 @@ function render(idx) {
   const split = Math.max(...rows.map((r) => r.split_sessions));
   const tile = (k, v, d) => `<div class="tile"><div class="k">${k}</div><div class="v">${v}</div><div class="d">${d}</div></div>`;
   $("#tiles").innerHTML =
-    tile("Peak working set vs GPU capacity", (peak / capDev).toFixed(2) + "×", `${fmtTok(peak)} needed, ${fmtTok(capDev)} of GPU cache`) +
+    tile(run.demandIsSum ? "Peak demand (sum) vs GPU capacity" : "Peak working set vs GPU capacity", (peak / capDev).toFixed(2) + "×", `${fmtTok(peak)} needed, ${fmtTok(capDev)} of GPU cache`) +
     tile("Thrash (tokens)", fmtTok(thTotal), `${fmtTok(th.recomputed)} recomputed, ${fmtTok(th.reloaded_host + th.reloaded_disk)} reloaded`) +
     tile("Prefix reuse", pct(isl ? cached / isl : 0), `${fmtTok(cached)} of ${fmtTok(isl)} input tokens served from cache`) +
     tile("Sessions", String(sess.length), `${subs} are subagents`) +
@@ -334,7 +340,7 @@ function render(idx) {
 
   // 1. working set vs capacity
   const s1 = [
-    { name: "Demand (active sessions)", color: "--s1", values: demand },
+    { name: demandName, color: "--s1", values: demand },
     { name: "GPU resident", color: "--s2", values: gpu },
   ];
   const refs = [{ y: capDev, label: "GPU capacity " + fmtTok(capDev) }];
