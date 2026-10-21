@@ -123,6 +123,9 @@ impl ThrashTokens {
 /// What the tracker learned from one request arrival.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ArrivalOutcome {
+    /// The request opened a session: either the first one, or one that resumed
+    /// after ending and now counts as a new episode.
+    pub started: bool,
     /// The session had an earlier turn with a prefix to find.
     pub returning: bool,
     /// Prefix the turn was expected to reuse: the smaller of the prior turn's
@@ -204,9 +207,28 @@ struct Stat {
     gap_sum_ms: u64,
     gap_count: u32,
     thrash: ThrashTokens,
+    /// An earlier episode left a prefix to find, though this one has no turns yet.
+    carried: bool,
 }
 
 impl Stat {
+    /// Begin a new episode after the session ended: the per-session totals start
+    /// over, while the prefix demand and last activity carry across so the
+    /// returning turn is still measured against what the session left behind.
+    fn restart(&mut self, now_ms: u64) {
+        self.started_ms = now_ms;
+        self.turns = 0;
+        self.isl_sum = 0;
+        self.osl_sum = 0;
+        self.cached_sum = 0;
+        self.peak_demand = self.demand;
+        self.children = 0;
+        self.gap_sum_ms = 0;
+        self.gap_count = 0;
+        self.thrash = ThrashTokens::default();
+        self.carried = true;
+    }
+
     fn last_activity_ms(&self) -> u64 {
         self.last_done_ms
             .map_or(self.last_arrival_ms, |done| done.max(self.last_arrival_ms))
@@ -317,6 +339,7 @@ impl SessionStatsTracker {
                     gap_sum_ms: 0,
                     gap_count: 0,
                     thrash: ThrashTokens::default(),
+                    carried: false,
                 },
             );
         }
@@ -326,9 +349,12 @@ impl SessionStatsTracker {
             .get_mut(session_id)
             .expect("session inserted above");
         // A session that sends another turn after ending has resumed.
-        stat.ended_ms = None;
+        let resumed = stat.ended_ms.take().is_some();
+        if resumed {
+            stat.restart(now_ms);
+        }
 
-        let returning = stat.turns > 0;
+        let returning = stat.turns > 0 || stat.carried;
         let prior = stat.demand.min(isl_tokens);
         let gap_ms = returning.then(|| now_ms.saturating_sub(stat.last_activity_ms()));
 
@@ -372,6 +398,9 @@ impl SessionStatsTracker {
             stat.gap_count += 1;
         }
 
+        if resumed {
+            inner.started += 1;
+        }
         inner.turns += 1;
         inner.thrash.add(thrash);
         if let (Some(gap), Some(outcome)) = (gap_ms, outcome) {
@@ -379,6 +408,7 @@ impl SessionStatsTracker {
         }
 
         ArrivalOutcome {
+            started: !returning || resumed,
             returning,
             prior_tokens: prior,
             gap_ms,
@@ -639,8 +669,11 @@ mod tests {
         assert_eq!(summary.osl_tokens, 50);
         assert!((summary.hit_rate - 0.4).abs() < 1e-9);
         assert!(tracker.end_session("s", 7).is_none());
-        tracker.on_arrival("s", None, 200, TierBlocks::default(), 8);
-        assert!(tracker.end_session("s", 9).is_some());
+        let outcome = tracker.on_arrival("s", None, 200, TierBlocks::default(), 8);
+        assert!(outcome.started && outcome.returning);
+        let second = tracker.end_session("s", 9).unwrap();
+        assert_eq!(second.turns, 1, "a resumed session reports its own episode");
+        assert_eq!(second.isl_tokens, 200);
     }
 
     #[test]

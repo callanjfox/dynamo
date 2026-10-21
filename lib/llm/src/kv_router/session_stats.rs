@@ -83,7 +83,7 @@ impl SessionStatsRuntime {
         let outcome =
             self.tracker
                 .on_arrival(session_id, parent, isl_tokens, resident, self.now_ms());
-        if !outcome.returning {
+        if outcome.started {
             self.metrics.sessions_started_total.inc();
         }
         let thrash = &outcome.thrash;
