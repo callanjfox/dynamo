@@ -41,11 +41,14 @@ OUTCOMES = ["gpu", "host", "disk", "miss"]
 
 
 LIVE_RUNS = [
-    ("agentx_gpu", "AgentX, live", "GPU memory only",
+    ("ax_gpu", "AgentX, live", "GPU memory only",
      "Recorded AgentX coding-agent sessions ({sessions} including subagents) through the production router with the session index on, "
      "{workers} mock workers ({gpu}k tokens of GPU cache){host_note}."),
-    ("agentx_host", "AgentX, live", "GPU + host memory",
+    ("ax_host", "AgentX, live", "GPU + host memory",
      "The same AgentX sessions with a host-memory tier on each worker: {workers} mock workers, {gpu}k tokens of GPU cache{host_note}."),
+    ("ax_mixed", "AgentX, partial coverage", "30% of sessions without headers",
+     "A shorter AgentX run through the same router, where about 30% of the sessions are sent without Dynamo session headers. "
+     "{workers} mock workers, {gpu}k tokens of GPU cache{host_note}. The coverage panel shows how much of the traffic the session metrics describe."),
     ("heavy", "Synthetic, live", "Real router, mock workers",
      "The production router with the session index on, {workers} mock workers ({gpu}k tokens of GPU cache), "
      "and a synthetic client sending Dynamo session headers."),
@@ -192,6 +195,8 @@ def main():
                 "so there are no GPUs and the cache model is the mocker's. Demand is the router's per-session sum, "
                 "which counts a prefix once per session and overstates distinct demand when sessions share one "
                 "(a subagent starts from its parent's prompt)."
+                + (" Requests above one worker's 640k-token KV capacity are refused by the mocker; they show as failed requests."
+                   if meta.get("workload") == "agentx" and meta["num_gpu_blocks"] * meta["block_size"] <= 640000 else "")
                 + (f" Sessions replay the recorded AgentX think times, capped at 300 s and divided by {meta['time_scale']}; "
                    f"the active window is {meta['active_window_s']} s." if meta.get("workload") == "agentx" else "")
             ),

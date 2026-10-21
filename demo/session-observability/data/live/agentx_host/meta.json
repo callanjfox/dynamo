@@ -1,3 +1,0 @@
-{"workers": 4, "num_gpu_blocks": 5000, "num_host_blocks": 8000, "block_size": 64,
- "speedup": 4, "sessions": 6, "duration_s": 240, "time_scale": 6,
- "active_window_s": 60, "idle_ttl_s": 30, "workload": "agentx"}

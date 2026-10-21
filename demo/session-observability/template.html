@@ -193,7 +193,7 @@ const MIN = 60000;
 const $ = (s) => document.querySelector(s);
 const css = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 
-const fmtTok = (n) => n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n >= 1e3 ? Math.round(n / 1e3) + "k" : String(Math.round(n));
+const fmtTok = (n) => n >= 1e9 ? (n / 1e9).toFixed(2) + "B" : n >= 1e8 ? Math.round(n / 1e6) + "M" : n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n >= 1e3 ? Math.round(n / 1e3) + "k" : String(Math.round(n));
 const fmtNum = (n) => Math.round(n).toLocaleString("en-US");
 const fmtClock = (m) => { const s = Math.round(m * 60); return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); };
 const pct = (x) => (x * 100).toFixed(0) + "%";
@@ -482,7 +482,7 @@ function render(idx) {
     top.map((s) => `<tr><td>${s.session_id}</td><td>${s.parent_session_id || "-"}</td><td>${s.turns}</td><td>${fmtTok(s.isl_tokens)}</td><td>${fmtTok(s.peak_demand_tokens)}</td><td>${pct(s.hit_rate)}</td><td>${s.children}</td><td>${fmtTok(s.thrash.recomputed + s.thrash.reloaded_host + s.thrash.reloaded_disk)}</td></tr>`).join("") + `</tbody></table>`;
 }
 
-let current = Number(new URLSearchParams(location.search).get("run") ?? DATA.findIndex((d) => d.key === "agentx_host" || d.key === "agentx_gpu"));
+let current = Number(new URLSearchParams(location.search).get("run") ?? DATA.findIndex((d) => d.key === "ax_host" || d.key === "ax_gpu"));
 if (!(current >= 0)) current = 1;
 $("#tabs").innerHTML = DATA.map((d, i) => `<button class="tab" data-i="${i}" aria-pressed="false">${d.label}<small>${d.detail}</small></button>`).join("");
 $("#tabs").addEventListener("click", (e) => { const b = e.target.closest(".tab"); if (b) { current = Number(b.dataset.i); render(current); } });

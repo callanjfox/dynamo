@@ -274,7 +274,8 @@ mod tests {
         runtime.on_uncovered(500);
 
         let metrics = &runtime.metrics;
-        let get = |vec: &prometheus::IntCounterVec, label: &str| vec.with_label_values(&[label]).get();
+        let get =
+            |vec: &prometheus::IntCounterVec, label: &str| vec.with_label_values(&[label]).get();
         assert_eq!(get(&metrics.coverage_requests_total, "covered"), 2);
         assert_eq!(get(&metrics.coverage_requests_total, "uncovered"), 1);
         assert_eq!(get(&metrics.coverage_input_tokens_total, "covered"), 2_200);
