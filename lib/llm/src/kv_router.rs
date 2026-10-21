@@ -894,6 +894,7 @@ impl KvRouter {
                 Arc::clone(index),
                 metrics::SessionMetrics::from_component(component),
                 block_size,
+                Some(workers_with_configs.clone()),
             );
             runtime.spawn_sweeper(cancellation_token.clone());
             runtime
@@ -1442,6 +1443,9 @@ impl KvRouter {
             match &session_arrival {
                 Some((session_id, parent)) => {
                     stats.on_arrival(session_id, parent.as_deref(), isl_tokens as u64);
+                    if let Some(hashes) = routing_hashes.as_deref() {
+                        stats.on_routed(session_id, response.best_worker, hashes);
+                    }
                 }
                 None => stats.on_uncovered(isl_tokens as u64),
             }

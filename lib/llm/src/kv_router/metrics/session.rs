@@ -11,7 +11,7 @@ use dynamo_kv_router::session_stats::GAP_BUCKET_LABELS;
 use dynamo_runtime::component::Component;
 use dynamo_runtime::metrics::MetricsHierarchy;
 use dynamo_runtime::traits::DistributedRuntimeProvider;
-use prometheus::{Histogram, IntCounter, IntCounterVec, IntGauge, IntGaugeVec};
+use prometheus::{GaugeVec, Histogram, IntCounter, IntCounterVec, IntGauge, IntGaugeVec};
 
 use super::{labels, router_metric};
 
@@ -21,18 +21,25 @@ const TIER_LABEL: &str = "tier";
 const OUTCOME_LABEL: &str = "outcome";
 const GAP_LABEL: &str = "gap";
 const COVERAGE_LABEL: &str = "coverage";
+const ROLE_LABEL: &str = "role";
+const WINDOW_LABEL: &str = "window";
+const STAT_LABEL: &str = "stat";
 
 pub(crate) const TIERS: [&str; 3] = ["device", "host", "disk"];
 pub(crate) const STRANDED_TIERS: [&str; 2] = ["device", "host"];
 pub(crate) const THRASH_OUTCOMES: [&str; 3] = ["recomputed", "reloaded_host", "reloaded_disk"];
 pub(crate) const COVERAGE: [&str; 2] = ["covered", "uncovered"];
+pub(crate) const ROLES: [&str; 2] = ["primary", "subagent"];
+/// Follows `dynamo_kv_router::session_stats::DEMAND_WINDOWS_MS`.
+pub(crate) const DEMAND_WINDOWS: [&str; 3] = ["30s", "1m", "5m"];
+pub(crate) const WORKER_STATS: [&str; 2] = ["max", "mean"];
 const RETURN_OUTCOMES: [&str; 4] = ["gpu", "host", "disk", "miss"];
 
 /// Experimental. Names, labels and units may change in any release.
 ///
-/// Series per router: gauges 1 + 1 + 3 + 2 + 2 + 1, counters 2 + 3 + 40 + 4, and eight
-/// histograms of up to 14 series each, about 180 in all. No label carries a
-/// session, tenant or worker identity.
+/// Series per router: 27 gauges, counters 2 + 3 + 40 + 4 + 1, and eight histograms of up
+/// to 14 series each, about 200 in all. No label carries a session, tenant or worker
+/// identity.
 #[cfg_attr(test, derive(Clone))]
 pub struct SessionMetrics {
     /// Sessions with activity inside the active window that have not ended.
@@ -40,13 +47,35 @@ pub struct SessionMetrics {
     /// Sum over active sessions of the prefix each will present next. A shared prefix
     /// is counted once per session, so this overstates distinct demand.
     pub demand_tokens: IntGauge,
+    /// Demand counting each distinct prompt block once across active sessions.
+    pub demand_distinct_tokens: IntGauge,
     /// Distinct tokens the index holds for sessions, per storage tier.
     pub resident_tokens: IntGaugeVec,
     /// Distinct tokens held only for inactive sessions, per storage tier.
     pub stranded_tokens: IntGaugeVec,
+    /// Tokens of prefix held by more than one worker, copies beyond the first, per tier.
     pub replicated_tokens: IntGaugeVec,
-    /// Active sessions whose GPU prefix sits on more than one worker.
-    pub sessions_split: IntGauge,
+    /// Prompt tokens referenced by more than one active session.
+    pub shared_tokens: IntGauge,
+    /// Active sessions, and their distinct demand, by role (primary session or subagent).
+    /// A subagent counts only the blocks its primary sessions do not already cover.
+    pub active_by_role: IntGaugeVec,
+    pub demand_by_role_tokens: IntGaugeVec,
+    /// Demand counting only sessions active within a short window.
+    pub demand_window_tokens: IntGaugeVec,
+    /// Distinct tokens the busiest worker holds, and the mean over workers holding any,
+    /// per tier. Compare with one worker's capacity to see load that is uneven.
+    pub worker_resident_tokens: IntGaugeVec,
+    /// Demand homed on one worker (the worker that served the session's last turn): the
+    /// busiest (max) and the mean over all workers.
+    pub worker_demand_tokens: IntGaugeVec,
+    /// The same demand as a share of that worker's GPU KV capacity. Above 1.0 means the
+    /// worker is asked to hold more than its GPU can.
+    pub worker_demand_ratio: GaugeVec,
+    /// Workers whose homed demand exceeds their GPU KV capacity.
+    pub workers_over_capacity: IntGauge,
+    /// Prefix tokens returning sessions could reuse if nothing had been evicted.
+    pub prior_prefix_tokens_total: IntCounter,
     pub sessions_started_total: IntCounter,
     pub sessions_ended_total: IntCounter,
     /// Prefix tokens a returning session had to recompute or reload.
@@ -161,7 +190,73 @@ impl SessionMetrics {
             )
             .expect("failed to create router_session_coverage_input_tokens_total");
 
+        let active_by_role = metrics
+            .create_intgaugevec(
+                &router_metric("sessions_active_by_role"),
+                "Active sessions by role (primary, subagent)",
+                &[ROLE_LABEL],
+                extra_labels,
+            )
+            .expect("failed to create router_sessions_active_by_role");
+        let demand_by_role_tokens = metrics
+            .create_intgaugevec(
+                &router_metric("session_demand_by_role_tokens"),
+                "Demand of active sessions by role (primary, subagent)",
+                &[ROLE_LABEL],
+                extra_labels,
+            )
+            .expect("failed to create router_session_demand_by_role_tokens");
+        let demand_window_tokens = metrics
+            .create_intgaugevec(
+                &router_metric("session_demand_window_tokens"),
+                "Demand counting only sessions active within the window (30s, 1m, 5m)",
+                &[WINDOW_LABEL],
+                extra_labels,
+            )
+            .expect("failed to create router_session_demand_window_tokens");
+        let worker_resident_tokens = metrics
+            .create_intgaugevec(
+                &router_metric("session_worker_resident_tokens"),
+                "Distinct session tokens held on one worker, the busiest (max) and the mean over workers holding any, by tier (device, host)",
+                &[STAT_LABEL, TIER_LABEL],
+                extra_labels,
+            )
+            .expect("failed to create router_session_worker_resident_tokens");
+
+        let worker_demand_tokens = metrics
+            .create_intgaugevec(
+                &router_metric("session_worker_demand_tokens"),
+                "Demand homed on one worker: the busiest (max) and the mean over all workers",
+                &[STAT_LABEL],
+                extra_labels,
+            )
+            .expect("failed to create router_session_worker_demand_tokens");
+        let worker_demand_ratio = metrics
+            .create_gaugevec(
+                &router_metric("session_worker_demand_ratio"),
+                "Homed demand over the worker's GPU KV capacity: the most loaded worker (max) and the mean over workers",
+                &[STAT_LABEL],
+                extra_labels,
+            )
+            .expect("failed to create router_session_worker_demand_ratio");
+
         // Bounded label values exist from the first scrape so rate() and absent() work.
+        for stat in WORKER_STATS {
+            worker_demand_tokens.with_label_values(&[stat]);
+            worker_demand_ratio.with_label_values(&[stat]);
+        }
+        for role in ROLES {
+            active_by_role.with_label_values(&[role]);
+            demand_by_role_tokens.with_label_values(&[role]);
+        }
+        for window in DEMAND_WINDOWS {
+            demand_window_tokens.with_label_values(&[window]);
+        }
+        for tier in STRANDED_TIERS {
+            for stat in WORKER_STATS {
+                worker_resident_tokens.with_label_values(&[stat, tier]);
+            }
+        }
         for tier in TIERS {
             resident_tokens.with_label_values(&[tier]);
         }
@@ -191,17 +286,35 @@ impl SessionMetrics {
             ),
             demand_tokens: gauge(
                 "session_demand_tokens",
-                "Sum over active sessions of the prefix tokens each will present next",
+                "Sum over active sessions of the prefix tokens each will present next, counting a shared prefix once per session",
             ),
             resident_tokens,
             stranded_tokens,
             replicated_tokens,
+            shared_tokens: gauge(
+                "session_shared_tokens",
+                "Prompt tokens referenced by more than one active session",
+            ),
+            demand_distinct_tokens: gauge(
+                "session_demand_distinct_tokens",
+                "Demand counting each distinct prompt block once across active sessions, so a shared prefix counts once",
+            ),
+            worker_demand_tokens,
+            worker_demand_ratio,
+            workers_over_capacity: gauge(
+                "session_workers_over_capacity",
+                "Workers whose homed session demand exceeds their GPU KV capacity",
+            ),
+            active_by_role,
+            demand_by_role_tokens,
+            demand_window_tokens,
+            worker_resident_tokens,
+            prior_prefix_tokens_total: counter(
+                "session_prior_prefix_tokens_total",
+                "Prefix tokens returning sessions could reuse if nothing had been evicted: the prior turn's input and output, up to the new prompt length",
+            ),
             coverage_requests_total,
             coverage_input_tokens_total,
-            sessions_split: gauge(
-                "sessions_split",
-                "Active sessions whose GPU-resident prefix is on more than one worker",
-            ),
             sessions_started_total: counter("sessions_started_total", "Sessions first seen"),
             sessions_ended_total: counter(
                 "sessions_ended_total",

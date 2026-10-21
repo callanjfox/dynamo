@@ -18,11 +18,15 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use dynamo_kv_router::protocols::{LocalBlockHash, WorkerWithDpRank};
+use dynamo_kv_router::session_prefix_index::ResidencySnapshot;
 use dynamo_kv_router::session_stats::{GAP_BUCKET_LABELS, SessionSummary, gap_bucket};
 use dynamo_kv_router::{SessionPrefixIndexer, SessionStatsConfig, SessionStatsTracker};
 use tokio_util::sync::CancellationToken;
 
 use super::metrics::SessionMetrics;
+use super::metrics::session::{DEMAND_WINDOWS, WORKER_STATS};
+use crate::discovery::RuntimeConfigWatch;
 
 const SWEEP_SECS_ENV: &str = "DYN_SESSION_STATS_SWEEP_SECS";
 const ACTIVE_WINDOW_SECS_ENV: &str = "DYN_SESSION_STATS_ACTIVE_WINDOW_SECS";
@@ -44,6 +48,9 @@ pub(crate) struct SessionStatsRuntime {
     tracker: SessionStatsTracker,
     index: Arc<SessionPrefixIndexer>,
     metrics: Arc<SessionMetrics>,
+    /// Per-worker GPU KV capacity, when the router knows it.
+    workers: Option<RuntimeConfigWatch>,
+    block_size: u32,
     epoch: Instant,
 }
 
@@ -52,6 +59,7 @@ impl SessionStatsRuntime {
         index: Arc<SessionPrefixIndexer>,
         metrics: Arc<SessionMetrics>,
         block_size: u32,
+        workers: Option<RuntimeConfigWatch>,
     ) -> Arc<Self> {
         let config = SessionStatsConfig {
             block_size,
@@ -64,6 +72,8 @@ impl SessionStatsRuntime {
             tracker: SessionStatsTracker::new(config),
             index,
             metrics,
+            workers,
+            block_size,
             epoch: Instant::now(),
         })
     }
@@ -103,6 +113,11 @@ impl SessionStatsRuntime {
         if outcome.started {
             self.metrics.sessions_started_total.inc();
         }
+        if outcome.returning {
+            self.metrics
+                .prior_prefix_tokens_total
+                .inc_by(outcome.prior_tokens);
+        }
         let thrash = &outcome.thrash;
         for (label, tokens) in [
             ("recomputed", thrash.recomputed),
@@ -121,6 +136,113 @@ impl SessionStatsRuntime {
                 .return_turns_total
                 .with_label_values(&[GAP_BUCKET_LABELS[gap_bucket(gap_ms)], outcome.as_str()])
                 .inc();
+        }
+    }
+
+    /// Where the request was routed and the block hashes of its prompt.
+    pub(crate) fn on_routed(
+        &self,
+        session_id: &str,
+        worker: WorkerWithDpRank,
+        hashes: &[LocalBlockHash],
+    ) {
+        let hashes: Vec<u64> = hashes.iter().map(|hash| hash.0).collect();
+        self.tracker.on_routed(session_id, worker, &hashes);
+    }
+
+    /// Per-worker load: how much of the index each worker holds, and how much session
+    /// demand is homed on it against its GPU KV capacity. Gauges carry no worker identity.
+    fn publish_workers(
+        &self,
+        home_demand: &std::collections::HashMap<WorkerWithDpRank, u64>,
+        residency: &ResidencySnapshot,
+    ) {
+        let metrics = &self.metrics;
+        let block = u64::from(self.block_size);
+        for (tier, held) in [
+            (
+                "device",
+                residency
+                    .workers
+                    .values()
+                    .map(|w| w.device)
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "host",
+                residency
+                    .workers
+                    .values()
+                    .map(|w| w.host)
+                    .collect::<Vec<_>>(),
+            ),
+        ] {
+            let holding: Vec<u64> = held.into_iter().filter(|&blocks| blocks > 0).collect();
+            let max = holding.iter().copied().max().unwrap_or(0);
+            let mean = holding
+                .iter()
+                .sum::<u64>()
+                .checked_div(holding.len() as u64)
+                .unwrap_or(0);
+            for (stat, blocks) in [("max", max), ("mean", mean)] {
+                metrics
+                    .worker_resident_tokens
+                    .with_label_values(&[stat, tier])
+                    .set(i64::try_from(blocks * block).unwrap_or(i64::MAX));
+            }
+        }
+
+        // Every worker the router knows, so an idle worker pulls the mean down.
+        let mut workers: Vec<(WorkerWithDpRank, Option<u64>)> = Vec::new();
+        if let Some(watch) = &self.workers {
+            for (&worker_id, config) in watch.borrow().iter() {
+                let start = config.data_parallel_start_rank;
+                let end = start.saturating_add(config.data_parallel_size);
+                let capacity = config.total_kv_blocks.map(|blocks| blocks * block);
+                workers.extend(
+                    (start..end).map(|rank| (WorkerWithDpRank::new(worker_id, rank), capacity)),
+                );
+            }
+        }
+        if workers.is_empty() {
+            workers = home_demand.keys().map(|&worker| (worker, None)).collect();
+        }
+        if workers.is_empty() {
+            return;
+        }
+        let demands: Vec<u64> = workers
+            .iter()
+            .map(|(worker, _)| home_demand.get(worker).copied().unwrap_or(0))
+            .collect();
+        let max = demands.iter().copied().max().unwrap_or(0);
+        let mean = demands.iter().sum::<u64>() / demands.len() as u64;
+        let ratios: Vec<f64> = workers
+            .iter()
+            .zip(&demands)
+            .filter_map(|((_, capacity), &demand)| {
+                capacity
+                    .filter(|&c| c > 0)
+                    .map(|c| demand as f64 / c as f64)
+            })
+            .collect();
+        for (stat, tokens) in WORKER_STATS.iter().zip([max, mean]) {
+            metrics
+                .worker_demand_tokens
+                .with_label_values(&[stat])
+                .set(i64::try_from(tokens).unwrap_or(i64::MAX));
+        }
+        if !ratios.is_empty() {
+            let ratio_max = ratios.iter().copied().fold(0.0, f64::max);
+            let ratio_mean = ratios.iter().sum::<f64>() / ratios.len() as f64;
+            for (stat, ratio) in WORKER_STATS.iter().zip([ratio_max, ratio_mean]) {
+                metrics
+                    .worker_demand_ratio
+                    .with_label_values(&[stat])
+                    .set(ratio);
+            }
+            metrics
+                .workers_over_capacity
+                .set(ratios.iter().filter(|&&ratio| ratio > 1.0).count() as i64);
         }
     }
 
@@ -202,7 +324,38 @@ impl SessionStatsRuntime {
         let gauge = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
         metrics.sessions_active.set(gauge(snapshot.active_sessions));
         metrics.demand_tokens.set(gauge(snapshot.demand_tokens));
-        metrics.sessions_split.set(gauge(snapshot.split_sessions));
+        metrics
+            .demand_distinct_tokens
+            .set(gauge(snapshot.demand_distinct_tokens));
+        metrics.shared_tokens.set(gauge(snapshot.shared_tokens));
+        for (role, sessions, demand) in [
+            (
+                "primary",
+                snapshot.active_primary_sessions,
+                snapshot.demand_distinct_primary_tokens,
+            ),
+            (
+                "subagent",
+                snapshot.active_subagent_sessions,
+                snapshot.demand_distinct_subagent_tokens,
+            ),
+        ] {
+            metrics
+                .active_by_role
+                .with_label_values(&[role])
+                .set(gauge(sessions));
+            metrics
+                .demand_by_role_tokens
+                .with_label_values(&[role])
+                .set(gauge(demand));
+        }
+        for (window, tokens) in DEMAND_WINDOWS.iter().zip(snapshot.demand_window_tokens) {
+            metrics
+                .demand_window_tokens
+                .with_label_values(&[window])
+                .set(gauge(tokens));
+        }
+        self.publish_workers(&snapshot.home_demand, &residency);
         for (tier, tokens) in [
             ("device", snapshot.distinct_device_tokens),
             ("host", snapshot.distinct_host_tokens),
@@ -258,7 +411,7 @@ mod tests {
         let registry = dynamo_runtime::MetricsRegistry::new();
         let index = Arc::new(SessionPrefixIndexer::new());
         let runtime =
-            SessionStatsRuntime::new(index.clone(), SessionMetrics::for_test(&registry), 16);
+            SessionStatsRuntime::new(index.clone(), SessionMetrics::for_test(&registry), 16, None);
         (runtime, index)
     }
 
@@ -369,6 +522,76 @@ mod tests {
             metrics.resident_tokens.with_label_values(&["device"]).get(),
             160
         );
-        assert_eq!(metrics.sessions_split.get(), 0);
+        // Nothing was routed with hashes, so no block is referenced yet.
+        assert_eq!(metrics.demand_distinct_tokens.get(), 0);
+    }
+
+    fn local(ids: impl IntoIterator<Item = u64>) -> Vec<LocalBlockHash> {
+        ids.into_iter().map(LocalBlockHash).collect()
+    }
+
+    #[test]
+    fn publish_reports_distinct_demand_by_role_and_the_reusable_prefix() {
+        let (runtime, _index) = runtime();
+        runtime.on_arrival("main", None, 8 * 16);
+        runtime.on_routed("main", WorkerWithDpRank::new(1, 0), &local(1..=8));
+        // The subagent starts from the first five blocks of its primary and adds two.
+        runtime.on_arrival("main/sub", Some("main"), 7 * 16);
+        runtime.on_routed(
+            "main/sub",
+            WorkerWithDpRank::new(2, 0),
+            &local((1..=5).chain([100, 101])),
+        );
+        runtime.publish();
+
+        let metrics = &runtime.metrics;
+        assert_eq!(metrics.demand_tokens.get(), 15 * 16);
+        assert_eq!(metrics.demand_distinct_tokens.get(), 10 * 16);
+        assert_eq!(metrics.shared_tokens.get(), 5 * 16);
+        assert_eq!(
+            metrics.active_by_role.with_label_values(&["primary"]).get(),
+            1
+        );
+        assert_eq!(
+            metrics
+                .active_by_role
+                .with_label_values(&["subagent"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            metrics
+                .demand_by_role_tokens
+                .with_label_values(&["primary"])
+                .get(),
+            8 * 16
+        );
+        assert_eq!(
+            metrics
+                .demand_by_role_tokens
+                .with_label_values(&["subagent"])
+                .get(),
+            2 * 16
+        );
+        // Without a capacity source the workers are the two that hold sessions.
+        assert_eq!(
+            metrics
+                .worker_demand_tokens
+                .with_label_values(&["max"])
+                .get(),
+            8 * 16
+        );
+        assert_eq!(
+            metrics
+                .worker_demand_tokens
+                .with_label_values(&["mean"])
+                .get(),
+            120
+        );
+
+        // A returning turn adds the prior turn's prefix to the reusable total.
+        runtime.on_complete("main", 20, 0, false);
+        runtime.on_arrival("main", None, 10 * 16);
+        assert_eq!(metrics.prior_prefix_tokens_total.get(), 8 * 16 + 20);
     }
 }

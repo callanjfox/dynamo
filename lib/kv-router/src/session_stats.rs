@@ -20,8 +20,10 @@
 use std::collections::{HashMap, HashSet};
 
 use parking_lot::Mutex;
+use rustc_hash::FxHashMap;
 use serde::Serialize;
 
+use crate::protocols::WorkerWithDpRank;
 use crate::session_prefix_index::{ResidencySnapshot, SessionId, TierBlocks};
 
 /// Upper edges of the turn-gap buckets, in milliseconds. A gap above the last edge
@@ -165,6 +167,24 @@ pub struct SessionStatsSnapshot {
     pub turns: u64,
     /// Sum over active sessions of the prefix they will present next.
     pub demand_tokens: u64,
+    /// Demand counting each distinct prompt block once across active sessions, so a
+    /// prefix two sessions share is not counted twice, plus each session's latest output.
+    /// Split by role: a subagent counts only the blocks its primary sessions do not cover.
+    pub demand_distinct_tokens: u64,
+    pub demand_distinct_primary_tokens: u64,
+    pub demand_distinct_subagent_tokens: u64,
+    pub active_primary_sessions: u64,
+    pub active_subagent_sessions: u64,
+    /// Prompt tokens referenced by more than one active session: the sum of each
+    /// session's prompt blocks minus the distinct blocks.
+    pub shared_tokens: u64,
+    /// Demand of active sessions grouped by the worker that served their last turn.
+    #[serde(skip)]
+    pub home_demand: HashMap<WorkerWithDpRank, u64>,
+    /// The demand sum counting only sessions active within each of
+    /// [`DEMAND_WINDOWS_MS`], so a short window shows demand with idle sessions decayed away.
+    pub demand_window_tokens: [u64; 3],
+
     /// Tokens held per tier if no prefix were shared between sessions.
     pub resident_device_tokens: u64,
     pub resident_host_tokens: u64,
@@ -189,6 +209,10 @@ pub struct SessionStatsSnapshot {
     pub gap_outcomes: Vec<[u64; 4]>,
 }
 
+/// Windows over which demand is also reported, so a session idle longer than the
+/// window stops counting. The configured active window is separate.
+pub const DEMAND_WINDOWS_MS: [u64; 3] = [30_000, 60_000, 300_000];
+
 #[derive(Debug)]
 struct Stat {
     parent: Option<SessionId>,
@@ -209,6 +233,79 @@ struct Stat {
     thrash: ThrashTokens,
     /// An earlier episode left a prefix to find, though this one has no turns yet.
     carried: bool,
+    /// Worker that served the latest turn.
+    home: Option<WorkerWithDpRank>,
+    /// Chained hashes of the latest prompt's blocks, counted in [`DistinctBlocks`]
+    /// while the session is active.
+    blocks: Vec<u64>,
+}
+
+/// Reference counts of the prompt blocks active sessions present, so demand can count
+/// a shared block once.
+#[derive(Debug, Default)]
+struct DistinctBlocks {
+    all: FxHashMap<u64, u32>,
+    primary: FxHashMap<u64, u32>,
+    /// Sum over sessions of their block count, shared blocks counted per session.
+    references: u64,
+}
+
+impl DistinctBlocks {
+    fn add(&mut self, hash: u64, primary: bool) {
+        *self.all.entry(hash).or_default() += 1;
+        if primary {
+            *self.primary.entry(hash).or_default() += 1;
+        }
+        self.references += 1;
+    }
+
+    fn remove(&mut self, hash: u64, primary: bool) {
+        fn drop_one(map: &mut FxHashMap<u64, u32>, hash: u64) {
+            if let Some(count) = map.get_mut(&hash) {
+                *count -= 1;
+                if *count == 0 {
+                    map.remove(&hash);
+                }
+            }
+        }
+        drop_one(&mut self.all, hash);
+        if primary {
+            drop_one(&mut self.primary, hash);
+        }
+        self.references = self.references.saturating_sub(1);
+    }
+
+    /// Swap a session's blocks for `new`, touching only the part after the shared
+    /// prefix: a prompt usually extends the previous one.
+    fn replace(&mut self, held: &mut Vec<u64>, new: Vec<u64>, primary: bool) {
+        let common = held.iter().zip(&new).take_while(|(a, b)| a == b).count();
+        for &hash in &held[common..] {
+            self.remove(hash, primary);
+        }
+        for &hash in &new[common..] {
+            self.add(hash, primary);
+        }
+        *held = new;
+    }
+
+    fn release(&mut self, held: &mut Vec<u64>, primary: bool) {
+        for &hash in held.iter() {
+            self.remove(hash, primary);
+        }
+        held.clear();
+    }
+}
+
+/// Hash each block together with the blocks before it, so equal hashes mean equal prefixes.
+fn chain_hashes(local_hashes: &[u64]) -> Vec<u64> {
+    let mut previous = 0x9E37_79B9_7F4A_7C15u64;
+    local_hashes
+        .iter()
+        .map(|&hash| {
+            previous = (previous.rotate_left(5) ^ hash).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            previous
+        })
+        .collect()
 }
 
 impl Stat {
@@ -272,6 +369,7 @@ struct Inner {
     turns: u64,
     thrash: ThrashTokens,
     gap_outcomes: [[u64; 4]; GAP_BUCKETS],
+    distinct: DistinctBlocks,
 }
 
 /// Thread-safe per-session stats table.
@@ -340,6 +438,8 @@ impl SessionStatsTracker {
                     gap_count: 0,
                     thrash: ThrashTokens::default(),
                     carried: false,
+                    home: None,
+                    blocks: Vec::new(),
                 },
             );
         }
@@ -417,6 +517,21 @@ impl SessionStatsTracker {
         }
     }
 
+    /// Record where a request was routed and the block hashes of its prompt, so demand
+    /// counts a prefix shared between sessions once.
+    pub fn on_routed(&self, session_id: &str, worker: WorkerWithDpRank, local_hashes: &[u64]) {
+        let mut guard = self.inner.lock();
+        let inner = &mut *guard;
+        let Some(stat) = inner.sessions.get_mut(session_id) else {
+            return;
+        };
+        stat.home = Some(worker);
+        let primary = stat.parent.is_none();
+        inner
+            .distinct
+            .replace(&mut stat.blocks, chain_hashes(local_hashes), primary);
+    }
+
     /// Record a request finishing. `cached_tokens` is the prefix the worker reused.
     pub fn on_complete(&self, session_id: &str, osl_tokens: u64, cached_tokens: u64, now_ms: u64) {
         let mut inner = self.inner.lock();
@@ -432,13 +547,16 @@ impl SessionStatsTracker {
 
     /// End a session, for example on a final-turn marker. Returns its summary once.
     pub fn end_session(&self, session_id: &str, now_ms: u64) -> Option<SessionSummary> {
-        let mut inner = self.inner.lock();
+        let mut guard = self.inner.lock();
+        let inner = &mut *guard;
         let stat = inner.sessions.get_mut(session_id)?;
         if stat.ended_ms.is_some() {
             return None;
         }
         stat.ended_ms = Some(now_ms);
         let summary = stat.summary(session_id, now_ms);
+        let primary = stat.parent.is_none();
+        inner.distinct.release(&mut stat.blocks, primary);
         inner.ended += 1;
         Some(summary)
     }
@@ -448,11 +566,16 @@ impl SessionStatsTracker {
     pub fn end_all(&self, now_ms: u64) -> Vec<SessionSummary> {
         let mut inner = self.inner.lock();
         let mut summaries = Vec::new();
-        for (session_id, stat) in &mut inner.sessions {
+        let Inner {
+            sessions, distinct, ..
+        } = &mut *inner;
+        for (session_id, stat) in sessions.iter_mut() {
             if stat.ended_ms.is_none() {
                 stat.ended_ms = Some(now_ms);
                 summaries.push(stat.summary(session_id, now_ms));
             }
+            let primary = stat.parent.is_none();
+            distinct.release(&mut stat.blocks, primary);
         }
         inner.ended += summaries.len() as u64;
         summaries
@@ -464,10 +587,19 @@ impl SessionStatsTracker {
         let ttl = self.config.idle_ttl_ms;
         let mut inner = self.inner.lock();
         let mut summaries = Vec::new();
-        for (session_id, stat) in &mut inner.sessions {
+        let window = self.config.active_window_ms;
+        let Inner {
+            sessions, distinct, ..
+        } = &mut *inner;
+        for (session_id, stat) in sessions.iter_mut() {
             if stat.ended_ms.is_none() && now_ms.saturating_sub(stat.last_activity_ms()) > ttl {
                 stat.ended_ms = Some(now_ms);
                 summaries.push(stat.summary(session_id, now_ms));
+            }
+            // A session idle past the active window no longer counts toward demand.
+            if !stat.is_active(now_ms, window) {
+                let primary = stat.parent.is_none();
+                distinct.release(&mut stat.blocks, primary);
             }
         }
         inner.ended += summaries.len() as u64;
@@ -503,12 +635,44 @@ impl SessionStatsTracker {
             gap_outcomes: inner.gap_outcomes.to_vec(),
             ..SessionStatsSnapshot::default()
         };
+        let (mut primary_output, mut subagent_output) = (0u64, 0u64);
         for stat in inner.sessions.values() {
+            let demand = stat.demand.max(stat.inflight_isl);
             if stat.is_active(now_ms, self.config.active_window_ms) {
                 snapshot.active_sessions += 1;
-                snapshot.demand_tokens += stat.demand.max(stat.inflight_isl);
+                snapshot.demand_tokens += demand;
+                // The prompt blocks are counted once in `distinct`; the latest output
+                // is not part of the next prompt's hashes, so it is added per session.
+                let output = stat.demand.saturating_sub(stat.inflight_isl);
+                if stat.parent.is_some() {
+                    snapshot.active_subagent_sessions += 1;
+                    subagent_output += output;
+                } else {
+                    snapshot.active_primary_sessions += 1;
+                    primary_output += output;
+                }
+                if let Some(home) = stat.home {
+                    *snapshot.home_demand.entry(home).or_default() += demand;
+                }
+            }
+            for (slot, window) in snapshot
+                .demand_window_tokens
+                .iter_mut()
+                .zip(DEMAND_WINDOWS_MS)
+            {
+                if stat.is_active(now_ms, window) {
+                    *slot += demand;
+                }
             }
         }
+        let distinct_blocks = inner.distinct.all.len() as u64;
+        let primary_blocks = inner.distinct.primary.len() as u64;
+        snapshot.demand_distinct_primary_tokens = primary_blocks * block + primary_output;
+        snapshot.demand_distinct_subagent_tokens =
+            (distinct_blocks - primary_blocks) * block + subagent_output;
+        snapshot.demand_distinct_tokens =
+            snapshot.demand_distinct_primary_tokens + snapshot.demand_distinct_subagent_tokens;
+        snapshot.shared_tokens = inner.distinct.references.saturating_sub(distinct_blocks) * block;
         snapshot
     }
 
@@ -540,8 +704,11 @@ impl Inner {
             .iter()
             .min_by_key(|(_, stat)| stat.last_activity_ms())
             .map(|(session_id, _)| session_id.clone());
-        if let Some(victim) = victim {
-            self.sessions.remove(&victim);
+        if let Some(victim) = victim
+            && let Some(mut stat) = self.sessions.remove(&victim)
+        {
+            let primary = stat.parent.is_none();
+            self.distinct.release(&mut stat.blocks, primary);
         }
     }
 }
@@ -720,6 +887,76 @@ mod tests {
         assert_eq!(snapshot.replicated_host_tokens, 64);
         assert_eq!(snapshot.sessions_started, 2);
         assert_eq!(snapshot.sessions_ended, 1);
+    }
+
+    fn worker(id: u64) -> WorkerWithDpRank {
+        WorkerWithDpRank::new(id, 0)
+    }
+
+    #[test]
+    fn distinct_demand_counts_a_shared_prefix_once_and_splits_by_role() {
+        let tracker = tracker();
+        // The primary presents 8 blocks. Its subagent starts from the first 5 and adds 2.
+        let primary: Vec<u64> = (1..=8).collect();
+        let sub: Vec<u64> = (1..=5).chain([100, 101]).collect();
+        tracker.on_arrival("main", None, 8 * 16, TierBlocks::default(), 0);
+        tracker.on_routed("main", worker(1), &primary);
+        tracker.on_arrival(
+            "main/sub",
+            Some("main"),
+            7 * 16,
+            TierBlocks::default(),
+            50_000,
+        );
+        tracker.on_routed("main/sub", worker(2), &sub);
+
+        let snapshot = tracker.snapshot(&ResidencySnapshot::default(), 55_000);
+        assert_eq!(snapshot.active_primary_sessions, 1);
+        assert_eq!(snapshot.active_subagent_sessions, 1);
+        // The sum counts the shared 5 blocks twice; the distinct count does not.
+        assert_eq!(snapshot.demand_tokens, 8 * 16 + 7 * 16);
+        assert_eq!(snapshot.demand_distinct_tokens, 10 * 16);
+        assert_eq!(snapshot.demand_distinct_primary_tokens, 8 * 16);
+        assert_eq!(snapshot.demand_distinct_subagent_tokens, 2 * 16);
+        assert_eq!(snapshot.shared_tokens, 5 * 16);
+        assert_eq!(snapshot.home_demand[&worker(1)], 8 * 16);
+        assert_eq!(snapshot.home_demand[&worker(2)], 7 * 16);
+        // The primary was last active 55 s ago, the subagent 5 s ago.
+        assert_eq!(snapshot.demand_window_tokens, [7 * 16, 15 * 16, 15 * 16]);
+
+        // The primary idles past the 60 s window: its blocks stop counting, the
+        // subagent's shared ones now count in full.
+        tracker.sweep(100_000);
+        let later = tracker.snapshot(&ResidencySnapshot::default(), 100_000);
+        assert_eq!(later.demand_distinct_tokens, 7 * 16);
+
+        // A prompt that extends its previous one only adds the new blocks.
+        tracker.on_arrival(
+            "main/sub",
+            Some("main"),
+            9 * 16,
+            TierBlocks::default(),
+            121_000,
+        );
+        tracker.on_routed(
+            "main/sub",
+            worker(2),
+            &sub.iter().copied().chain([102, 103]).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            tracker
+                .snapshot(&ResidencySnapshot::default(), 121_000)
+                .demand_distinct_tokens,
+            9 * 16
+        );
+        // Ending the session releases everything.
+        tracker.end_session("main/sub", 122_000);
+        assert_eq!(
+            tracker
+                .snapshot(&ResidencySnapshot::default(), 122_000)
+                .demand_distinct_tokens,
+            0
+        );
     }
 
     #[test]

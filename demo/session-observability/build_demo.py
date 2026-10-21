@@ -10,6 +10,7 @@ self-contained index.html with the data embedded.
 
 import json
 import pathlib
+import re
 
 HERE = pathlib.Path(__file__).parent
 DATA = HERE / "data" / "final"
@@ -60,6 +61,72 @@ def total(m, prefix):
     return int(sum(v for k, v in m.items() if k.startswith(prefix)))
 
 
+def percentiles(xs):
+    xs = sorted(xs)
+    pick = lambda q: xs[min(len(xs) - 1, int(q * len(xs)))] if xs else 0
+    return {"p50": pick(0.5), "p90": pick(0.9), "max": xs[-1] if xs else 0}
+
+
+def sum_prefix(m, prefix):
+    return sum(v for k, v in m.items() if k.startswith(prefix))
+
+
+def buckets(m, prefix):
+    """Cumulative histogram buckets {le: count}, summed over the other labels."""
+    out = {}
+    for k, v in m.items():
+        if k.startswith(prefix + "_bucket{"):
+            le = re.search(r"le=([^,}]+)", k).group(1)
+            out[float("inf") if le == "+Inf" else float(le)] = out.get(float("inf") if le == "+Inf" else float(le), 0) + v
+    return out
+
+
+def window_quantile(now, before, q):
+    """Quantile of the observations between two cumulative bucket snapshots, interpolated inside the bucket."""
+    edges = sorted(now)
+    delta = [(e, now[e] - before.get(e, 0)) for e in edges]
+    total = delta[-1][1] if delta else 0
+    if total < 1:
+        return None
+    prev_edge, prev_cum = 0.0, 0.0
+    for edge, cum in delta:
+        if cum >= q * total:
+            if edge == float("inf"):
+                return prev_edge
+            span = cum - prev_cum
+            return prev_edge + (edge - prev_edge) * ((q * total - prev_cum) / span if span else 1)
+        prev_edge, prev_cum = edge, cum
+    return prev_edge
+
+
+def compute_row(m):
+    """Instantaneous compute-health gauges from the frontend and the router's per-worker load series, or None when the run did not scrape them."""
+    if not any(k.startswith("fe_") for k in m):
+        return None
+    decode_blocks = [v for _, v in sorted((k, v) for k, v in m.items() if k.startswith("fe_worker_active_decode_blocks"))]
+    return {
+        "queued": int(m.get("fe_queued_requests", 0)) + int(sum_prefix(m, "queue_pending_requests")),
+        "inflight": int(sum_prefix(m, "fe_inflight_requests")),
+        "decoding": int(sum(v for k, v in m.items() if k.startswith("fe_worker_active_requests") and "request_phase=decode" in k)),
+        "prefilling": int(sum(v for k, v in m.items() if k.startswith("fe_worker_active_requests") and "request_phase=prefill" in k)),
+        "prefill_tokens": int(sum_prefix(m, "fe_worker_active_prefill_tokens")),
+        "decode_blocks": decode_blocks,
+    }
+
+
+def add_latency_percentiles(rows, hists, window_ms=30000):
+    """TTFT and ITL p50 and p90 over the trailing window, from the frontend histograms."""
+    for i, row in enumerate(rows):
+        if not row["compute"]:
+            continue
+        j = i
+        while j > 0 and row["now_ms"] - rows[j]["now_ms"] < window_ms:
+            j -= 1
+        for name, short in (("time_to_first_token_seconds", "ttft"), ("inter_token_latency_seconds", "itl")):
+            now, before = hists[i][name], hists[j][name]
+            row["compute"][short] = {"p50": window_quantile(now, before, 0.5), "p90": window_quantile(now, before, 0.9)} if now else None
+
+
 def live_run(directory):
     """Turn a live run (scraped /metrics plus the router's session_summary logs) into
     the same row and session shapes the replay produces."""
@@ -68,7 +135,7 @@ def live_run(directory):
     t0 = scrapes[0]["t"]
     capacity = meta["workers"] * meta["num_gpu_blocks"] * meta["block_size"]
     capacity_host = meta["workers"] * meta.get("num_host_blocks", 0) * meta["block_size"]
-    rows = []
+    rows, hists = [], []
     for scrape in scrapes:
         m = scrape["m"]
         g = lambda key: int(m.get(key, 0))
@@ -106,7 +173,16 @@ def live_run(directory):
             ],
             "capacity_device_tokens": capacity,
             "capacity_host_tokens": capacity_host,
+            "requests_started": g("requests_started_total"),
+            "input_seq": {"sum": total(m, "input_sequence_tokens_sum"), "count": total(m, "input_sequence_tokens_count")},
+            "output_seq": {"sum": total(m, "output_sequence_tokens_sum"), "count": total(m, "output_sequence_tokens_count")},
+            "compute": compute_row(m),
         })
+        hists.append({name: buckets(m, "fe_" + name) for name in ("time_to_first_token_seconds", "inter_token_latency_seconds")})
+    for row in rows:
+        if row["compute"]:
+            row["compute"]["block_capacity"] = meta["num_gpu_blocks"]
+    add_latency_percentiles(rows, hists)
     requests = [r for r in read_jsonl(directory / "requests.jsonl")] if (directory / "requests.jsonl").exists() else []
     first_last = {}
     for r in requests:
@@ -143,6 +219,8 @@ def live_run(directory):
         "failed": len(requests) - len(ok),
         "p50_s": latencies[len(latencies) // 2] if latencies else 0,
         "p90_s": latencies[int(len(latencies) * 0.9)] if latencies else 0,
+        "isl": percentiles([r["prompt_tokens"] for r in ok if r.get("prompt_tokens")]),
+        "osl": percentiles([r["completion_tokens"] for r in ok if r.get("completion_tokens")]),
     }
     return rows, sessions, meta, request_stats
 

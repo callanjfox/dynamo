@@ -102,6 +102,18 @@
   th { color: var(--ink-2); font-weight: 600; }
   .scroll { overflow-x: auto; }
   .foot { color: var(--ink-3); font-size: 12px; margin-top: 18px; max-width: 90ch; }
+  .hists { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 8px 24px; }
+  .hist h3 { font-size: 13px; margin: 6px 0 2px; color: var(--ink-2); font-weight: 600; }
+  .hist .gaprow { grid-template-columns: 78px 1fr 34px; }
+  .nav { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 0 0 18px; font-size: 13px; }
+  .nav a { color: var(--s1); text-decoration: none; }
+  .nav a:hover { text-decoration: underline; }
+  h2.section { font-size: 17px; margin: 28px 0 4px; font-weight: 650; scroll-margin-top: 12px; }
+  p.section-note { color: var(--ink-2); font-size: 13px; margin: 0 0 12px; max-width: 80ch; }
+  .tiles.small .tile .v { font-size: 22px; }
+  .reftable td:first-child { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; white-space: nowrap; }
+  .reftable td, .reftable th { text-align: left; white-space: normal; vertical-align: top; }
+  .reftable td:nth-child(2) { white-space: nowrap; color: var(--ink-2); }
   .axis text { fill: var(--ink-3); font-size: 11px; }
 </style>
 </head>
@@ -113,6 +125,27 @@
   <div class="tabs" id="tabs"></div>
   <p class="blurb" id="blurb"></p>
 
+  <div class="nav"><a href="#sec-sessions">Your sessions</a><a href="#sec-cache">Working set and cache</a><a href="#sec-compute">Compute health</a><a href="#sec-ref">Metric reference</a></div>
+
+  <h2 class="section" id="sec-sessions">Your sessions</h2>
+  <p class="section-note">What the workload looks like: how many turns a session runs, how large its prompts and outputs are, how fast its context grows, and how much it fans out into subagents.</p>
+  <div class="tiles small" id="stiles"></div>
+  <div class="card">
+    <h2>Shape of the sessions</h2>
+    <p class="note">Number of sessions in each range, including subagents. Turns, prompt size per turn, and the largest context each session reached.</p>
+    <div class="hists" id="hists"></div>
+  </div>
+  <div class="card" id="card-shape">
+    <h2>Request size over time</h2>
+    <p class="note">Mean input and output tokens per request in each 60 second window. Input grows as sessions accumulate context; output stays small.</p>
+    <div class="legend" id="leg9"></div>
+    <div class="chart" id="c9"></div>
+    <div class="legend" id="leg10"></div>
+    <div class="chart" id="c10"></div>
+  </div>
+
+  <h2 class="section" id="sec-cache">Working set and cache</h2>
+  <p class="section-note">Is the working set larger than the cache, and what does that cost? Demand against capacity first, then the thrash it causes.</p>
   <div class="tiles" id="tiles"></div>
 
   <div class="card">
@@ -159,7 +192,7 @@
 
   <div class="card" id="card-funnel">
     <h2>Cache reuse funnel</h2>
-    <p class="note">Cumulative input tokens narrowing from the prompt to what the worker reports reusing. F0 is every prompt token. F2 is the prefix the router estimates is cached on the best eligible worker. F3 is the same on the worker it chose. F4 is what the worker reports reusing. Each step counts tokens, not requests.</p>
+    <p class="note">Share of prompt tokens at each step in each 60 second window (F0, every prompt token, is 100%). F2 is the prefix the router estimates is cached on the best eligible worker. F3 is the same on the worker it chose. F4 is what the worker reports reusing. The table has the cumulative totals.</p>
     <div class="legend" id="leg7"></div>
     <div class="chart" id="c7"></div>
     <div class="scroll" id="funnel"></div>
@@ -184,6 +217,46 @@
     <div class="scroll" id="top"></div>
   </div>
 
+  <div id="compute">
+  <h2 class="section" id="sec-compute">Compute health</h2>
+  <p class="section-note">How the workers cope with that load. If the working set is too big the cost shows up here: longer time to first token as prefixes are recomputed, a queue building, the KV cache full. Latency and queue series come from the frontend and the router's per-worker load tracking. Workers are mockers, so absolute times are the simulation's.</p>
+  <div class="tiles small" id="ctiles"></div>
+  <div class="card">
+    <h2>Time to first token</h2>
+    <p class="note">Median and 90th percentile over a trailing 30 seconds. Prompts that recompute a large prefix wait longer for their first token.</p>
+    <div class="legend" id="leg11"></div>
+    <div class="chart" id="c11"></div>
+  </div>
+  <div class="card">
+    <h2>Inter-token latency</h2>
+    <p class="note">Median and 90th percentile over a trailing 30 seconds, in milliseconds. It rises with batch size and context length.</p>
+    <div class="legend" id="leg12"></div>
+    <div class="chart" id="c12"></div>
+  </div>
+  <div class="card">
+    <h2>Queues</h2>
+    <p class="note">Requests the router has booked on a worker and not yet marked prefill-complete (waiting for the prefill or running it), requests decoding, and requests held at the frontend or router queue before dispatch. A growing prefill count means the fleet is saturated.</p>
+    <div class="legend" id="leg13"></div>
+    <div class="chart" id="c13"></div>
+  </div>
+  <div class="card">
+    <h2>Estimated queue wait</h2>
+    <p class="note">Prefill backlog (prompt tokens queued or being prefilled) divided by the input token rate over a trailing 30 seconds: how long the backlog takes to clear. Neither the frontend nor the mock workers export a queue-time histogram, so this is derived. A real engine exports one (vllm:request_queue_time_seconds) and it should replace this estimate.</p>
+    <div class="legend" id="leg14"></div>
+    <div class="chart" id="c14"></div>
+  </div>
+  <div class="card">
+    <h2>KV blocks in use per worker</h2>
+    <p class="note">Share of each worker's GPU KV blocks booked by its active requests, from the router's load tracking. A worker near 100% is full; an uneven spread means the router is concentrating sessions.</p>
+    <div class="legend" id="leg15"></div>
+    <div class="chart" id="c15"></div>
+  </div>
+  </div>
+
+  <h2 class="section" id="sec-ref">Metric reference</h2>
+  <p class="section-note">Every metric on this page. Session metrics are the ones added in this work. All carry the router_ prefix, are experimental, and use only bounded labels: no session or tenant ID is ever a label. Per-session detail goes to the dynamo_session_summary log.</p>
+  <div class="card"><div class="scroll" id="ref"></div></div>
+
   <p class="foot" id="foot">Synthetic workload, not a customer trace. Time is simulated. Active means the session had activity within 5 minutes and has not ended. Thrash is estimated from the prior turn's input plus output against what the index holds, so it carries up to one block of rounding per turn.</p>
 </div>
 
@@ -197,6 +270,55 @@ const fmtTok = (n) => n >= 1e9 ? (n / 1e9).toFixed(2) + "B" : n >= 1e8 ? Math.ro
 const fmtNum = (n) => Math.round(n).toLocaleString("en-US");
 const fmtClock = (m) => { const s = Math.round(m * 60); return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); };
 const pct = (x) => (x * 100).toFixed(0) + "%";
+const windowStart = (rows, i, ms) => { let j = i; while (j > 0 && rows[i].now_ms - rows[j].now_ms < ms) j--; return j; };
+const median = (xs) => quantile(xs, 0.5);
+const REF = [
+  ["Session state", [
+    ["sessions_active", "gauge", "Sessions active inside the window that have not ended."],
+    ["session_demand_tokens", "gauge", "Sum over active sessions of the prefix each will present next: the working set size."],
+    ["session_resident_tokens{tier}", "gauge", "Distinct tokens the session index holds in each tier (device, host, disk). Compare with demand and capacity."],
+    ["session_stranded_tokens{tier}", "gauge", "Tokens held only for inactive sessions (device, host): cache held but not needed."],
+    ["session_replicated_tokens{tier}", "gauge", "Copies of session prefix beyond the first on other workers (device, host): redundancy."],
+    ["sessions_split", "gauge", "Active sessions whose GPU prefix is spread over more than one worker."],
+    ["sessions_started_total", "counter", "Sessions first seen. A session resuming after it ended counts as a new start."],
+    ["sessions_ended_total", "counter", "Sessions ended by a final-turn marker or by idling past the TTL."],
+  ]],
+  ["Thrash and returns", [
+    ["session_thrash_tokens_total{outcome}", "counter", "Prior-prefix tokens a returning session had to recompute, or reload from host or disk. Recomputed is the cost of running out of cache."],
+    ["session_return_turns_total{gap,outcome}", "counter", "Returning turns by time since the previous turn (10 buckets) and where the prior prefix was found (gpu, host, disk, miss)."],
+  ]],
+  ["Coverage", [
+    ["session_coverage_requests_total{coverage}", "counter", "Routed requests with (covered) or without (uncovered) a session ID."],
+    ["session_coverage_input_tokens_total{coverage}", "counter", "The same split in input tokens: how much of the traffic the session metrics describe."],
+  ]],
+  ["Per-session shape (observed when a session ends)", [
+    ["session_turns", "histogram", "Turns per session."],
+    ["session_input_tokens", "histogram", "Input tokens summed over a session."],
+    ["session_output_tokens", "histogram", "Output tokens summed over a session."],
+    ["session_peak_context_tokens", "histogram", "Largest context a session presented."],
+    ["session_cache_hit_ratio", "histogram", "Share of a session's input served from cache, 0 to 1."],
+    ["session_duration_seconds", "histogram", "First request to end."],
+    ["session_turn_gap_seconds", "histogram", "Mean time between a session's turns."],
+    ["session_subagents", "histogram", "Subagent sessions a session spawned."],
+  ]],
+  ["Cache reuse funnel (already in Dynamo)", [
+    ["input_sequence_tokens", "histogram", "F0: every prompt token. Its sum and count give mean input size per request."],
+    ["kv_best_eligible_cached_prefix_tokens_total", "counter", "F2: prefix the router estimates is cached on the best eligible worker."],
+    ["kv_selected_cached_prefix_tokens_total", "counter", "F3: the same on the worker the router chose."],
+    ["kv_worker_reused_tokens_total", "counter", "F4: tokens the worker reports reusing."],
+    ["output_sequence_tokens", "histogram", "Output tokens per request."],
+  ]],
+  ["Compute health (already in Dynamo)", [
+    ["frontend time_to_first_token_seconds", "histogram", "Request arrival to first token."],
+    ["frontend inter_token_latency_seconds", "histogram", "Time between streamed tokens."],
+    ["frontend queued_requests", "gauge", "Requests waiting in the HTTP queue before a first response."],
+    ["frontend inflight_requests", "gauge", "Requests being served."],
+    ["frontend router_queue_pending_requests", "gauge", "Requests held in the router's scheduler queue."],
+    ["frontend worker_active_requests{request_phase}", "gauge", "Requests booked per worker, split prefill (not yet prefill-complete) and decode."],
+    ["frontend worker_active_prefill_tokens", "gauge", "Prompt tokens queued or being prefilled per worker."],
+    ["frontend worker_active_decode_blocks", "gauge", "KV blocks booked by active requests per worker."],
+]],
+];
 const quantile = (xs, q) => { const a = [...xs].sort((x, y) => x - y); return a.length ? a[Math.min(a.length - 1, Math.floor(q * a.length))] : 0; };
 
 function niceStep(v) {
@@ -256,7 +378,7 @@ function lineChart(host, spec) {
   let top = 0;
   for (const s of spec.series) top = Math.max(top, ...s.values);
   for (const r of spec.refs || []) top = Math.max(top, r.y);
-  const sc = scale(top * 1.04), yMax = sc.max;
+  const sc = scale(spec.max || top * 1.04), yMax = sc.max;
   const X = (v) => M.l + (iw * v) / xMax;
   const Y = (v) => M.t + ih - (ih * v) / yMax;
   let svg = axes(W, H, xMax, sc, spec.fmtY);
@@ -446,14 +568,17 @@ function render(idx) {
   const hasFunnel = rows.some((r) => r.funnel && r.funnel.f0 > 0);
   $("#card-funnel").style.display = hasFunnel ? "" : "none";
   if (hasFunnel) {
+    const windowShare = (key) => rows.map((r, i) => {
+      const j = windowStart(rows, i, 60000), d0 = r.funnel.f0 - rows[j].funnel.f0;
+      return d0 > 0 ? (100 * (r.funnel[key] - rows[j].funnel[key])) / d0 : 0;
+    });
     const sf = [
-      { name: "F0 prompt tokens", color: "--s1", values: rows.map((r) => r.funnel.f0) },
-      { name: "F2 best eligible worker's cache", color: "--s2", values: rows.map((r) => r.funnel.f2) },
-      { name: "F3 chosen worker's cache", color: "--s3", values: rows.map((r) => r.funnel.f3) },
-      { name: "F4 worker-reported reuse", color: "--s5", values: rows.map((r) => r.funnel.f4) },
+      { name: "F2 best eligible worker's cache", color: "--s2", values: windowShare("f2") },
+      { name: "F3 chosen worker's cache", color: "--s3", values: windowShare("f3") },
+      { name: "F4 worker-reported reuse", color: "--s5", values: windowShare("f4") },
     ].filter((x) => x.values.some((v) => v > 0));
     legend("#leg7", sf);
-    lineChart($("#c7"), { x: t, series: sf, fmtY: fmtTok, fmtTip: fmtTok, label: "Cache reuse funnel" });
+    lineChart($("#c7"), { x: t, series: sf, fmtY: (v) => Math.round(v) + "%", fmtTip: (v) => v.toFixed(1) + "%", label: "Cache reuse funnel, share of prompt tokens", max: 100 });
     const f = last.funnel, of = (v) => (f.f0 ? pct(v / f.f0) : "-");
     $("#funnel").innerHTML = `<table><thead><tr><th>Step</th><th>Tokens</th><th>Share of prompt</th></tr></thead><tbody>` +
       [["F0 prompt", f.f0], ["F2 best eligible worker", f.f2], ["F3 chosen worker", f.f3], ["F4 worker-reported reuse", f.f4]]
@@ -480,9 +605,93 @@ function render(idx) {
   const top = [...sess].sort((a, b) => b.peak_demand_tokens - a.peak_demand_tokens).slice(0, 12);
   $("#top").innerHTML = `<table><thead><tr><th>Session</th><th>Parent</th><th>Turns</th><th>Input tokens</th><th>Context</th><th>Hit rate</th><th>Subagents</th><th>Thrash tokens</th></tr></thead><tbody>` +
     top.map((s) => `<tr><td>${s.session_id}</td><td>${s.parent_session_id || "-"}</td><td>${s.turns}</td><td>${fmtTok(s.isl_tokens)}</td><td>${fmtTok(s.peak_demand_tokens)}</td><td>${pct(s.hit_rate)}</td><td>${s.children}</td><td>${fmtTok(s.thrash.recomputed + s.thrash.reloaded_host + s.thrash.reloaded_disk)}</td></tr>`).join("") + `</tbody></table>`;
+
+  // ---- your sessions: tiles and shape
+  const islTurn = sess.map((x) => x.isl_tokens / Math.max(1, x.turns)), osl = sess.map((x) => x.osl_tokens / Math.max(1, x.turns));
+  const rs = run.requests;
+  const withKids = sess.filter((x) => x.children > 0).length;
+  $("#stiles").innerHTML =
+    tile("Sessions", String(sess.length), `${subs} subagents, ${withKids} sessions spawned subagents`) +
+    tile("Turns per session", `${Math.round(median(sess.map((x) => x.turns)))} median`, `p90 ${Math.round(quantile(sess.map((x) => x.turns), 0.9))}, max ${Math.max(...sess.map((x) => x.turns))}`) +
+    tile("Input tokens (ISL) per request", fmtTok(rs && rs.isl ? rs.isl.p50 : median(islTurn)) + " median", rs && rs.isl ? `p90 ${fmtTok(rs.isl.p90)}, max ${fmtTok(rs.isl.max)}` : `p90 ${fmtTok(quantile(islTurn, 0.9))} (mean per turn, per session)`) +
+    tile("Output tokens (OSL) per request", Math.round(rs && rs.osl ? rs.osl.p50 : median(osl)) + " median", rs && rs.osl ? `p90 ${fmtNum(rs.osl.p90)}, max ${fmtNum(rs.osl.max)}` : `p90 ${Math.round(quantile(osl, 0.9))}`) +
+    tile("Context reached", fmtTok(median(sess.map((x) => x.peak_demand_tokens))) + " median", `p90 ${fmtTok(quantile(sess.map((x) => x.peak_demand_tokens), 0.9))}, max ${fmtTok(Math.max(...sess.map((x) => x.peak_demand_tokens)))}`) +
+    tile("Context growth per turn", fmtTok(median(sess.map((x) => x.growth_per_turn || 0))) + " median", `p90 ${fmtTok(quantile(sess.map((x) => x.growth_per_turn || 0), 0.9))}`) +
+    tile("Think time between turns", median(sess.map((x) => x.mean_turn_gap_ms / 1000)).toFixed(1) + " s median", `p90 ${quantile(sess.map((x) => x.mean_turn_gap_ms / 1000), 0.9).toFixed(1)} s`);
+
+  const histRows = (title, xs, edges, fmt) => {
+    const counts = edges.map(() => 0).concat([0]);
+    xs.forEach((v) => { let k = edges.findIndex((e) => v <= e); counts[k < 0 ? edges.length : k]++; });
+    const top = Math.max(...counts, 1);
+    return `<div class="hist"><h3>${title}</h3>` + counts.map((c, k) =>
+      `<div class="gaprow"><div class="lab">${k < edges.length ? "up to " + fmt(edges[k]) : "over " + fmt(edges[edges.length - 1])}</div><div class="gapbar"><span title="${c} sessions" style="width:${(c / top) * 100}%;background:var(--s1)"></span></div><div class="n">${c}</div></div>`).join("") + `</div>`;
+  };
+  $("#hists").innerHTML =
+    histRows("Turns per session", sess.map((x) => x.turns), [1, 2, 4, 8, 16, 32, 64, 128], String) +
+    histRows("Input tokens per turn", islTurn, [1000, 4000, 16000, 32000, 64000, 128000, 256000], fmtTok) +
+    histRows("Largest context reached", sess.map((x) => x.peak_demand_tokens), [4000, 16000, 32000, 64000, 128000, 256000, 512000], fmtTok);
+
+  const meanWindow = (key) => rows.map((r, i) => {
+    const j = windowStart(rows, i, 60000), dc = r[key].count - rows[j][key].count;
+    return dc > 0 ? (r[key].sum - rows[j][key].sum) / dc : 0;
+  });
+  const hasShape = rows.some((r) => r.input_seq && r.input_seq.count > 0);
+  $("#card-shape").style.display = hasShape ? "" : "none";
+  if (hasShape) {
+    legend("#leg9", [{ name: "Mean input tokens per request", color: "--s1" }]);
+    lineChart($("#c9"), { x: t, series: [{ name: "Mean input tokens per request", color: "--s1", values: meanWindow("input_seq") }], fmtY: fmtTok, fmtTip: fmtTok, label: "Mean input tokens per request" });
+    legend("#leg10", [{ name: "Mean output tokens per request", color: "--s3" }]);
+    lineChart($("#c10"), { x: t, series: [{ name: "Mean output tokens per request", color: "--s3", values: meanWindow("output_seq") }], fmtY: (v) => String(Math.round(v)), fmtTip: (v) => String(Math.round(v)), label: "Mean output tokens per request" });
+  }
+
+  // ---- compute health
+  const crow = rows.filter((r) => r.compute);
+  $("#compute").style.display = crow.length ? "" : "none";
+  if (crow.length) {
+    const ct = crow.map((r) => r.now_ms / MIN);
+    const fill = (xs) => { let last = 0; return xs.map((v) => (last = v == null ? last : v)); };
+    const lat = (name, k, scale) => fill(crow.map((r) => (r.compute[name] ? r.compute[name][k] : null))).map((v) => v * scale);
+    const ttft50 = lat("ttft", "p50", 1), ttft90 = lat("ttft", "p90", 1), itl50 = lat("itl", "p50", 1000), itl90 = lat("itl", "p90", 1000);
+    const fmtS = (v) => (v < 1 ? Math.round(v * 1000) + " ms" : (v >= 10 ? v.toFixed(0) : v.toFixed(1)) + " s"), fmtMs = (v) => Math.round(v) + " ms";
+    const demandOver = [], demandUnder = [];
+    crow.forEach((r, i) => (r.demand_tokens > r.capacity_device_tokens ? demandOver : demandUnder).push(ttft90[i]));
+    const waiting = crow.map((r) => r.compute.prefilling), queued = crow.map((r) => r.compute.queued), running = crow.map((r) => r.compute.decoding);
+    const backlog = crow.map((r) => r.compute.prefill_tokens);
+    const kvPct = (r) => r.compute.decode_blocks.map((b) => (100 * b) / r.compute.block_capacity);
+    const kvMean = crow.map((r) => { const x = kvPct(r); return x.length ? x.reduce((a, b) => a + b, 0) / x.length : 0; });
+    $("#ctiles").innerHTML =
+      tile("Time to first token", fmtS(median(ttft50)) + " median", `p90 ${fmtS(quantile(ttft90, 0.5))} typical, ${fmtS(Math.max(...ttft90))} worst window`) +
+      (demandOver.length && demandUnder.length ? tile("p90 TTFT, demand over vs under capacity", `${fmtS(median(demandOver))} vs ${fmtS(median(demandUnder))}`, `windows where demand passed GPU capacity (${demandOver.length}) vs did not (${demandUnder.length})`) : "") +
+      tile("Inter-token latency", fmtMs(median(itl50)) + " median", `p90 ${fmtMs(quantile(itl90, 0.5))} typical`) +
+      tile("Peak requests in prefill", String(Math.max(...waiting)), `peak decoding ${Math.max(...running)}, frontend queue peak ${Math.max(...queued)}`) +
+      tile("Peak prefill backlog", fmtTok(Math.max(...backlog)), "prompt tokens queued or being prefilled, all workers") +
+      tile("KV blocks in use", Math.round(Math.max(...kvMean)) + "% peak", "mean across workers, booked by active requests");
+    legend("#leg11", [{ name: "p50", color: "--s1" }, { name: "p90", color: "--s2" }]);
+    lineChart($("#c11"), { x: ct, series: [{ name: "p50", color: "--s1", values: ttft50 }, { name: "p90", color: "--s2", values: ttft90 }], fmtY: fmtS, fmtTip: fmtS, label: "Time to first token" });
+    legend("#leg12", [{ name: "p50", color: "--s1" }, { name: "p90", color: "--s2" }]);
+    lineChart($("#c12"), { x: ct, series: [{ name: "p50", color: "--s1", values: itl50 }, { name: "p90", color: "--s2", values: itl90 }], fmtY: fmtMs, fmtTip: fmtMs, label: "Inter-token latency" });
+    const sq = [{ name: "In prefill (queued or prefilling)", color: "--s2", values: waiting }, { name: "Decoding", color: "--s1", values: running }, { name: "Queued at frontend or router", color: "--s5", values: queued }];
+    legend("#leg13", sq);
+    lineChart($("#c13"), { x: ct, series: sq, fmtY: (v) => String(Math.round(v)), fmtTip: (v) => String(Math.round(v)), label: "Queues" });
+    const wait = crow.map((r, i) => {
+      const k = windowStart(crow, i, 30000), dt = (r.now_ms - crow[k].now_ms) / 1000, dn = r.input_seq.sum - crow[k].input_seq.sum;
+      const b = backlog.slice(k, i + 1).reduce((a, c) => a + c, 0) / (i - k + 1);
+      return dn > 0 && dt > 0 ? b / (dn / dt) : 0;
+    });
+    legend("#leg14", [{ name: "Estimated wait to finish prefill backlog", color: "--s2" }]);
+    lineChart($("#c14"), { x: ct, series: [{ name: "Estimated wait to finish prefill backlog", color: "--s2", values: wait }], fmtY: fmtS, fmtTip: fmtS, label: "Estimated queue wait" });
+    const engines = Math.max(...crow.map((r) => r.compute.decode_blocks.length));
+    const colors = ["--s1", "--s2", "--s3", "--s5"];
+    const kv = Array.from({ length: engines }, (_, e) => ({ name: "Worker " + (e + 1), color: colors[e % 4], values: crow.map((r) => kvPct(r)[e] || 0) }));
+    legend("#leg15", kv);
+    lineChart($("#c15"), { x: ct, series: kv, fmtY: (v) => Math.round(v) + "%", fmtTip: (v) => v.toFixed(0) + "%", label: "KV cache usage per worker", max: 100 });
+  }
+
+  $("#ref").innerHTML = `<table class="reftable"><thead><tr><th>Metric</th><th>Type</th><th>What it tells you</th></tr></thead><tbody>` +
+    REF.map(([group, ms]) => `<tr><td colspan="3"><b>${group}</b></td></tr>` + ms.map(([n, ty, d]) => `<tr><td>${n}</td><td>${ty}</td><td>${d}</td></tr>`).join("")).join("") + `</tbody></table>`;
 }
 
-let current = Number(new URLSearchParams(location.search).get("run") ?? DATA.findIndex((d) => d.key === "ax_host" || d.key === "ax_gpu"));
+let current = Number(new URLSearchParams(location.search).get("run") ?? DATA.findIndex((d) => d.key === "ax_host"));
 if (!(current >= 0)) current = 1;
 $("#tabs").innerHTML = DATA.map((d, i) => `<button class="tab" data-i="${i}" aria-pressed="false">${d.label}<small>${d.detail}</small></button>`).join("");
 $("#tabs").addEventListener("click", (e) => { const b = e.target.closest(".tab"); if (b) { current = Number(b.dataset.i); render(current); } });

@@ -20,6 +20,7 @@ RAMP_S=${RAMP_S:-900}
 TIME_SCALE=${TIME_SCALE:-6}
 MODEL=${MODEL:-Qwen/Qwen3-0.6B}
 PORT=${PORT:-8000}
+WPORT=${WPORT:-8081}   # the mocker's system status server: engine-style worker metrics
 ANON=${ANON:-0}
 HERE=$(cd "$(dirname "$0")" && pwd)
 

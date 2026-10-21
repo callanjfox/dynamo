@@ -115,6 +115,9 @@ pub struct ResidencySnapshot {
     /// Sessions the caller did not mark inactive whose device-tier frontier sits on
     /// more than one worker.
     pub split_sessions: u64,
+    /// Distinct blocks each worker holds per tier for the sessions' prefixes. Set
+    /// against that worker's own capacity, it shows whether load is even.
+    pub workers: HashMap<WorkerWithDpRank, TierBlocks>,
 }
 
 /// Thread-safe session-aware logical prefix index.
@@ -521,8 +524,15 @@ impl SessionPrefixIndexer {
             disk: active_covered[2].len() as u64 + snapshot.stranded.disk,
         };
         let mut worker_sum = [0u64; 3];
-        for (&(_, tier_index), nodes) in &per_worker {
+        for (&(worker, tier_index), nodes) in &per_worker {
             worker_sum[tier_index] += nodes.len() as u64;
+            let held = snapshot.workers.entry(worker).or_default();
+            let slot = match tier_index {
+                0 => &mut held.device,
+                1 => &mut held.host,
+                _ => &mut held.disk,
+            };
+            *slot = nodes.len() as u64;
         }
         snapshot.replicated = TierBlocks {
             device: worker_sum[0] - snapshot.distinct.device,
@@ -1625,6 +1635,9 @@ mod tests {
         // Both workers hold blocks 1 and 2: two copies beyond the first.
         assert_eq!(snapshot.distinct.device, 2);
         assert_eq!(snapshot.replicated.device, 2);
+        // Worker 1 holds both blocks for s and t together; worker 2 holds the same two.
+        assert_eq!(snapshot.workers[&worker(1)].device, 2);
+        assert_eq!(snapshot.workers[&worker(2)].device, 2);
     }
 
     #[test]
