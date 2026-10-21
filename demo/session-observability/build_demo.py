@@ -40,6 +40,23 @@ GAP_LABELS = ["le_1s", "le_5s", "le_10s", "le_30s", "le_60s", "le_120s", "le_300
 OUTCOMES = ["gpu", "host", "disk", "miss"]
 
 
+LIVE_RUNS = [
+    ("agentx_gpu", "AgentX, live", "GPU memory only",
+     "Recorded AgentX coding-agent sessions ({sessions} including subagents) through the production router with the session index on, "
+     "{workers} mock workers ({gpu}k tokens of GPU cache){host_note}."),
+    ("agentx_host", "AgentX, live", "GPU + host memory",
+     "The same AgentX sessions with a host-memory tier on each worker: {workers} mock workers, {gpu}k tokens of GPU cache{host_note}."),
+    ("heavy", "Synthetic, live", "Real router, mock workers",
+     "The production router with the session index on, {workers} mock workers ({gpu}k tokens of GPU cache), "
+     "and a synthetic client sending Dynamo session headers."),
+]
+
+
+def total(m, prefix):
+    """Sum the scraped series whose key starts with prefix (the scraper drops the model label)."""
+    return int(sum(v for k, v in m.items() if k.startswith(prefix)))
+
+
 def live_run(directory):
     """Turn a live run (scraped /metrics plus the router's session_summary logs) into
     the same row and session shapes the replay produces."""
@@ -47,6 +64,7 @@ def live_run(directory):
     scrapes = [r for r in read_jsonl(directory / "metrics.jsonl") if "m" in r]
     t0 = scrapes[0]["t"]
     capacity = meta["workers"] * meta["num_gpu_blocks"] * meta["block_size"]
+    capacity_host = meta["workers"] * meta.get("num_host_blocks", 0) * meta["block_size"]
     rows = []
     for scrape in scrapes:
         m = scrape["m"]
@@ -59,6 +77,14 @@ def live_run(directory):
             "distinct_device_tokens": g("session_resident_tokens{tier=device}"),
             "distinct_host_tokens": g("session_resident_tokens{tier=host}"),
             "stranded_device_tokens": g("session_stranded_tokens{tier=device}"),
+            "replicated_device_tokens": g("session_replicated_tokens{tier=device}"),
+            "replicated_host_tokens": g("session_replicated_tokens{tier=host}"),
+            "funnel": {
+                "f0": total(m, "input_sequence_tokens_sum"),
+                "f2": total(m, "kv_best_eligible_cached_prefix_tokens_total"),
+                "f3": total(m, "kv_selected_cached_prefix_tokens_total"),
+                "f4": total(m, "kv_worker_reused_tokens_total"),
+            },
             "split_sessions": g("sessions_split"),
             "thrash": {
                 "recomputed": g("session_thrash_tokens_total{outcome=recomputed}"),
@@ -70,10 +96,17 @@ def live_run(directory):
                 for gap in GAP_LABELS
             ],
             "capacity_device_tokens": capacity,
-            "capacity_host_tokens": 0,
+            "capacity_host_tokens": capacity_host,
         })
+    requests = [r for r in read_jsonl(directory / "requests.jsonl")] if (directory / "requests.jsonl").exists() else []
+    first_last = {}
+    for r in requests:
+        if r.get("prompt_tokens"):
+            first_last.setdefault(r["session"], []).append(r["prompt_tokens"])
     sessions = []
     for record in read_jsonl(directory / "summaries.jsonl"):
+        prompts = first_last.get(record["session_id"], [])
+        growth = (prompts[-1] - prompts[0]) / (len(prompts) - 1) if len(prompts) > 1 else 0
         sessions.append({
             "session_id": record["session_id"],
             "parent_session_id": record.get("parent_session_id") or None,
@@ -86,13 +119,23 @@ def live_run(directory):
             "mean_turn_gap_ms": record["mean_turn_gap_ms"],
             "peak_demand_tokens": record["peak_context_tokens"],
             "children": record["subagents"],
+            "growth_per_turn": growth,
             "thrash": {
                 "recomputed": record["thrash_recomputed_tokens"],
                 "reloaded_host": record["thrash_reloaded_host_tokens"],
                 "reloaded_disk": record["thrash_reloaded_disk_tokens"],
             },
         })
-    return rows, sessions, meta
+    ok = [r for r in requests if r.get("status") == 200]
+    latencies = sorted(r["latency_s"] for r in ok)
+    request_stats = {
+        "sent": len(requests),
+        "ok": len(ok),
+        "failed": len(requests) - len(ok),
+        "p50_s": latencies[len(latencies) // 2] if latencies else 0,
+        "p90_s": latencies[int(len(latencies) * 0.9)] if latencies else 0,
+    }
+    return rows, sessions, meta, request_stats
 
 
 def read_jsonl(path):
@@ -106,33 +149,45 @@ def main():
         rows = read_jsonl(DATA / f"{scenario['key']}.jsonl")
         sessions = read_jsonl(DATA / f"{scenario['key']}.jsonl.sessions")
         payload.append({**scenario, "rows": rows, "sessions": sessions})
-    live_dir = HERE / "data" / "live" / "heavy"
-    if live_dir.exists():
-        rows, sessions, meta = live_run(live_dir)
+    for key, label, detail, blurb in LIVE_RUNS:
+        directory = HERE / "data" / "live" / key
+        if not directory.exists():
+            continue
+        rows, sessions, meta, request_stats = live_run(directory)
+        host_note = (
+            f" plus {meta['num_host_blocks'] * meta['block_size'] * meta['workers'] // 1000}k tokens of host memory"
+            if meta.get("num_host_blocks") else ""
+        )
         payload.append({
-            "key": "live",
-            "label": "Live run",
-            "detail": "Real router, mock workers",
-            "blurb": (
-                f"The production router with the session index on, {meta['workers']} mock workers "
-                f"({meta['num_gpu_blocks'] * meta['block_size'] * meta['workers'] // 1000}k tokens of GPU cache), "
-                "and a client sending Dynamo session headers. Every number is read from the router's real "
-                "/metrics and its session_summary log."
+            "key": key,
+            "label": label,
+            "detail": detail,
+            "blurb": blurb.format(
+                workers=meta["workers"],
+                gpu=meta["num_gpu_blocks"] * meta["block_size"] * meta["workers"] // 1000,
+                host_note=host_note,
+                sessions=len(sessions),
             ),
             "demandIsSum": True,
+            "requests": request_stats,
             "intro": (
+                "AgentX coding-agent sessions replayed through a live Dynamo frontend and KV router with mock workers. "
+                "These are the router's own session metrics, scraped from /metrics while the workload ran."
+                if meta.get("workload") == "agentx" else
                 "A synthetic agent workload sent through a live Dynamo frontend and KV router with mock workers. "
                 "These are the router's own session metrics, scraped from /metrics while the workload ran."
             ),
             "note1": (
                 "Demand is the router's sum over active sessions of the prefix each will present next. "
-                "Resident is the distinct tokens the session index holds on the GPU."
+                "Resident is the distinct tokens the session index holds in each tier."
             ),
             "foot": (
                 "Wall-clock time. Real frontend and KV router with the session index on; workers are mockers, "
-                "so there are no GPUs. Demand here is the router's per-session sum, which counts a shared prefix "
-                "once per session and overstates distinct demand. Subagent prompts start from their parent's, "
-                "so that overstatement is larger than in the replay runs."
+                "so there are no GPUs and the cache model is the mocker's. Demand is the router's per-session sum, "
+                "which counts a prefix once per session and overstates distinct demand when sessions share one "
+                "(a subagent starts from its parent's prompt)."
+                + (f" Sessions replay the recorded AgentX think times, capped at 300 s and divided by {meta['time_scale']}; "
+                   f"the active window is {meta['active_window_s']} s." if meta.get("workload") == "agentx" else "")
             ),
             "rows": rows,
             "sessions": sessions,

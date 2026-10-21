@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Poll a frontend's /metrics and keep the router session series as JSON lines.
+"""Poll a frontend's /metrics and keep the router session and cache-reuse funnel series as JSON lines.
 
     python3 scrape.py --url http://localhost:8000/metrics --out metrics.jsonl --stop-file stop
 """
@@ -12,7 +12,16 @@ import urllib.request
 
 from prometheus_client.parser import text_string_to_metric_families
 
-KEEP = ("router_session", "router_sessions")
+KEEP = (
+    "router_session",
+    "router_sessions",
+    "router_kv_best_eligible",
+    "router_kv_selected",
+    "router_kv_worker_reused",
+    "router_input_sequence_tokens",
+    "router_output_sequence_tokens",
+    "router_requests",
+)
 DROP_LABELS = {"dynamo_namespace", "dynamo_component", "dynamo_endpoint", "router_id", "worker_id"}
 
 

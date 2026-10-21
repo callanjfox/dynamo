@@ -143,6 +143,21 @@
     <div class="chart" id="c4"></div>
   </div>
 
+  <div class="card" id="card-repl">
+    <h2>Prefix copies held by more than one worker</h2>
+    <p class="note">Tokens of session prefix that sit on a second (or third) worker: capacity spent on duplicates. It rises when the router spreads sessions that share a prefix, such as a parent and its subagents.</p>
+    <div class="legend" id="leg6"></div>
+    <div class="chart" id="c6"></div>
+  </div>
+
+  <div class="card" id="card-funnel">
+    <h2>Cache reuse funnel</h2>
+    <p class="note">Cumulative input tokens narrowing from the prompt to what the worker reports reusing. F0 is every prompt token. F2 is the prefix the router estimates is cached on the best eligible worker. F3 is the same on the worker it chose. F4 is what the worker reports reusing. Each step counts tokens, not requests.</p>
+    <div class="legend" id="leg7"></div>
+    <div class="chart" id="c7"></div>
+    <div class="scroll" id="funnel"></div>
+  </div>
+
   <div class="card">
     <h2>Where a returning session finds its prefix, by time since its last turn</h2>
     <p class="note">Share of returning turns whose prior prefix was on the GPU, in host memory, or mostly missing (so recomputed), to within a tenth. Long gaps lose the GPU.</p>
@@ -336,7 +351,8 @@ function render(idx) {
     tile("Thrash (tokens)", fmtTok(thTotal), `${fmtTok(th.recomputed)} recomputed, ${fmtTok(th.reloaded_host + th.reloaded_disk)} reloaded`) +
     tile("Prefix reuse", pct(isl ? cached / isl : 0), `${fmtTok(cached)} of ${fmtTok(isl)} input tokens served from cache`) +
     tile("Sessions", String(sess.length), `${subs} are subagents`) +
-    tile("Peak sessions split across workers", String(split), "GPU prefix on more than one worker");
+    tile("Peak sessions split across workers", String(split), "GPU prefix on more than one worker") +
+    (run.requests ? tile("Requests", fmtNum(run.requests.sent), `${fmtNum(run.requests.failed)} failed, p50 ${run.requests.p50_s.toFixed(1)}s, p90 ${run.requests.p90_s.toFixed(1)}s`) : "");
 
   // 1. working set vs capacity
   const s1 = [
@@ -395,10 +411,42 @@ function render(idx) {
     return `<div class="gaprow"><div class="lab">${i < 9 ? "up to " : ""}${edges[i]}</div><div class="gapbar">${seg(g[0], "--s1", "GPU")}${seg(g[1] + g[2], "--s3", "Host or disk")}${seg(g[3], "--s2", "Mostly recomputed")}</div><div class="n">${fmtNum(n)} turns</div></div>`;
   }).join("");
 
+  // 6. replicated prefix
+  const hasRepl = rows.some((r) => r.replicated_device_tokens !== undefined);
+  $("#card-repl").style.display = hasRepl ? "" : "none";
+  if (hasRepl) {
+    const sr = [{ name: "On more than one worker (GPU)", color: "--s5", values: rows.map((r) => r.replicated_device_tokens || 0) }];
+    if (capHost > 0) sr.push({ name: "On more than one worker (host)", color: "--s3", values: rows.map((r) => r.replicated_host_tokens || 0) });
+    legend("#leg6", sr);
+    lineChart($("#c6"), { x: t, series: sr, fmtY: fmtTok, fmtTip: fmtTok, label: "Replicated prefix tokens" });
+  }
+
+  // 7. funnel
+  const hasFunnel = rows.some((r) => r.funnel && r.funnel.f0 > 0);
+  $("#card-funnel").style.display = hasFunnel ? "" : "none";
+  if (hasFunnel) {
+    const sf = [
+      { name: "F0 prompt tokens", color: "--s1", values: rows.map((r) => r.funnel.f0) },
+      { name: "F2 best eligible worker's cache", color: "--s2", values: rows.map((r) => r.funnel.f2) },
+      { name: "F3 chosen worker's cache", color: "--s3", values: rows.map((r) => r.funnel.f3) },
+      { name: "F4 worker-reported reuse", color: "--s5", values: rows.map((r) => r.funnel.f4) },
+    ];
+    legend("#leg7", sf);
+    lineChart($("#c7"), { x: t, series: sf, fmtY: fmtTok, fmtTip: fmtTok, label: "Cache reuse funnel" });
+    const f = last.funnel, of = (v) => (f.f0 ? pct(v / f.f0) : "-");
+    $("#funnel").innerHTML = `<table><thead><tr><th>Step</th><th>Tokens</th><th>Share of prompt</th></tr></thead><tbody>` +
+      [["F0 prompt", f.f0], ["F2 best eligible worker", f.f2], ["F3 chosen worker", f.f3], ["F4 worker-reported reuse", f.f4]]
+        .map(([k, v]) => `<tr><td>${k}</td><td>${fmtNum(v)}</td><td>${of(v)}</td></tr>`).join("") + `</tbody></table>`;
+  }
+
   // distribution + table
   const dur = sess.map((s) => s.duration_ms / MIN);
   const dist = [
     ["Turns", sess.map((s) => s.turns), (v) => String(Math.round(v))],
+    ["Input tokens (ISL), total", sess.map((s) => s.isl_tokens), fmtTok],
+    ["Input tokens (ISL) per turn", sess.map((s) => s.isl_tokens / Math.max(1, s.turns)), fmtTok],
+    ["Output tokens (OSL) per turn", sess.map((s) => s.osl_tokens / Math.max(1, s.turns)), (v) => String(Math.round(v))],
+    ["Context growth per turn (tokens)", sess.map((s) => s.growth_per_turn || 0), (v) => String(Math.round(v))],
     ["Context (tokens)", sess.map((s) => s.peak_demand_tokens), fmtTok],
     ["Output (tokens)", sess.map((s) => s.osl_tokens), fmtTok],
     ["Cache hit rate", sess.map((s) => s.hit_rate), pct],
@@ -413,7 +461,8 @@ function render(idx) {
     top.map((s) => `<tr><td>${s.session_id}</td><td>${s.parent_session_id || "-"}</td><td>${s.turns}</td><td>${fmtTok(s.isl_tokens)}</td><td>${fmtTok(s.peak_demand_tokens)}</td><td>${pct(s.hit_rate)}</td><td>${s.children}</td><td>${fmtTok(s.thrash.recomputed + s.thrash.reloaded_host + s.thrash.reloaded_disk)}</td></tr>`).join("") + `</tbody></table>`;
 }
 
-let current = Number(new URLSearchParams(location.search).get("run") || 1);
+let current = Number(new URLSearchParams(location.search).get("run") ?? DATA.findIndex((d) => d.key === "agentx_host" || d.key === "agentx_gpu"));
+if (!(current >= 0)) current = 1;
 $("#tabs").innerHTML = DATA.map((d, i) => `<button class="tab" data-i="${i}" aria-pressed="false">${d.label}<small>${d.detail}</small></button>`).join("");
 $("#tabs").addEventListener("click", (e) => { const b = e.target.closest(".tab"); if (b) { current = Number(b.dataset.i); render(current); } });
 let timer;
