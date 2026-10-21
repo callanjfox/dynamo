@@ -71,6 +71,45 @@ pub enum SessionPrefixIndexError {
     CyclicParent { block: ExternalSequenceBlockHash },
 }
 
+/// Block counts for the tiers a session prefix can be resident in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct TierBlocks {
+    pub device: u64,
+    pub host: u64,
+    pub disk: u64,
+}
+
+impl TierBlocks {
+    fn slot_mut(&mut self, tier: StorageTier) -> Option<&mut u64> {
+        match tier {
+            StorageTier::Device => Some(&mut self.device),
+            StorageTier::HostPinned => Some(&mut self.host),
+            StorageTier::Disk => Some(&mut self.disk),
+            StorageTier::External => None,
+        }
+    }
+
+    fn raise(&mut self, tier: StorageTier, blocks: u64) {
+        if let Some(slot) = self.slot_mut(tier) {
+            *slot = (*slot).max(blocks);
+        }
+    }
+}
+
+/// Fleet-wide view of where session prefixes are resident.
+#[derive(Clone, Debug, Default)]
+pub struct ResidencySnapshot {
+    /// Deepest prefix each session holds per tier, across all workers.
+    pub per_session: HashMap<SessionId, TierBlocks>,
+    /// Sum of `per_session`: what the tiers hold if no prefix were shared.
+    pub summed: TierBlocks,
+    /// Distinct logical blocks the sessions' prefixes cover per tier, counting a
+    /// shared prefix once.
+    pub distinct: TierBlocks,
+    /// Sessions whose device-tier frontier sits on more than one worker.
+    pub split_sessions: u64,
+}
+
 /// Thread-safe session-aware logical prefix index.
 #[derive(Debug, Default)]
 pub struct SessionPrefixIndexer {
@@ -378,6 +417,70 @@ impl SessionPrefixIndexer {
     pub fn session_count(&self) -> usize {
         self.state.read().session_to_worker_frontiers.len()
     }
+
+    /// Deepest prefix one session holds per tier, in blocks.
+    pub fn session_resident_blocks(&self, session_id: &str) -> TierBlocks {
+        let state = self.state.read();
+        let Some(entry) = state.session_to_worker_frontiers.get(session_id) else {
+            return TierBlocks::default();
+        };
+        let mut memo = FxHashMap::default();
+        let mut blocks = TierBlocks::default();
+        for (&(_, tier), frontiers) in &entry.worker_frontiers {
+            for &frontier in frontiers {
+                blocks.raise(tier, state.node_depth(frontier, &mut memo));
+            }
+        }
+        blocks
+    }
+
+    /// Summarize residency for every session. Walks each frontier once, memoizing
+    /// depths, so cost is bounded by the distinct nodes the frontiers cover; call it
+    /// on a timer, not per request.
+    pub fn residency_snapshot(&self) -> ResidencySnapshot {
+        let state = self.state.read();
+        let mut memo = FxHashMap::default();
+        let mut covered: [FxHashSet<NodeId>; 3] = Default::default();
+        let mut snapshot = ResidencySnapshot::default();
+        for (session_id, entry) in &state.session_to_worker_frontiers {
+            let mut blocks = TierBlocks::default();
+            let mut device_workers: FxHashSet<WorkerWithDpRank> = FxHashSet::default();
+            for (&(worker, tier), frontiers) in &entry.worker_frontiers {
+                let set = match tier {
+                    StorageTier::Device => &mut covered[0],
+                    StorageTier::HostPinned => &mut covered[1],
+                    StorageTier::Disk => &mut covered[2],
+                    StorageTier::External => continue,
+                };
+                for &frontier in frontiers {
+                    blocks.raise(tier, state.node_depth(frontier, &mut memo));
+                    let mut current = Some(frontier);
+                    while let Some(node) = current {
+                        if !set.insert(node) {
+                            break;
+                        }
+                        current = state.nodes[node].parent;
+                    }
+                }
+                if tier == StorageTier::Device && !frontiers.is_empty() {
+                    device_workers.insert(worker);
+                }
+            }
+            if device_workers.len() > 1 {
+                snapshot.split_sessions += 1;
+            }
+            snapshot.summed.device += blocks.device;
+            snapshot.summed.host += blocks.host;
+            snapshot.summed.disk += blocks.disk;
+            snapshot.per_session.insert(session_id.clone(), blocks);
+        }
+        snapshot.distinct = TierBlocks {
+            device: covered[0].len() as u64,
+            host: covered[1].len() as u64,
+            disk: covered[2].len() as u64,
+        };
+        snapshot
+    }
 }
 
 fn valid_session_id(session_id: &str) -> bool {
@@ -569,6 +672,31 @@ impl IndexState {
     }
 
     // Bound parent walks so corrupted cycles cannot hang while holding the lock.
+    /// Blocks from the root to `node` inclusive, memoized across calls.
+    fn node_depth(&self, node: NodeId, memo: &mut FxHashMap<NodeId, u64>) -> u64 {
+        let limit = self.nodes.len();
+        let mut pending = Vec::new();
+        let mut current = Some(node);
+        let mut depth = 0;
+        while let Some(candidate) = current {
+            if let Some(&known) = memo.get(&candidate) {
+                depth = known;
+                break;
+            }
+            if pending.len() >= limit {
+                debug_assert!(false, "parent cycle in session prefix index forest");
+                break;
+            }
+            pending.push(candidate);
+            current = self.nodes[candidate].parent;
+        }
+        for candidate in pending.into_iter().rev() {
+            depth += 1;
+            memo.insert(candidate, depth);
+        }
+        depth
+    }
+
     fn path_to_root(&self, tail: NodeId) -> Vec<NodeId> {
         let limit = self.nodes.len();
         let mut path = Vec::new();
@@ -1373,6 +1501,77 @@ mod tests {
             1,
             "device frontier queries ignore lower tiers"
         );
+    }
+
+    #[test]
+    fn resident_blocks_report_the_deepest_prefix_per_tier() {
+        let chain = hashes(vec![1, 2, 3, 4]);
+        let indexer = SessionPrefixIndexer::new();
+        indexer
+            .update_session_from_stored_blocks("s1", worker(1), None, &chain)
+            .unwrap();
+        indexer.inherit_stored_blocks(worker(1), StorageTier::HostPinned, &chain[..3]);
+        indexer.update_session_from_removed_blocks(worker(1), &chain[2..]);
+
+        assert_eq!(
+            indexer.session_resident_blocks("s1"),
+            TierBlocks {
+                device: 2,
+                host: 3,
+                disk: 0
+            }
+        );
+        assert_eq!(
+            indexer.session_resident_blocks("unknown"),
+            TierBlocks::default()
+        );
+    }
+
+    #[test]
+    fn residency_snapshot_counts_a_shared_prefix_once() {
+        let shared = hashes(vec![1, 2, 3]);
+        let a_tail = hashes(vec![10, 11]);
+        let b_tail = hashes(vec![20]);
+        let indexer = SessionPrefixIndexer::new();
+        indexer
+            .update_session_from_stored_blocks("a", worker(1), None, &shared)
+            .unwrap();
+        indexer
+            .update_session_from_stored_blocks("a", worker(1), Some(shared[2]), &a_tail)
+            .unwrap();
+        indexer
+            .update_session_from_stored_blocks("b", worker(1), None, &shared)
+            .unwrap();
+        indexer
+            .update_session_from_stored_blocks("b", worker(1), Some(shared[2]), &b_tail)
+            .unwrap();
+
+        let snapshot = indexer.residency_snapshot();
+        assert_eq!(snapshot.per_session["a"].device, 5);
+        assert_eq!(snapshot.per_session["b"].device, 4);
+        assert_eq!(snapshot.summed.device, 9);
+        // Three shared blocks plus two tails of a and one of b.
+        assert_eq!(snapshot.distinct.device, 6);
+        assert_eq!(snapshot.split_sessions, 0);
+    }
+
+    #[test]
+    fn residency_snapshot_flags_sessions_split_across_workers() {
+        let chain = hashes(vec![1, 2]);
+        let indexer = SessionPrefixIndexer::new();
+        indexer
+            .update_session_from_stored_blocks("s", worker(1), None, &chain)
+            .unwrap();
+        indexer
+            .update_session_from_stored_blocks("s", worker(2), None, &chain)
+            .unwrap();
+        indexer
+            .update_session_from_stored_blocks("t", worker(1), None, &chain)
+            .unwrap();
+
+        let snapshot = indexer.residency_snapshot();
+        assert_eq!(snapshot.split_sessions, 1);
+        assert_eq!(snapshot.per_session["s"].device, 2);
     }
 
     #[test]
