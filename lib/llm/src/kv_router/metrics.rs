@@ -1609,6 +1609,8 @@ mod tests {
             "router_session_resident_tokens{tier=\"host\"} 0",
             "router_session_stranded_tokens{tier=\"device\"} 0",
             "router_session_replicated_tokens{tier=\"host\"} 0",
+            "router_session_coverage_requests_total{coverage=\"uncovered\"} 0",
+            "router_session_coverage_input_tokens_total{coverage=\"covered\"} 0",
             "router_session_thrash_tokens_total{outcome=\"reloaded_host\"} 0",
             "router_session_return_turns_total{gap=\"le_30s\",outcome=\"miss\"} 0",
             "router_session_return_turns_total{gap=\"gt_1800s\",outcome=\"gpu\"} 0",

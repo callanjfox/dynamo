@@ -1435,8 +1435,16 @@ impl KvRouter {
         if update_states && is_admitted_routing && booking.is_none() {
             anyhow::bail!("booked selection returned no booking handle");
         }
-        if let (Some(stats), Some((session_id, parent))) = (&self.session_stats, &session_arrival) {
-            stats.on_arrival(session_id, parent.as_deref(), isl_tokens as u64);
+        if let Some(stats) = &self.session_stats
+            && is_admitted_routing
+            && update_states
+        {
+            match &session_arrival {
+                Some((session_id, parent)) => {
+                    stats.on_arrival(session_id, parent.as_deref(), isl_tokens as u64);
+                }
+                None => stats.on_uncovered(isl_tokens as u64),
+            }
         }
         // Publish the selection trace here, on the routing task and before any
         // awaited bookkeeping (the session prefix refresh below can be cancelled),

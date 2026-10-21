@@ -425,6 +425,8 @@ Compare `session_resident_tokens` and demand with worker KV capacity from the en
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
+| `session_coverage_requests_total` | counter | `coverage` (`covered`, `uncovered`) | Routed requests by whether they carried a session ID. The covered share is the part of the traffic the session metrics describe. Requires `--enable-session-prefix-index`. |
+| `session_coverage_input_tokens_total` | counter | `coverage` (`covered`, `uncovered`) | Input tokens of those requests, so coverage can be read by traffic weight as well as by count. |
 | `session_thrash_tokens_total` | counter | `outcome` (`recomputed`, `reloaded_host`, `reloaded_disk`) | Tokens of a returning session's prior prefix that were not on the GPU when the turn arrived. `recomputed` means no tier held them; the reloaded outcomes mean the named tier did. |
 | `session_return_turns_total` | counter | `gap` (`le_1s`, `le_5s`, `le_10s`, `le_30s`, `le_60s`, `le_120s`, `le_300s`, `le_600s`, `le_1800s`, `gt_1800s`), `outcome` (`gpu`, `host`, `disk`, `miss`) | Returning turns by time since the previous turn finished and where the prior prefix was found, to within a tenth of it. Gives the survival curve per tier. |
 
@@ -445,7 +447,7 @@ The prior prefix is estimated as the previous turn's input plus output, capped a
 | `session_turn_gap_seconds` | histogram | seconds, mean over the session |
 | `session_subagents` | histogram | subagent sessions spawned |
 
-**Series budget.** About 172 series per router process: 10 gauge series, 45 counter series (2 + 3 + 40), and 8 histograms of 11 to 15 series each. Bounded label values are created at startup. When one process hosts several routers, such as a prefill and a decode pool, gauges are last-router-wins and counters and histograms add up.
+**Series budget.** About 180 series per router process: 10 gauge series, 49 counter series (2 + 3 + 40 + 4), and 8 histograms of 11 to 15 series each. Bounded label values are created at startup. When one process hosts several routers, such as a prefill and a decode pool, gauges are last-router-wins and counters and histograms add up.
 
 **Configuration.** `DYN_SESSION_STATS_SWEEP_SECS` (default 10), `DYN_SESSION_STATS_ACTIVE_WINDOW_SECS` (default 300), and `DYN_SESSION_STATS_IDLE_TTL_SECS` (default 1800).
 

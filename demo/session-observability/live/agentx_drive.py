@@ -40,6 +40,10 @@ class Replay:
         self.deadline = time.time() + args.duration_s
         self.sent = 0
 
+    def anonymous(self, salt):
+        """Sessions the client sends without Dynamo session headers, to leave traffic uncovered."""
+        return random.Random(salt * 7919).random() < self.args.anonymous_fraction
+
     def gap(self, think):
         return min(think, self.args.idle_gap_cap_s) / self.args.time_scale
 
@@ -64,11 +68,13 @@ class Replay:
             await asyncio.gather(*tasks)
 
     async def send(self, http, sid, parent, salt, block_size, q, final, index):
-        headers = {"x-dynamo-session-id": sid}
-        if parent:
-            headers["x-dynamo-parent-session-id"] = parent
-        if final:
-            headers["x-dynamo-session-final"] = "true"
+        headers = {}
+        if not self.anonymous(salt):
+            headers["x-dynamo-session-id"] = sid
+            if parent:
+                headers["x-dynamo-parent-session-id"] = parent
+            if final:
+                headers["x-dynamo-session-final"] = "true"
         body = {
             "model": self.args.model,
             "prompt": token_ids(salt, q["hash_ids"], block_size),
@@ -104,6 +110,8 @@ async def main():
     parser.add_argument("--ramp-s", type=float, default=900.0)
     parser.add_argument("--time-scale", type=float, default=6.0)
     parser.add_argument("--idle-gap-cap-s", type=float, default=300.0)
+    parser.add_argument("--anonymous-fraction", type=float, default=0.0,
+                        help="share of sessions sent without session headers")
     parser.add_argument("--max-output", type=int, default=256)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--out", default="requests.jsonl")

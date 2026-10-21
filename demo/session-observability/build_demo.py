@@ -79,6 +79,12 @@ def live_run(directory):
             "stranded_device_tokens": g("session_stranded_tokens{tier=device}"),
             "replicated_device_tokens": g("session_replicated_tokens{tier=device}"),
             "replicated_host_tokens": g("session_replicated_tokens{tier=host}"),
+            "coverage": {
+                "requests_covered": g("session_coverage_requests_total{coverage=covered}"),
+                "requests_uncovered": g("session_coverage_requests_total{coverage=uncovered}"),
+                "tokens_covered": g("session_coverage_input_tokens_total{coverage=covered}"),
+                "tokens_uncovered": g("session_coverage_input_tokens_total{coverage=uncovered}"),
+            },
             "funnel": {
                 "f0": total(m, "input_sequence_tokens_sum"),
                 "f2": total(m, "kv_best_eligible_cached_prefix_tokens_total"),
@@ -151,7 +157,7 @@ def main():
         payload.append({**scenario, "rows": rows, "sessions": sessions})
     for key, label, detail, blurb in LIVE_RUNS:
         directory = HERE / "data" / "live" / key
-        if not directory.exists():
+        if not (directory / "meta.json").exists():
             continue
         rows, sessions, meta, request_stats = live_run(directory)
         host_note = (

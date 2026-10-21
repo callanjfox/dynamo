@@ -20,16 +20,18 @@ static SESSION_METRICS: OnceLock<Arc<SessionMetrics>> = OnceLock::new();
 const TIER_LABEL: &str = "tier";
 const OUTCOME_LABEL: &str = "outcome";
 const GAP_LABEL: &str = "gap";
+const COVERAGE_LABEL: &str = "coverage";
 
 pub(crate) const TIERS: [&str; 3] = ["device", "host", "disk"];
 pub(crate) const STRANDED_TIERS: [&str; 2] = ["device", "host"];
 pub(crate) const THRASH_OUTCOMES: [&str; 3] = ["recomputed", "reloaded_host", "reloaded_disk"];
+pub(crate) const COVERAGE: [&str; 2] = ["covered", "uncovered"];
 const RETURN_OUTCOMES: [&str; 4] = ["gpu", "host", "disk", "miss"];
 
 /// Experimental. Names, labels and units may change in any release.
 ///
-/// Series per router: gauges 1 + 1 + 3 + 2 + 1, counters 2 + 3 + 40, and eight
-/// histograms of up to 14 series each, about 170 in all. No label carries a
+/// Series per router: gauges 1 + 1 + 3 + 2 + 2 + 1, counters 2 + 3 + 40 + 4, and eight
+/// histograms of up to 14 series each, about 180 in all. No label carries a
 /// session, tenant or worker identity.
 #[cfg_attr(test, derive(Clone))]
 pub struct SessionMetrics {
@@ -51,6 +53,10 @@ pub struct SessionMetrics {
     pub thrash_tokens_total: IntCounterVec,
     /// Returning turns by the time since the session's last turn and where its prefix was.
     pub return_turns_total: IntCounterVec,
+    /// Routed requests by whether they carried a session ID (covered) or not (uncovered).
+    pub coverage_requests_total: IntCounterVec,
+    /// Input tokens of routed requests, by the same split.
+    pub coverage_input_tokens_total: IntCounterVec,
     pub session_turns: Histogram,
     pub session_input_tokens: Histogram,
     pub session_output_tokens: Histogram,
@@ -138,6 +144,23 @@ impl SessionMetrics {
             )
             .expect("failed to create router_session_return_turns_total");
 
+        let coverage_requests_total = metrics
+            .create_intcountervec(
+                &router_metric("session_coverage_requests_total"),
+                "Routed requests by whether they carried a session ID (covered, uncovered)",
+                &[COVERAGE_LABEL],
+                extra_labels,
+            )
+            .expect("failed to create router_session_coverage_requests_total");
+        let coverage_input_tokens_total = metrics
+            .create_intcountervec(
+                &router_metric("session_coverage_input_tokens_total"),
+                "Input tokens of routed requests by whether they carried a session ID (covered, uncovered)",
+                &[COVERAGE_LABEL],
+                extra_labels,
+            )
+            .expect("failed to create router_session_coverage_input_tokens_total");
+
         // Bounded label values exist from the first scrape so rate() and absent() work.
         for tier in TIERS {
             resident_tokens.with_label_values(&[tier]);
@@ -147,6 +170,10 @@ impl SessionMetrics {
         }
         for tier in STRANDED_TIERS {
             replicated_tokens.with_label_values(&[tier]);
+        }
+        for coverage in COVERAGE {
+            coverage_requests_total.with_label_values(&[coverage]);
+            coverage_input_tokens_total.with_label_values(&[coverage]);
         }
         for outcome in THRASH_OUTCOMES {
             thrash_tokens_total.with_label_values(&[outcome]);
@@ -169,6 +196,8 @@ impl SessionMetrics {
             resident_tokens,
             stranded_tokens,
             replicated_tokens,
+            coverage_requests_total,
+            coverage_input_tokens_total,
             sessions_split: gauge(
                 "sessions_split",
                 "Active sessions whose GPU-resident prefix is on more than one worker",

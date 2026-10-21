@@ -143,6 +143,13 @@
     <div class="chart" id="c4"></div>
   </div>
 
+  <div class="card" id="card-cov">
+    <h2>Share of traffic the session metrics cover</h2>
+    <p class="note">Cumulative share of routed requests, and of input tokens, that carried a session ID. Everything else on this page describes only that share. Requests without an ID are routed as usual but are not tracked.</p>
+    <div class="legend" id="leg8"></div>
+    <div class="chart" id="c8"></div>
+  </div>
+
   <div class="card" id="card-repl">
     <h2>Prefix copies held by more than one worker</h2>
     <p class="note">Tokens of session prefix that sit on a second (or third) worker: capacity spent on duplicates. It rises when the router spreads sessions that share a prefix, such as a parent and its subagents.</p>
@@ -352,6 +359,7 @@ function render(idx) {
     tile("Prefix reuse", pct(isl ? cached / isl : 0), `${fmtTok(cached)} of ${fmtTok(isl)} input tokens served from cache`) +
     tile("Sessions", String(sess.length), `${subs} are subagents`) +
     tile("Peak sessions split across workers", String(split), "GPU prefix on more than one worker") +
+    ((lc) => lc && lc.requests_covered + lc.requests_uncovered > 0 ? tile("Session coverage", pct(lc.requests_covered / (lc.requests_covered + lc.requests_uncovered)), `of requests carry a session ID, ${pct(lc.tokens_covered / (lc.tokens_covered + lc.tokens_uncovered || 1))} of input tokens`) : "")(last.coverage) +
     (run.requests ? tile("Requests", fmtNum(run.requests.sent), `${fmtNum(run.requests.failed)} failed, p50 ${run.requests.p50_s.toFixed(1)}s, p90 ${run.requests.p90_s.toFixed(1)}s`) : "");
 
   // 1. working set vs capacity
@@ -411,6 +419,19 @@ function render(idx) {
     return `<div class="gaprow"><div class="lab">${i < 9 ? "up to " : ""}${edges[i]}</div><div class="gapbar">${seg(g[0], "--s1", "GPU")}${seg(g[1] + g[2], "--s3", "Host or disk")}${seg(g[3], "--s2", "Mostly recomputed")}</div><div class="n">${fmtNum(n)} turns</div></div>`;
   }).join("");
 
+  // 8. coverage
+  const covRows = rows.filter((r) => r.coverage && r.coverage.requests_covered + r.coverage.requests_uncovered > 0);
+  $("#card-cov").style.display = covRows.length ? "" : "none";
+  if (covRows.length) {
+    const share = (c, u) => (c + u ? (100 * c) / (c + u) : 100);
+    const sc = [
+      { name: "Requests with a session ID", color: "--s1", values: covRows.map((r) => share(r.coverage.requests_covered, r.coverage.requests_uncovered)) },
+      { name: "Input tokens with a session ID", color: "--s3", values: covRows.map((r) => share(r.coverage.tokens_covered, r.coverage.tokens_uncovered)) },
+    ];
+    legend("#leg8", sc);
+    lineChart($("#c8"), { x: covRows.map((r) => r.now_ms / MIN), series: sc, fmtY: (v) => Math.round(v) + "%", fmtTip: (v) => v.toFixed(1) + "%", label: "Session coverage" });
+  }
+
   // 6. replicated prefix
   const hasRepl = rows.some((r) => r.replicated_device_tokens !== undefined);
   $("#card-repl").style.display = hasRepl ? "" : "none";
@@ -430,13 +451,13 @@ function render(idx) {
       { name: "F2 best eligible worker's cache", color: "--s2", values: rows.map((r) => r.funnel.f2) },
       { name: "F3 chosen worker's cache", color: "--s3", values: rows.map((r) => r.funnel.f3) },
       { name: "F4 worker-reported reuse", color: "--s5", values: rows.map((r) => r.funnel.f4) },
-    ];
+    ].filter((x) => x.values.some((v) => v > 0));
     legend("#leg7", sf);
     lineChart($("#c7"), { x: t, series: sf, fmtY: fmtTok, fmtTip: fmtTok, label: "Cache reuse funnel" });
     const f = last.funnel, of = (v) => (f.f0 ? pct(v / f.f0) : "-");
     $("#funnel").innerHTML = `<table><thead><tr><th>Step</th><th>Tokens</th><th>Share of prompt</th></tr></thead><tbody>` +
       [["F0 prompt", f.f0], ["F2 best eligible worker", f.f2], ["F3 chosen worker", f.f3], ["F4 worker-reported reuse", f.f4]]
-        .map(([k, v]) => `<tr><td>${k}</td><td>${fmtNum(v)}</td><td>${of(v)}</td></tr>`).join("") + `</tbody></table>`;
+        .map(([k, v]) => v === 0 && k.startsWith("F4") ? `<tr><td>${k}</td><td colspan="2">not reported: mock workers do not publish reuse</td></tr>` : `<tr><td>${k}</td><td>${fmtNum(v)}</td><td>${of(v)}</td></tr>`).join("") + `</tbody></table>`;
   }
 
   // distribution + table

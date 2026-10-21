@@ -77,8 +77,25 @@ impl SessionStatsRuntime {
         self.epoch.elapsed().as_millis() as u64
     }
 
+    /// A routed request carried no session ID, so nothing tracks it.
+    pub(crate) fn on_uncovered(&self, isl_tokens: u64) {
+        self.record_coverage("uncovered", isl_tokens);
+    }
+
+    fn record_coverage(&self, coverage: &str, isl_tokens: u64) {
+        self.metrics
+            .coverage_requests_total
+            .with_label_values(&[coverage])
+            .inc();
+        self.metrics
+            .coverage_input_tokens_total
+            .with_label_values(&[coverage])
+            .inc_by(isl_tokens);
+    }
+
     /// A request for `session_id` was routed. `isl_tokens` is its prompt length.
     pub(crate) fn on_arrival(&self, session_id: &str, parent: Option<&str>, isl_tokens: u64) {
+        self.record_coverage("covered", isl_tokens);
         let resident = self.index.session_resident_blocks(session_id);
         let outcome =
             self.tracker
@@ -247,6 +264,21 @@ mod tests {
 
     fn hashes(ids: std::ops::RangeInclusive<u64>) -> Vec<ExternalSequenceBlockHash> {
         ids.map(ExternalSequenceBlockHash).collect()
+    }
+
+    #[test]
+    fn coverage_counts_requests_and_tokens_with_and_without_a_session() {
+        let (runtime, _index) = runtime();
+        runtime.on_arrival("s", None, 1_000);
+        runtime.on_arrival("s", None, 1_200);
+        runtime.on_uncovered(500);
+
+        let metrics = &runtime.metrics;
+        let get = |vec: &prometheus::IntCounterVec, label: &str| vec.with_label_values(&[label]).get();
+        assert_eq!(get(&metrics.coverage_requests_total, "covered"), 2);
+        assert_eq!(get(&metrics.coverage_requests_total, "uncovered"), 1);
+        assert_eq!(get(&metrics.coverage_input_tokens_total, "covered"), 2_200);
+        assert_eq!(get(&metrics.coverage_input_tokens_total, "uncovered"), 500);
     }
 
     #[test]

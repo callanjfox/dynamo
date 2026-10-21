@@ -20,6 +20,7 @@ RAMP_S=${RAMP_S:-900}
 TIME_SCALE=${TIME_SCALE:-6}
 MODEL=${MODEL:-Qwen/Qwen3-0.6B}
 PORT=${PORT:-8000}
+ANON=${ANON:-0}
 HERE=$(cd "$(dirname "$0")" && pwd)
 
 mkdir "$OUT" || { echo "$OUT exists"; exit 1; }
@@ -34,7 +35,7 @@ export PYTHONPATH=/root/dynamo/components/src
 cat > "$OUT/meta.json" <<JSON
 {"workers": $WORKERS, "num_gpu_blocks": $BLOCKS, "num_host_blocks": $HOST_BLOCKS, "block_size": $BLOCK,
  "speedup": $SPEEDUP, "sessions": $SESSIONS, "duration_s": $DURATION_S, "time_scale": $TIME_SCALE,
- "active_window_s": ${WINDOW:-60}, "idle_ttl_s": ${TTL:-180}, "workload": "agentx"}
+ "active_window_s": ${WINDOW:-60}, "idle_ttl_s": ${TTL:-180}, "workload": "agentx", "anonymous_fraction": $ANON}
 JSON
 
 HOST_ARGS=""
@@ -61,7 +62,7 @@ python "$HERE/scrape.py" --url http://localhost:$PORT/metrics --out "$OUT/metric
   --stop-file "$OUT/stop" --interval 5 &
 SCRAPER=$!
 python "$HERE/agentx_drive.py" --subset "$SUBSET" --url http://localhost:$PORT --model "$MODEL" \
-  --sessions "$SESSIONS" --duration-s "$DURATION_S" --ramp-s "$RAMP_S" --time-scale "$TIME_SCALE" \
+  --sessions "$SESSIONS" --duration-s "$DURATION_S" --ramp-s "$RAMP_S" --time-scale "$TIME_SCALE" --anonymous-fraction "$ANON" \
   --out "$OUT/requests.jsonl"
 # Let idle sessions expire and the sweep publish before stopping.
 sleep $(( ${TTL:-180} + 15 ))
