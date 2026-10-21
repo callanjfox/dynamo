@@ -234,7 +234,7 @@
 
   <div class="card" id="card-funnel">
     <h2>Cache reuse funnel</h2>
-    <p class="note">Share of prompt tokens at each step in each 60 second window. The top line is what the session history says could be reused if nothing had been evicted (from the session index, covered traffic only); the steps below it are what the router and the worker find. F2 is the prefix the router estimates is cached on the best eligible worker. F3 is the same on the worker it chose. F4 is what the worker reports reusing. The table has the cumulative totals.</p>
+    <p class="note">Share of prompt tokens at each step in each 60 second window. The session-history line is what the session index says a returning session could reuse if nothing had been evicted (covered traffic only, and only the part that is a returning session's own prior prefix). F2 is the prefix the router estimates is cached on the best eligible worker. F3 is the same on the worker it chose. F4 is what the worker reports reusing. The table has the cumulative totals.</p>
     <div class="legend" id="leg7"></div>
     <div class="chart" id="c7"></div>
     <div class="scroll" id="funnel"></div>
@@ -268,6 +268,30 @@
     <p class="note">Median and 90th percentile over a trailing 30 seconds, in milliseconds. It rises with batch size and context length.</p>
     <div class="legend" id="leg12"></div>
     <div class="chart" id="c12"></div>
+  </div>
+  <div class="card">
+    <h2>Throughput</h2>
+    <p class="note">What the fleet is serving, from the frontend's counters over a trailing 60 seconds: requests, input tokens and output tokens per second. Input tokens are mostly cache hits when reuse is high, so a worker's real prefill load is lower.</p>
+    <div class="legend" id="leg24"></div>
+    <div class="chart" id="c24"></div>
+    <div class="legend" id="leg25"></div>
+    <div class="chart" id="c25"></div>
+    <div class="legend" id="leg29"></div>
+    <div class="chart" id="c29"></div>
+  </div>
+  <div class="card">
+    <h2>Request duration</h2>
+    <p class="note">Whole-request latency from arrival to the last token, median and 90th percentile over a trailing 30 seconds. It grows with output length as well as with queueing and prefill.</p>
+    <div class="legend" id="leg26"></div>
+    <div class="chart" id="c26"></div>
+  </div>
+  <div class="card" id="card-wspread">
+    <h2>Latency spread across workers</h2>
+    <p class="note">The most recent time to first token and inter-token latency each worker reported, slowest worker against the median worker. A wide gap means some workers are slower than others, which points at uneven load more than at the fleet being too small.</p>
+    <div class="legend" id="leg27"></div>
+    <div class="chart" id="c27"></div>
+    <div class="legend" id="leg28"></div>
+    <div class="chart" id="c28"></div>
   </div>
   <div class="card">
     <h2>Queues</h2>
@@ -362,6 +386,9 @@ const REF = [
   ["Compute health (already in Dynamo)", [
     ["frontend time_to_first_token_seconds", "histogram", "Request arrival to first token."],
     ["frontend inter_token_latency_seconds", "histogram", "Time between streamed tokens."],
+    ["frontend request_duration_seconds", "histogram", "Whole-request latency, arrival to last token."],
+    ["frontend worker_last_time_to_first_token_seconds", "gauge", "The most recent TTFT each worker reported."],
+    ["frontend worker_last_inter_token_latency_seconds", "gauge", "The most recent inter-token latency each worker reported."],
     ["frontend queued_requests", "gauge", "Requests waiting in the HTTP queue before a first response."],
     ["frontend inflight_requests", "gauge", "Requests being served."],
     ["frontend router_queue_pending_requests", "gauge", "Requests held in the router's scheduler queue."],
@@ -797,6 +824,39 @@ function render(idx) {
     lineChart($("#c11"), { x: ct, series: [{ name: "p50", color: "--s1", values: ttft50 }, { name: "p90", color: "--s2", values: ttft90 }], fmtY: fmtS, fmtTip: fmtS, label: "Time to first token" });
     legend("#leg12", [{ name: "p50", color: "--s1" }, { name: "p90", color: "--s2" }]);
     lineChart($("#c12"), { x: ct, series: [{ name: "p50", color: "--s1", values: itl50 }, { name: "p90", color: "--s2", values: itl90 }], fmtY: fmtMs, fmtTip: fmtMs, label: "Inter-token latency" });
+    const rate = (key, field) => crow.map((r, i) => {
+      const j = windowStart(crow, i, 60000), dt = (r.now_ms - crow[j].now_ms) / 1000;
+      return dt > 0 ? (r[key][field] - crow[j][key][field]) / dt : 0;
+    });
+    const reqRate = crow.map((r, i) => { const j = windowStart(crow, i, 60000), dt = (r.now_ms - crow[j].now_ms) / 1000; return dt > 0 ? (r.requests_started - crow[j].requests_started) / dt : 0; });
+    const s24 = [{ name: "Requests per second", color: "--s1", values: reqRate }];
+    legend("#leg24", s24);
+    lineChart($("#c24"), { x: ct, series: s24, fmtY: (v) => v.toFixed(1), fmtTip: (v) => v.toFixed(2), label: "Requests per second" });
+    const s25 = [{ name: "Input tokens per second", color: "--s2", values: rate("input_seq", "sum") }];
+    legend("#leg25", s25);
+    lineChart($("#c25"), { x: ct, series: s25, fmtY: fmtTok, fmtTip: fmtTok, label: "Input tokens per second" });
+    const s29 = [{ name: "Output tokens per second", color: "--s3", values: rate("output_seq", "sum") }];
+    legend("#leg29", s29);
+    lineChart($("#c29"), { x: ct, series: s29, fmtY: fmtTok, fmtTip: fmtTok, label: "Output tokens per second" });
+    const dur50 = lat("dur", "p50", 1), dur90 = lat("dur", "p90", 1);
+    const s26 = [{ name: "p50", color: "--s1", values: dur50 }, { name: "p90", color: "--s2", values: dur90 }];
+    legend("#leg26", s26);
+    lineChart($("#c26"), { x: ct, series: s26, fmtY: fmtS, fmtTip: fmtS, label: "Request duration" });
+    const hasW = crow.some((r) => r.compute.worker_ttft && r.compute.worker_ttft.length);
+    $("#card-wspread").style.display = hasW ? "" : "none";
+    if (hasW) {
+      const spread = (field, scale) => [
+        crow.map((r) => { const x = r.compute[field] || []; return x.length ? x[x.length - 1] * scale : 0; }),
+        crow.map((r) => { const x = r.compute[field] || []; return x.length ? x[x.length >> 1] * scale : 0; }),
+      ];
+      const [tMax, tMed] = spread("worker_ttft", 1), [iMax, iMed] = spread("worker_itl", 1000);
+      const s27 = [{ name: "Slowest worker", color: "--s2", values: tMax }, { name: "Median worker", color: "--s1", values: tMed }];
+      legend("#leg27", s27);
+      lineChart($("#c27"), { x: ct, series: s27, fmtY: fmtS, fmtTip: fmtS, label: "Last time to first token per worker" });
+      const s28 = [{ name: "Slowest worker", color: "--s2", values: iMax }, { name: "Median worker", color: "--s1", values: iMed }];
+      legend("#leg28", s28);
+      lineChart($("#c28"), { x: ct, series: s28, fmtY: fmtMs, fmtTip: fmtMs, label: "Last inter-token latency per worker" });
+    }
     const sq = [{ name: "In prefill (queued or prefilling)", color: "--s2", values: waiting }, { name: "Decoding", color: "--s1", values: running }, { name: "Queued at frontend or router", color: "--s5", values: queued }];
     legend("#leg13", sq);
     lineChart($("#c13"), { x: ct, series: sq, fmtY: (v) => String(Math.round(v)), fmtTip: (v) => String(Math.round(v)), label: "Queues" });

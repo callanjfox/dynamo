@@ -114,6 +114,9 @@ def compute_row(m):
         "prefilling": int(sum(v for k, v in m.items() if k.startswith("fe_worker_active_requests") and "request_phase=prefill" in k)),
         "prefill_tokens": int(sum_prefix(m, "fe_worker_active_prefill_tokens")),
         "decode_blocks": decode_blocks,
+        # Last TTFT and inter-token latency each worker reported, in seconds: the spread across workers.
+        "worker_ttft": sorted(v for k, v in m.items() if k.startswith("fe_worker_last_time_to_first_token_seconds")),
+        "worker_itl": sorted(v for k, v in m.items() if k.startswith("fe_worker_last_inter_token_latency_seconds")),
     }
 
 
@@ -125,7 +128,7 @@ def add_latency_percentiles(rows, hists, window_ms=30000):
         j = i
         while j > 0 and row["now_ms"] - rows[j]["now_ms"] < window_ms:
             j -= 1
-        for name, short in (("time_to_first_token_seconds", "ttft"), ("inter_token_latency_seconds", "itl")):
+        for name, short in (("time_to_first_token_seconds", "ttft"), ("inter_token_latency_seconds", "itl"), ("request_duration_seconds", "dur")):
             now, before = hists[i][name], hists[j][name]
             row["compute"][short] = {"p50": window_quantile(now, before, 0.5), "p90": window_quantile(now, before, 0.9)} if now else None
 
@@ -201,7 +204,7 @@ def live_run(directory):
             "output_seq": {"sum": total(m, "output_sequence_tokens_sum"), "count": total(m, "output_sequence_tokens_count")},
             "compute": compute_row(m),
         })
-        hists.append({name: buckets(m, "fe_" + name) for name in ("time_to_first_token_seconds", "inter_token_latency_seconds")})
+        hists.append({name: buckets(m, "fe_" + name) for name in ("time_to_first_token_seconds", "inter_token_latency_seconds", "request_duration_seconds")})
     for row in rows:
         if row["compute"]:
             row["compute"]["block_capacity"] = meta["num_gpu_blocks"]
