@@ -106,7 +106,10 @@ pub struct ResidencySnapshot {
     /// Distinct logical blocks the sessions' prefixes cover per tier, counting a
     /// shared prefix once.
     pub distinct: TierBlocks,
-    /// Sessions whose device-tier frontier sits on more than one worker.
+    /// Distinct blocks per tier held only for sessions the caller marked inactive.
+    pub stranded: TierBlocks,
+    /// Sessions the caller did not mark inactive whose device-tier frontier sits on
+    /// more than one worker.
     pub split_sessions: u64,
 }
 
@@ -438,11 +441,24 @@ impl SessionPrefixIndexer {
     /// depths, so cost is bounded by the distinct nodes the frontiers cover; call it
     /// on a timer, not per request.
     pub fn residency_snapshot(&self) -> ResidencySnapshot {
+        self.residency_snapshot_with(|_| false)
+    }
+
+    /// As [`Self::residency_snapshot`], also reporting the distinct blocks held only
+    /// for sessions `is_inactive` accepts: capacity spent on sessions nobody is
+    /// waiting on.
+    pub fn residency_snapshot_with(&self, is_inactive: impl Fn(&str) -> bool) -> ResidencySnapshot {
         let state = self.state.read();
         let mut memo = FxHashMap::default();
-        let mut covered: [FxHashSet<NodeId>; 3] = Default::default();
+        let mut active_covered: [FxHashSet<NodeId>; 3] = Default::default();
+        let mut inactive_covered: [FxHashSet<NodeId>; 3] = Default::default();
         let mut snapshot = ResidencySnapshot::default();
         for (session_id, entry) in &state.session_to_worker_frontiers {
+            let covered = if is_inactive(session_id) {
+                &mut inactive_covered
+            } else {
+                &mut active_covered
+            };
             let mut blocks = TierBlocks::default();
             let mut device_workers: FxHashSet<WorkerWithDpRank> = FxHashSet::default();
             for (&(worker, tier), frontiers) in &entry.worker_frontiers {
@@ -466,7 +482,7 @@ impl SessionPrefixIndexer {
                     device_workers.insert(worker);
                 }
             }
-            if device_workers.len() > 1 {
+            if device_workers.len() > 1 && !is_inactive(session_id) {
                 snapshot.split_sessions += 1;
             }
             snapshot.summed.device += blocks.device;
@@ -474,10 +490,21 @@ impl SessionPrefixIndexer {
             snapshot.summed.disk += blocks.disk;
             snapshot.per_session.insert(session_id.clone(), blocks);
         }
+        let stranded = |tier: usize| {
+            inactive_covered[tier]
+                .iter()
+                .filter(|node| !active_covered[tier].contains(*node))
+                .count() as u64
+        };
+        snapshot.stranded = TierBlocks {
+            device: stranded(0),
+            host: stranded(1),
+            disk: stranded(2),
+        };
         snapshot.distinct = TierBlocks {
-            device: covered[0].len() as u64,
-            host: covered[1].len() as u64,
-            disk: covered[2].len() as u64,
+            device: active_covered[0].len() as u64 + snapshot.stranded.device,
+            host: active_covered[1].len() as u64 + snapshot.stranded.host,
+            disk: active_covered[2].len() as u64 + snapshot.stranded.disk,
         };
         snapshot
     }
@@ -1572,6 +1599,49 @@ mod tests {
         let snapshot = indexer.residency_snapshot();
         assert_eq!(snapshot.split_sessions, 1);
         assert_eq!(snapshot.per_session["s"].device, 2);
+    }
+
+    #[test]
+    fn inactive_sessions_are_not_counted_as_split() {
+        let chain = hashes(vec![1, 2]);
+        let indexer = SessionPrefixIndexer::new();
+        for worker_id in [1, 2] {
+            indexer
+                .update_session_from_stored_blocks("s", worker(worker_id), None, &chain)
+                .unwrap();
+        }
+        assert_eq!(indexer.residency_snapshot().split_sessions, 1);
+        assert_eq!(
+            indexer
+                .residency_snapshot_with(|session| session == "s")
+                .split_sessions,
+            0
+        );
+    }
+
+    #[test]
+    fn residency_snapshot_reports_blocks_held_only_for_inactive_sessions() {
+        let shared = hashes(vec![1, 2, 3]);
+        let indexer = SessionPrefixIndexer::new();
+        for (session, tail) in [("live", 10), ("gone", 20)] {
+            indexer
+                .update_session_from_stored_blocks(session, worker(1), None, &shared)
+                .unwrap();
+            indexer
+                .update_session_from_stored_blocks(
+                    session,
+                    worker(1),
+                    Some(shared[2]),
+                    &hashes(vec![tail]),
+                )
+                .unwrap();
+        }
+
+        let snapshot = indexer.residency_snapshot_with(|session| session == "gone");
+        // The shared prefix is still held for the live session, so only the tail is stranded.
+        assert_eq!(snapshot.stranded.device, 1);
+        assert_eq!(snapshot.distinct.device, 5);
+        assert_eq!(indexer.residency_snapshot().stranded, TierBlocks::default());
     }
 
     #[test]

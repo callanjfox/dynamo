@@ -17,7 +17,7 @@
 //! session needs. Demand is the prior turn's input plus output, which is the prefix
 //! the next turn will present if the harness resends its history.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -31,7 +31,7 @@ pub const GAP_BUCKET_EDGES_MS: [u64; 9] = [
 ];
 const GAP_BUCKETS: usize = GAP_BUCKET_EDGES_MS.len() + 1;
 
-/// Where a returning session's prior prefix was found.
+/// Where a returning session's prior prefix was found, to within a tenth of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReturnOutcome {
     HitDevice,
@@ -320,12 +320,15 @@ impl SessionStatsTracker {
         } else {
             ThrashTokens::default()
         };
+        // The last turn's output blocks are often not yet resident anywhere, so a
+        // hit allows a tenth of the prefix, or one block, to be missing.
+        let tolerance = block.max(prior / 10);
         let outcome = (returning && prior > 0).then(|| {
-            if covered_device + block >= prior {
+            if covered_device + tolerance >= prior {
                 ReturnOutcome::HitDevice
-            } else if covered_host + block >= prior {
+            } else if covered_host + tolerance >= prior {
                 ReturnOutcome::HitHost
-            } else if covered_disk + block >= prior {
+            } else if covered_disk + tolerance >= prior {
                 ReturnOutcome::HitDisk
             } else {
                 ReturnOutcome::Miss
@@ -387,6 +390,21 @@ impl SessionStatsTracker {
         Some(summary)
     }
 
+    /// End every session still open, for example when a replay finishes. Returns the
+    /// summaries of the sessions ended by this call.
+    pub fn end_all(&self, now_ms: u64) -> Vec<SessionSummary> {
+        let mut inner = self.inner.lock();
+        let mut summaries = Vec::new();
+        for (session_id, stat) in &mut inner.sessions {
+            if stat.ended_ms.is_none() {
+                stat.ended_ms = Some(now_ms);
+                summaries.push(stat.summary(session_id, now_ms));
+            }
+        }
+        inner.ended += summaries.len() as u64;
+        summaries
+    }
+
     /// End sessions idle past the TTL and forget ones that ended a TTL ago. Returns
     /// the summaries of sessions ended by this call.
     pub fn sweep(&self, now_ms: u64) -> Vec<SessionSummary> {
@@ -400,9 +418,10 @@ impl SessionStatsTracker {
             }
         }
         inner.ended += summaries.len() as u64;
-        inner
-            .sessions
-            .retain(|_, stat| stat.ended_ms.is_none_or(|ended| now_ms.saturating_sub(ended) <= ttl));
+        inner.sessions.retain(|_, stat| {
+            stat.ended_ms
+                .is_none_or(|ended| now_ms.saturating_sub(ended) <= ttl)
+        });
         summaries
     }
 
@@ -422,6 +441,8 @@ impl SessionStatsTracker {
             distinct_device_tokens: residency.distinct.device * block,
             distinct_host_tokens: residency.distinct.host * block,
             distinct_disk_tokens: residency.distinct.disk * block,
+            stranded_device_tokens: residency.stranded.device * block,
+            stranded_host_tokens: residency.stranded.host * block,
             split_sessions: residency.split_sessions,
             thrash: inner.thrash,
             gap_outcomes: inner.gap_outcomes.to_vec(),
@@ -433,16 +454,23 @@ impl SessionStatsTracker {
                 snapshot.demand_tokens += stat.demand.max(stat.inflight_isl);
             }
         }
-        for (session_id, blocks) in &residency.per_session {
-            let Some(stat) = inner.sessions.get(session_id) else {
-                continue;
-            };
-            if !stat.is_active(now_ms, self.config.active_window_ms) {
-                snapshot.stranded_device_tokens += blocks.device * block;
-                snapshot.stranded_host_tokens += blocks.host * block;
-            }
-        }
         snapshot
+    }
+
+    /// Sessions currently counted in the working set. A session absent from this set,
+    /// including one the tracker has forgotten, is inactive; pass the complement to
+    /// [`SessionPrefixIndexer::residency_snapshot_with`] so the snapshot can separate
+    /// capacity held for sessions nobody is waiting on.
+    ///
+    /// [`SessionPrefixIndexer::residency_snapshot_with`]: crate::SessionPrefixIndexer::residency_snapshot_with
+    pub fn active_sessions(&self, now_ms: u64) -> HashSet<SessionId> {
+        self.inner
+            .lock()
+            .sessions
+            .iter()
+            .filter(|(_, stat)| stat.is_active(now_ms, self.config.active_window_ms))
+            .map(|(session_id, _)| session_id.clone())
+            .collect()
     }
 
     pub fn session_count(&self) -> usize {
@@ -522,6 +550,17 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_tail_within_a_tenth_still_counts_as_a_hit() {
+        let tracker = tracker();
+        tracker.on_arrival("s", None, 1_600, TierBlocks::default(), 0);
+        tracker.on_complete("s", 0, 0, 1);
+        // 1_600 prior tokens; the host holds 1_440 of them, nothing on the GPU.
+        let outcome = tracker.on_arrival("s", None, 1_700, blocks(0, 90, 0), 2);
+        assert_eq!(outcome.outcome, Some(ReturnOutcome::HitHost));
+        assert_eq!(outcome.thrash.recomputed, 160);
+    }
+
+    #[test]
     fn evicted_everywhere_is_all_recompute() {
         let tracker = tracker();
         tracker.on_arrival("s", None, 800, TierBlocks::default(), 0);
@@ -590,11 +629,16 @@ mod tests {
         tracker.on_complete("gone", 0, 0, 10);
         tracker.end_session("gone", 20);
 
-        let mut residency = ResidencySnapshot::default();
-        residency.per_session.insert("live".into(), blocks(70, 0, 0));
-        residency.per_session.insert("gone".into(), blocks(30, 10, 0));
-        residency.summed = blocks(100, 10, 0);
-        residency.distinct = blocks(90, 10, 0);
+        let active = tracker.active_sessions(2_000);
+        assert!(active.contains("live") && !active.contains("gone"));
+        assert_eq!(active.len(), 1);
+
+        let residency = ResidencySnapshot {
+            summed: blocks(100, 10, 0),
+            distinct: blocks(90, 10, 0),
+            stranded: blocks(30, 10, 0),
+            ..ResidencySnapshot::default()
+        };
 
         let snapshot = tracker.snapshot(&residency, 2_000);
         assert_eq!(snapshot.active_sessions, 1);
