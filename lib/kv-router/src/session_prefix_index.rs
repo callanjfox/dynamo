@@ -108,6 +108,10 @@ pub struct ResidencySnapshot {
     pub distinct: TierBlocks,
     /// Distinct blocks per tier held only for sessions the caller marked inactive.
     pub stranded: TierBlocks,
+    /// Blocks held by more than one worker per tier: the sum over workers of the
+    /// distinct blocks each holds, minus the distinct blocks fleet-wide. Capacity
+    /// spent on copies of the same prefix.
+    pub replicated: TierBlocks,
     /// Sessions the caller did not mark inactive whose device-tier frontier sits on
     /// more than one worker.
     pub split_sessions: u64,
@@ -452,6 +456,8 @@ impl SessionPrefixIndexer {
         let mut memo = FxHashMap::default();
         let mut active_covered: [FxHashSet<NodeId>; 3] = Default::default();
         let mut inactive_covered: [FxHashSet<NodeId>; 3] = Default::default();
+        let mut per_worker: FxHashMap<(WorkerWithDpRank, usize), FxHashSet<NodeId>> =
+            FxHashMap::default();
         let mut snapshot = ResidencySnapshot::default();
         for (session_id, entry) in &state.session_to_worker_frontiers {
             let covered = if is_inactive(session_id) {
@@ -462,14 +468,22 @@ impl SessionPrefixIndexer {
             let mut blocks = TierBlocks::default();
             let mut device_workers: FxHashSet<WorkerWithDpRank> = FxHashSet::default();
             for (&(worker, tier), frontiers) in &entry.worker_frontiers {
-                let set = match tier {
-                    StorageTier::Device => &mut covered[0],
-                    StorageTier::HostPinned => &mut covered[1],
-                    StorageTier::Disk => &mut covered[2],
+                let (tier_index, set) = match tier {
+                    StorageTier::Device => (0, &mut covered[0]),
+                    StorageTier::HostPinned => (1, &mut covered[1]),
+                    StorageTier::Disk => (2, &mut covered[2]),
                     StorageTier::External => continue,
                 };
+                let held = per_worker.entry((worker, tier_index)).or_default();
                 for &frontier in frontiers {
                     blocks.raise(tier, state.node_depth(frontier, &mut memo));
+                    let mut current = Some(frontier);
+                    while let Some(node) = current {
+                        if !held.insert(node) {
+                            break;
+                        }
+                        current = state.nodes[node].parent;
+                    }
                     let mut current = Some(frontier);
                     while let Some(node) = current {
                         if !set.insert(node) {
@@ -505,6 +519,15 @@ impl SessionPrefixIndexer {
             device: active_covered[0].len() as u64 + snapshot.stranded.device,
             host: active_covered[1].len() as u64 + snapshot.stranded.host,
             disk: active_covered[2].len() as u64 + snapshot.stranded.disk,
+        };
+        let mut worker_sum = [0u64; 3];
+        for (&(_, tier_index), nodes) in &per_worker {
+            worker_sum[tier_index] += nodes.len() as u64;
+        }
+        snapshot.replicated = TierBlocks {
+            device: worker_sum[0] - snapshot.distinct.device,
+            host: worker_sum[1] - snapshot.distinct.host,
+            disk: worker_sum[2] - snapshot.distinct.disk,
         };
         snapshot
     }
@@ -1599,6 +1622,9 @@ mod tests {
         let snapshot = indexer.residency_snapshot();
         assert_eq!(snapshot.split_sessions, 1);
         assert_eq!(snapshot.per_session["s"].device, 2);
+        // Both workers hold blocks 1 and 2: two copies beyond the first.
+        assert_eq!(snapshot.distinct.device, 2);
+        assert_eq!(snapshot.replicated.device, 2);
     }
 
     #[test]

@@ -416,6 +416,7 @@ A session is the chain of requests sharing an `x-dynamo-session-id`. It is activ
 | `session_demand_tokens` | gauge | none | Sum over active sessions of the prefix each will present next: the prior turn's input plus output. A shared prefix counts once per session, so this overstates distinct demand. |
 | `session_resident_tokens` | gauge | `tier` (`device`, `host`, `disk`) | Distinct tokens the session index holds, counting a shared prefix once. |
 | `session_stranded_tokens` | gauge | `tier` (`device`, `host`) | Distinct tokens held only for inactive sessions. Evictable, but it crowds out active demand when the cache is full. |
+| `session_replicated_tokens` | gauge | `tier` (`device`, `host`) | Tokens of session prefix held by more than one worker, counting copies beyond the first. Capacity spent on duplicates; high values with low hit rate suggest the router is spreading shared prefixes. |
 | `sessions_split` | gauge | none | Active sessions whose GPU-resident prefix is on more than one worker. |
 
 Compare `session_resident_tokens` and demand with worker KV capacity from the engine's own metrics. This router does not re-export capacity.
@@ -444,7 +445,7 @@ The prior prefix is estimated as the previous turn's input plus output, capped a
 | `session_turn_gap_seconds` | histogram | seconds, mean over the session |
 | `session_subagents` | histogram | subagent sessions spawned |
 
-**Series budget.** About 170 series per router process: 8 gauge series, 45 counter series (2 + 3 + 40), and 8 histograms of 11 to 15 series each. Bounded label values are created at startup. When one process hosts several routers, such as a prefill and a decode pool, gauges are last-router-wins and counters and histograms add up.
+**Series budget.** About 172 series per router process: 10 gauge series, 45 counter series (2 + 3 + 40), and 8 histograms of 11 to 15 series each. Bounded label values are created at startup. When one process hosts several routers, such as a prefill and a decode pool, gauges are last-router-wins and counters and histograms add up.
 
 **Configuration.** `DYN_SESSION_STATS_SWEEP_SECS` (default 10), `DYN_SESSION_STATS_ACTIVE_WINDOW_SECS` (default 300), and `DYN_SESSION_STATS_IDLE_TTL_SECS` (default 1800).
 

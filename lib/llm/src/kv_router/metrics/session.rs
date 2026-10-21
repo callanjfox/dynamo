@@ -42,6 +42,7 @@ pub struct SessionMetrics {
     pub resident_tokens: IntGaugeVec,
     /// Distinct tokens held only for inactive sessions, per storage tier.
     pub stranded_tokens: IntGaugeVec,
+    pub replicated_tokens: IntGaugeVec,
     /// Active sessions whose GPU prefix sits on more than one worker.
     pub sessions_split: IntGauge,
     pub sessions_started_total: IntCounter,
@@ -112,6 +113,14 @@ impl SessionMetrics {
                 extra_labels,
             )
             .expect("failed to create router_session_stranded_tokens");
+        let replicated_tokens = metrics
+            .create_intgaugevec(
+                &router_metric("session_replicated_tokens"),
+                "Tokens of session prefix held by more than one worker, copies beyond the first, by storage tier (device, host)",
+                &[TIER_LABEL],
+                extra_labels,
+            )
+            .expect("failed to create router_session_replicated_tokens");
         let thrash_tokens_total = metrics
             .create_intcountervec(
                 &router_metric("session_thrash_tokens_total"),
@@ -136,6 +145,9 @@ impl SessionMetrics {
         for tier in STRANDED_TIERS {
             stranded_tokens.with_label_values(&[tier]);
         }
+        for tier in STRANDED_TIERS {
+            replicated_tokens.with_label_values(&[tier]);
+        }
         for outcome in THRASH_OUTCOMES {
             thrash_tokens_total.with_label_values(&[outcome]);
         }
@@ -156,6 +168,7 @@ impl SessionMetrics {
             ),
             resident_tokens,
             stranded_tokens,
+            replicated_tokens,
             sessions_split: gauge(
                 "sessions_split",
                 "Active sessions whose GPU-resident prefix is on more than one worker",

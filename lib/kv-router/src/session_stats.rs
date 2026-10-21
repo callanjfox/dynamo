@@ -173,6 +173,9 @@ pub struct SessionStatsSnapshot {
     /// Tokens held for sessions that have ended or gone idle.
     pub stranded_device_tokens: u64,
     pub stranded_host_tokens: u64,
+    /// Tokens held by more than one worker: copies of a prefix beyond the first.
+    pub replicated_device_tokens: u64,
+    pub replicated_host_tokens: u64,
     /// Sessions whose device-tier prefix sits on more than one worker.
     pub split_sessions: u64,
     /// Cumulative thrash since the tracker started.
@@ -463,6 +466,8 @@ impl SessionStatsTracker {
             distinct_disk_tokens: residency.distinct.disk * block,
             stranded_device_tokens: residency.stranded.device * block,
             stranded_host_tokens: residency.stranded.host * block,
+            replicated_device_tokens: residency.replicated.device * block,
+            replicated_host_tokens: residency.replicated.host * block,
             split_sessions: residency.split_sessions,
             thrash: inner.thrash,
             gap_outcomes: inner.gap_outcomes.to_vec(),
@@ -667,6 +672,7 @@ mod tests {
             summed: blocks(100, 10, 0),
             distinct: blocks(90, 10, 0),
             stranded: blocks(30, 10, 0),
+            replicated: blocks(12, 4, 0),
             ..ResidencySnapshot::default()
         };
 
@@ -677,6 +683,8 @@ mod tests {
         assert_eq!(snapshot.distinct_device_tokens, 1_440);
         assert_eq!(snapshot.stranded_device_tokens, 480);
         assert_eq!(snapshot.stranded_host_tokens, 160);
+        assert_eq!(snapshot.replicated_device_tokens, 192);
+        assert_eq!(snapshot.replicated_host_tokens, 64);
         assert_eq!(snapshot.sessions_started, 2);
         assert_eq!(snapshot.sessions_ended, 1);
     }

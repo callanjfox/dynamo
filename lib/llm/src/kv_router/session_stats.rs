@@ -205,6 +205,15 @@ impl SessionStatsRuntime {
                 .with_label_values(&[tier])
                 .set(gauge(tokens));
         }
+        for (tier, tokens) in [
+            ("device", snapshot.replicated_device_tokens),
+            ("host", snapshot.replicated_host_tokens),
+        ] {
+            metrics
+                .replicated_tokens
+                .with_label_values(&[tier])
+                .set(gauge(tokens));
+        }
     }
 
     pub(crate) fn spawn_sweeper(self: &Arc<Self>, cancellation: CancellationToken) {
