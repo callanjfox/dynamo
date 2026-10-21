@@ -91,7 +91,7 @@
   .tip b { display: block; margin-bottom: 3px; }
   .tip div { display: flex; align-items: center; gap: 6px; font-variant-numeric: tabular-nums; }
   .tip i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
-  .gaprow { display: grid; grid-template-columns: 78px 1fr 78px; align-items: center; gap: 10px; margin: 5px 0; font-size: 12.5px; }
+  .gaprow { display: grid; grid-template-columns: 96px 1fr 78px; align-items: center; gap: 10px; margin: 5px 0; font-size: 12.5px; }
   .gaprow .lab { color: var(--ink-2); text-align: right; font-variant-numeric: tabular-nums; }
   .gaprow .n { color: var(--ink-2); font-variant-numeric: tabular-nums; }
   .gapbar { display: flex; height: 16px; gap: 2px; background: transparent; }
@@ -163,10 +163,24 @@
   </div>
 
   <div class="card">
-    <h2>Sessions</h2>
-    <p class="note">Active sessions, and how many have their GPU-resident prefix on more than one worker.</p>
+    <h2>Active sessions</h2>
+    <p class="note">Sessions active inside the window, split into primary sessions and the subagents they spawn.</p>
     <div class="legend" id="leg3"></div>
     <div class="chart" id="c3"></div>
+  </div>
+
+  <div class="card" id="card-role">
+    <h2>Primary sessions and subagents</h2>
+    <p class="note">The distinct working set split by role. A subagent counts only the blocks its primary sessions do not already hold, so its line is the capacity subagents add on top of the sessions that spawned them.</p>
+    <div class="legend" id="leg16"></div>
+    <div class="chart" id="c16"></div>
+  </div>
+
+  <div class="card" id="card-decay">
+    <h2>Demand if idle sessions decay</h2>
+    <p class="note">The same demand counting only sessions active in the last 30 seconds, minute or five minutes, against the longer active window. A session quiet for minutes may or may not return; the gap between these lines is demand that depends on that bet. The return-gap panel below shows how often sessions do come back.</p>
+    <div class="legend" id="leg17"></div>
+    <div class="chart" id="c17"></div>
   </div>
 
   <div class="card">
@@ -177,22 +191,41 @@
   </div>
 
   <div class="card" id="card-cov">
-    <h2>Share of traffic the session metrics cover</h2>
-    <p class="note">Cumulative share of routed requests, and of input tokens, that carried a session ID. Everything else on this page describes only that share. Requests without an ID are routed as usual but are not tracked.</p>
+    <h2>Agent traffic against the rest</h2>
+    <p class="note">Share of routed requests, and of input tokens, that carried a session ID, in each 60 second window. Everything else on this page describes only that share. Requests without an ID are routed as usual but are not tracked. The partial coverage run sends 30% of its sessions without headers.</p>
     <div class="legend" id="leg8"></div>
     <div class="chart" id="c8"></div>
   </div>
 
   <div class="card" id="card-repl">
-    <h2>Prefix copies held by more than one worker</h2>
-    <p class="note">Tokens of session prefix that sit on a second (or third) worker: capacity spent on duplicates. It rises when the router spreads sessions that share a prefix, such as a parent and its subagents.</p>
+    <h2>Duplication factor</h2>
+    <p class="note">Copies of the cache across workers: 1x means each prefix block is held on one worker, 2x means on average two. It is the tokens held on workers divided by the distinct tokens, so it rises when the router spreads sessions that share a prefix.</p>
     <div class="legend" id="leg6"></div>
     <div class="chart" id="c6"></div>
   </div>
 
+  <div class="card" id="card-shared">
+    <h2>Shared prefix across sessions</h2>
+    <p class="note">Prompt tokens that more than one active session presents, such as a system prompt, a repository summary, or a subagent starting from its parent's context. The per-session demand sum counts them each time; the distinct demand counts them once.</p>
+    <div class="legend" id="leg18"></div>
+    <div class="chart" id="c18"></div>
+  </div>
+
+  <div class="card" id="card-worker">
+    <h2>Load across workers</h2>
+    <p class="note">Demand homed on the busiest worker against what one worker can hold, and the mean. Fleet totals can look fine while a few workers carry most sessions and spill past their own GPU and host memory. The sessions are homed where their last turn ran.</p>
+    <div class="legend" id="leg19"></div>
+    <div class="chart" id="c19"></div>
+    <div class="legend" id="leg20"></div>
+    <div class="chart" id="c20"></div>
+    <p class="note">Distinct session tokens each worker's cache holds, the busiest worker against the mean. A busiest worker pinned at capacity while the mean is low means the load is uneven.</p>
+    <div class="legend" id="leg21"></div>
+    <div class="chart" id="c21"></div>
+  </div>
+
   <div class="card" id="card-funnel">
     <h2>Cache reuse funnel</h2>
-    <p class="note">Share of prompt tokens at each step in each 60 second window (F0, every prompt token, is 100%). F2 is the prefix the router estimates is cached on the best eligible worker. F3 is the same on the worker it chose. F4 is what the worker reports reusing. The table has the cumulative totals.</p>
+    <p class="note">Share of prompt tokens at each step in each 60 second window. The top line is what the session history says could be reused if nothing had been evicted (from the session index, covered traffic only); the steps below it are what the router and the worker find. F2 is the prefix the router estimates is cached on the best eligible worker. F3 is the same on the worker it chose. F4 is what the worker reports reusing. The table has the cumulative totals.</p>
     <div class="legend" id="leg7"></div>
     <div class="chart" id="c7"></div>
     <div class="scroll" id="funnel"></div>
@@ -209,12 +242,6 @@
     <h2>What the sessions look like</h2>
     <p class="note">Distribution across all sessions in this run, including subagents. Context is the largest prefix a session presented.</p>
     <div class="scroll" id="dist"></div>
-  </div>
-
-  <div class="card">
-    <h2>Largest sessions</h2>
-    <p class="note">The per-session record the router writes when a session ends. It carries the session ID, so it is a log, not a metric.</p>
-    <div class="scroll" id="top"></div>
   </div>
 
   <div id="compute">
@@ -271,21 +298,33 @@ const fmtNum = (n) => Math.round(n).toLocaleString("en-US");
 const fmtClock = (m) => { const s = Math.round(m * 60); return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); };
 const pct = (x) => (x * 100).toFixed(0) + "%";
 const windowStart = (rows, i, ms) => { let j = i; while (j > 0 && rows[i].now_ms - rows[j].now_ms < ms) j--; return j; };
+const meta_workers = (run) => run.workers || 4;
 const median = (xs) => quantile(xs, 0.5);
 const REF = [
-  ["Session state", [
+  ["Working set", [
     ["sessions_active", "gauge", "Sessions active inside the window that have not ended."],
-    ["session_demand_tokens", "gauge", "Sum over active sessions of the prefix each will present next: the working set size."],
-    ["session_resident_tokens{tier}", "gauge", "Distinct tokens the session index holds in each tier (device, host, disk). Compare with demand and capacity."],
+    ["sessions_active_by_role{role}", "gauge", "Active sessions split into primary and subagent."],
+    ["session_demand_tokens", "gauge", "Sum over active sessions of the prefix each will present next. A shared prefix counts once per session."],
+    ["session_demand_distinct_tokens", "gauge", "The same demand counting each distinct prompt block once: the working set a cache must hold."],
+    ["session_demand_by_role_tokens{role}", "gauge", "Distinct demand split by role. A subagent counts only the blocks its primaries do not cover."],
+    ["session_shared_tokens", "gauge", "Prompt tokens referenced by more than one active session."],
+    ["session_demand_window_tokens{window}", "gauge", "Per-session demand counting only sessions active in the last 30 s, 1 m or 5 m: demand with idle sessions decayed."],
+    ["session_resident_tokens{tier}", "gauge", "Distinct tokens the session index holds in each tier (device, host, disk)."],
     ["session_stranded_tokens{tier}", "gauge", "Tokens held only for inactive sessions (device, host): cache held but not needed."],
-    ["session_replicated_tokens{tier}", "gauge", "Copies of session prefix beyond the first on other workers (device, host): redundancy."],
-    ["sessions_split", "gauge", "Active sessions whose GPU prefix is spread over more than one worker."],
+    ["session_replicated_tokens{tier}", "gauge", "Copies of session prefix beyond the first on other workers (device, host). The duplication factor is 1 + replicated / resident."],
     ["sessions_started_total", "counter", "Sessions first seen. A session resuming after it ended counts as a new start."],
     ["sessions_ended_total", "counter", "Sessions ended by a final-turn marker or by idling past the TTL."],
   ]],
+  ["Load across workers", [
+    ["session_worker_demand_tokens{stat}", "gauge", "Demand homed on one worker (where the session's last turn ran): the busiest (max) and the mean over workers."],
+    ["session_worker_demand_ratio{stat}", "gauge", "That demand over the worker's GPU KV capacity. Above 1.0 the worker is asked to hold more than its GPU can."],
+    ["session_workers_over_capacity", "gauge", "Workers whose homed demand exceeds their GPU KV capacity."],
+    ["session_worker_resident_tokens{stat,tier}", "gauge", "Distinct session tokens held on one worker: the busiest (max) and the mean over workers holding any."],
+  ]],
   ["Thrash and returns", [
     ["session_thrash_tokens_total{outcome}", "counter", "Prior-prefix tokens a returning session had to recompute, or reload from host or disk. Recomputed is the cost of running out of cache."],
-    ["session_return_turns_total{gap,outcome}", "counter", "Returning turns by time since the previous turn (10 buckets) and where the prior prefix was found (gpu, host, disk, miss)."],
+    ["session_return_turns_total{gap,outcome}", "counter", "Returning turns by time since the previous turn (10 buckets, shown here as 30 s, 1 m, 5 m and longer) and where the prior prefix was found (gpu, host, disk, miss)."],
+    ["session_prior_prefix_tokens_total", "counter", "Prefix tokens returning sessions could reuse if nothing had been evicted. The session-history line in the funnel."],
   ]],
   ["Coverage", [
     ["session_coverage_requests_total{coverage}", "counter", "Routed requests with (covered) or without (uncovered) a session ID."],
@@ -378,7 +417,7 @@ function lineChart(host, spec) {
   let top = 0;
   for (const s of spec.series) top = Math.max(top, ...s.values);
   for (const r of spec.refs || []) top = Math.max(top, r.y);
-  const sc = scale(spec.max || top * 1.04), yMax = sc.max;
+  const sc = scale(spec.max || Math.max(top * 1.04, spec.min1 ? 2 : 0)), yMax = sc.max;
   const X = (v) => M.l + (iw * v) / xMax;
   const Y = (v) => M.t + ih - (ih * v) / yMax;
   let svg = axes(W, H, xMax, sc, spec.fmtY);
@@ -485,10 +524,12 @@ function render(idx) {
     (run.requests ? tile("Requests", fmtNum(run.requests.sent), `${fmtNum(run.requests.failed)} failed, p50 ${run.requests.p50_s.toFixed(1)}s, p90 ${run.requests.p90_s.toFixed(1)}s`) : "");
 
   // 1. working set vs capacity
+  const hasDistinct = rows.some((r) => r.distinct_demand);
   const s1 = [
-    { name: demandName, color: "--s1", values: demand },
+    { name: hasDistinct ? "Demand (distinct blocks)" : demandName, color: "--s1", values: demand },
     { name: "GPU resident", color: "--s2", values: gpu },
   ];
+  if (hasDistinct) s1.push({ name: "Demand (sum over sessions)", color: "--s5", values: rows.map((r) => r.demand_tokens) });
   const refs = [{ y: capDev, label: "GPU capacity " + fmtTok(capDev) }];
   if (capHost > 0) {
     s1.push({ name: "Host resident", color: "--s3", values: host });
@@ -511,16 +552,33 @@ function render(idx) {
   legend("#leg2", [{ name: "Recomputed", color: "--s2" }, { name: "Reloaded from host", color: "--s3" }]);
   barChart($("#c2"), { bins, xMax, colors: ["--s2", "--s3"], names: ["Recomputed", "Reloaded from host"], fmtY: fmtTok, label: "Thrash per 30 seconds" });
 
-  // 3. sessions
-  legend("#leg3", [{ name: "Active sessions", color: "--s1" }, { name: "Split across workers", color: "--s5" }]);
-  lineChart($("#c3"), {
-    x: t,
-    series: [
-      { name: "Active sessions", color: "--s1", values: rows.map((r) => r.active_sessions) },
-      { name: "Split across workers", color: "--s5", values: rows.map((r) => r.split_sessions) },
-    ],
-    fmtY: (v) => String(Math.round(v)), fmtTip: (v) => String(Math.round(v)), label: "Active and split sessions",
-  });
+  // 3. sessions by role
+  const hasRole = rows.some((r) => r.active_primary !== undefined && (r.active_primary + r.active_subagent) > 0);
+  const roleSeries = hasRole
+    ? [{ name: "Primary sessions", color: "--s1", values: rows.map((r) => r.active_primary) }, { name: "Subagent sessions", color: "--s3", values: rows.map((r) => r.active_subagent) }]
+    : [{ name: "Active sessions", color: "--s1", values: rows.map((r) => r.active_sessions) }];
+  legend("#leg3", roleSeries);
+  lineChart($("#c3"), { x: t, series: roleSeries, fmtY: (v) => String(Math.round(v)), fmtTip: (v) => String(Math.round(v)), label: "Active sessions by role" });
+  // 3b. demand by role (distinct blocks): how much of the working set is primaries and how much subagents add
+  $("#card-role").style.display = hasRole && hasDistinct ? "" : "none";
+  if (hasRole && hasDistinct) {
+    const rd = [{ name: "Primary sessions", color: "--s1", values: rows.map((r) => r.demand_primary_tokens) }, { name: "Subagents (blocks the primaries do not cover)", color: "--s3", values: rows.map((r) => r.demand_subagent_tokens) }];
+    legend("#leg16", rd);
+    lineChart($("#c16"), { x: t, series: rd, fmtY: fmtTok, fmtTip: fmtTok, label: "Demand by role" });
+  }
+  // 3c. demand with idle sessions decayed
+  const hasWin = rows.some((r) => r.demand_windows && r.demand_windows[2] > 0);
+  $("#card-decay").style.display = hasWin ? "" : "none";
+  if (hasWin) {
+    const wd = [
+      { name: "Active in the last 30 s", color: "--s2", values: rows.map((r) => r.demand_windows[0]) },
+      { name: "Last minute", color: "--s3", values: rows.map((r) => r.demand_windows[1]) },
+      { name: "Last 5 minutes", color: "--s1", values: rows.map((r) => r.demand_windows[2]) },
+      { name: "Active window (" + (run.meta_window || "100") + " s)", color: "--s5", values: rows.map((r) => r.demand_tokens) },
+    ];
+    legend("#leg17", wd);
+    lineChart($("#c17"), { x: t, series: wd, refs: [{ y: capDev, label: "GPU capacity " + fmtTok(capDev) }], fmtY: fmtTok, fmtTip: fmtTok, label: "Demand with idle sessions decayed" });
+  }
 
   // 4. stranded
   legend("#leg4", [{ name: "Held for inactive sessions", color: "--s2" }, { name: "Capacity", dash: true }]);
@@ -531,37 +589,79 @@ function render(idx) {
     fmtY: fmtTok, fmtTip: fmtTok, label: "KV held for inactive sessions",
   });
 
-  // 5. gap outcomes
-  const edges = ["1s", "5s", "10s", "30s", "1m", "2m", "5m", "10m", "30m", "over 30m"];
+  // 5. gap outcomes, bucketed to 30 s, 1 min, 5 min and longer
+  const groups = [["up to 30 s", [0, 1, 2, 3]], ["30 s to 1 min", [4]], ["1 to 5 min", [5, 6]], ["over 5 min", [7, 8, 9]]];
   legend("#leg5", [{ name: "Prefix on GPU", color: "--s1" }, ...(capHost > 0 ? [{ name: "Prefix in host memory", color: "--s3" }] : []), { name: "Mostly recomputed", color: "--s2" }]);
-  $("#gap").innerHTML = last.gap_outcomes.map((g, i) => {
+  $("#gap").innerHTML = groups.map(([label, idxs]) => {
+    const g = [0, 1, 2, 3].map((k) => idxs.reduce((a, i) => a + last.gap_outcomes[i][k], 0));
     const n = g[0] + g[1] + g[2] + g[3];
     if (!n) return "";
     const seg = (v, c, name) => v ? `<span title="${name}: ${v} of ${n}" style="width:${(v / n) * 100}%;background:var(${c})"></span>` : "";
-    return `<div class="gaprow"><div class="lab">${i < 9 ? "up to " : ""}${edges[i]}</div><div class="gapbar">${seg(g[0], "--s1", "GPU")}${seg(g[1] + g[2], "--s3", "Host or disk")}${seg(g[3], "--s2", "Mostly recomputed")}</div><div class="n">${fmtNum(n)} turns</div></div>`;
+    return `<div class="gaprow"><div class="lab">${label}</div><div class="gapbar">${seg(g[0], "--s1", "GPU")}${seg(g[1] + g[2], "--s3", "Host or disk")}${seg(g[3], "--s2", "Mostly recomputed")}</div><div class="n">${fmtNum(n)} turns</div></div>`;
   }).join("");
 
-  // 8. coverage
+  // 8. coverage: agent (session) traffic against the rest, per 60 s window
   const covRows = rows.filter((r) => r.coverage && r.coverage.requests_covered + r.coverage.requests_uncovered > 0);
   $("#card-cov").style.display = covRows.length ? "" : "none";
   if (covRows.length) {
-    const share = (c, u) => (c + u ? (100 * c) / (c + u) : 100);
+    const win = (c, u) => covRows.map((r, i) => {
+      const j = windowStart(covRows, i, 60000), dc = r.coverage[c] - covRows[j].coverage[c], du = r.coverage[u] - covRows[j].coverage[u];
+      return dc + du > 0 ? (100 * dc) / (dc + du) : null;
+    });
+    const fillNull = (xs) => { let last = 100; return xs.map((v) => (last = v == null ? last : v)); };
     const sc = [
-      { name: "Requests with a session ID", color: "--s1", values: covRows.map((r) => share(r.coverage.requests_covered, r.coverage.requests_uncovered)) },
-      { name: "Input tokens with a session ID", color: "--s3", values: covRows.map((r) => share(r.coverage.tokens_covered, r.coverage.tokens_uncovered)) },
+      { name: "Requests from sessions", color: "--s1", values: fillNull(win("requests_covered", "requests_uncovered")) },
+      { name: "Input tokens from sessions", color: "--s3", values: fillNull(win("tokens_covered", "tokens_uncovered")) },
     ];
     legend("#leg8", sc);
-    lineChart($("#c8"), { x: covRows.map((r) => r.now_ms / MIN), series: sc, fmtY: (v) => Math.round(v) + "%", fmtTip: (v) => v.toFixed(1) + "%", label: "Session coverage" });
+    lineChart($("#c8"), { x: covRows.map((r) => r.now_ms / MIN), series: sc, max: 100, fmtY: (v) => Math.round(v) + "%", fmtTip: (v) => v.toFixed(1) + "%", label: "Share of traffic from sessions" });
   }
 
-  // 6. replicated prefix
+  // 6. duplication factor
   const hasRepl = rows.some((r) => r.replicated_device_tokens !== undefined);
   $("#card-repl").style.display = hasRepl ? "" : "none";
   if (hasRepl) {
-    const sr = [{ name: "On more than one worker (GPU)", color: "--s5", values: rows.map((r) => r.replicated_device_tokens || 0) }];
-    if (capHost > 0) sr.push({ name: "On more than one worker (host)", color: "--s3", values: rows.map((r) => r.replicated_host_tokens || 0) });
+    const factor = (rep, res) => rows.map((r) => (r[res] > 0 ? 1 + r[rep] / r[res] : 1));
+    const sr = [{ name: "GPU copies", color: "--s5", values: factor("replicated_device_tokens", "distinct_device_tokens") }];
+    if (capHost > 0) sr.push({ name: "Host copies", color: "--s3", values: factor("replicated_host_tokens", "distinct_host_tokens") });
     legend("#leg6", sr);
-    lineChart($("#c6"), { x: t, series: sr, fmtY: fmtTok, fmtTip: fmtTok, label: "Replicated prefix tokens" });
+    lineChart($("#c6"), { x: t, series: sr, fmtY: (v) => v.toFixed(1) + "x", fmtTip: (v) => v.toFixed(2) + "x", label: "Duplication factor", min1: true, refs: [{ y: 1, label: "1x: one copy of everything" }] });
+  }
+  // 6b. shared prefix across sessions
+  const hasShared = rows.some((r) => r.shared_tokens > 0);
+  $("#card-shared").style.display = hasShared ? "" : "none";
+  if (hasShared) {
+    const ss = [
+      { name: "Prompt tokens shared by more than one session", color: "--s3", values: rows.map((r) => r.shared_tokens) },
+      { name: "Distinct demand", color: "--s1", values: demand },
+    ];
+    legend("#leg18", ss);
+    lineChart($("#c18"), { x: t, series: ss, fmtY: fmtTok, fmtTip: fmtTok, label: "Shared prefix" });
+  }
+  // 6c. load across workers
+  const hasWorker = rows.some((r) => r.worker);
+  $("#card-worker").style.display = hasWorker ? "" : "none";
+  if (hasWorker) {
+    const wr = rows.map((r) => r.worker || { demand_max: 0, demand_mean: 0, resident_max_device: 0, resident_max_host: 0, over: 0 });
+    const perGpu = capDev / meta_workers(run), perAll = (capDev + capHost) / meta_workers(run);
+    const sw = [
+      { name: "Busiest worker's demand", color: "--s2", values: wr.map((w) => w.demand_max) },
+      { name: "Mean worker demand", color: "--s1", values: wr.map((w) => w.demand_mean) },
+    ];
+    const wrefs = [{ y: perGpu, label: "one worker's GPU " + fmtTok(perGpu) }];
+    if (capHost > 0) wrefs.push({ y: perAll, label: "one worker's GPU + host " + fmtTok(perAll) });
+    legend("#leg19", [...sw, { name: "Per-worker capacity", dash: true }]);
+    lineChart($("#c19"), { x: t, series: sw, refs: wrefs, fmtY: fmtTok, fmtTip: fmtTok, label: "Demand per worker" });
+    const so = [{ name: "Workers over their GPU capacity", color: "--s2", values: wr.map((w) => w.over) }];
+    legend("#leg20", so);
+    lineChart($("#c20"), { x: t, series: so, fmtY: (v) => String(Math.round(v)), fmtTip: (v) => String(Math.round(v)), label: "Workers over capacity" });
+    const sres = [
+      { name: "Busiest worker, GPU resident", color: "--s2", values: wr.map((w) => w.resident_max_device) },
+      { name: "Mean worker, GPU resident", color: "--s1", values: wr.map((w) => w.resident_mean_device) },
+    ];
+    if (capHost > 0) sres.push({ name: "Busiest worker, host resident", color: "--s3", values: wr.map((w) => w.resident_max_host) });
+    legend("#leg21", sres);
+    lineChart($("#c21"), { x: t, series: sres, refs: wrefs, fmtY: fmtTok, fmtTip: fmtTok, label: "Resident per worker" });
   }
 
   // 7. funnel
@@ -572,7 +672,12 @@ function render(idx) {
       const j = windowStart(rows, i, 60000), d0 = r.funnel.f0 - rows[j].funnel.f0;
       return d0 > 0 ? (100 * (r.funnel[key] - rows[j].funnel[key])) / d0 : 0;
     });
+    const potential = rows.map((r, i) => {
+      const j = windowStart(rows, i, 60000), d0 = r.funnel.f0 - rows[j].funnel.f0;
+      return d0 > 0 ? Math.min(100, (100 * ((r.prior_prefix || 0) - (rows[j].prior_prefix || 0))) / d0) : 0;
+    });
     const sf = [
+      { name: "Session history: prefix a returning session could reuse", color: "--s1", values: potential },
       { name: "F2 best eligible worker's cache", color: "--s2", values: windowShare("f2") },
       { name: "F3 chosen worker's cache", color: "--s3", values: windowShare("f3") },
       { name: "F4 worker-reported reuse", color: "--s5", values: windowShare("f4") },
@@ -602,9 +707,6 @@ function render(idx) {
   ];
   $("#dist").innerHTML = `<table><thead><tr><th>Per session</th><th>p50</th><th>p90</th><th>max</th></tr></thead><tbody>` +
     dist.map(([k, xs, f]) => `<tr><td>${k}</td><td>${f(quantile(xs, 0.5))}</td><td>${f(quantile(xs, 0.9))}</td><td>${f(Math.max(...xs))}</td></tr>`).join("") + `</tbody></table>`;
-  const top = [...sess].sort((a, b) => b.peak_demand_tokens - a.peak_demand_tokens).slice(0, 12);
-  $("#top").innerHTML = `<table><thead><tr><th>Session</th><th>Parent</th><th>Turns</th><th>Input tokens</th><th>Context</th><th>Hit rate</th><th>Subagents</th><th>Thrash tokens</th></tr></thead><tbody>` +
-    top.map((s) => `<tr><td>${s.session_id}</td><td>${s.parent_session_id || "-"}</td><td>${s.turns}</td><td>${fmtTok(s.isl_tokens)}</td><td>${fmtTok(s.peak_demand_tokens)}</td><td>${pct(s.hit_rate)}</td><td>${s.children}</td><td>${fmtTok(s.thrash.recomputed + s.thrash.reloaded_host + s.thrash.reloaded_disk)}</td></tr>`).join("") + `</tbody></table>`;
 
   // ---- your sessions: tiles and shape
   const islTurn = sess.map((x) => x.isl_tokens / Math.max(1, x.turns)), osl = sess.map((x) => x.osl_tokens / Math.max(1, x.turns));

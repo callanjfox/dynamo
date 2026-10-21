@@ -62,9 +62,15 @@ python3 live/extract_summaries.py summaries.raw > summaries.jsonl; python3 live/
 # copy meta.json, metrics.jsonl, requests.jsonl, summaries.jsonl into data/live/<name>/, then build_demo.py
 ```
 
+The page has four parts: the session shape (turns, ISL, OSL, context growth, fan-out), the working set and cache (demand with a
+shared prefix counted once, primary sessions against subagents, demand with idle sessions decayed, thrash, duplication factor,
+shared prefix, load across workers, the cache reuse funnel, agent traffic against the rest), compute health (TTFT, inter-token
+latency, queues, an estimated queue wait, KV blocks per worker) and a reference table of every metric. Compute series come from
+the frontend and the router's per-worker load tracking: the mocker does not publish engine-style worker metrics, so a real
+engine run is still needed for engine queue time and KV usage.
+
 Caveats: mock workers do not publish cache reuse, so funnel step F4 is not reported. Requests above one worker's 640k-token
-capacity are refused by the mocker (about 33 per run). Demand is the router's per-session sum, which counts a prefix once per
-session and overstates distinct demand, more so with subagents. The corpus has no prefix shared across sessions, so all sharing
+capacity are refused by the mocker (about 33 per run). The router reports demand two ways: the per-session sum (a prefix counts once per session) and the distinct count (a shared block counts once). The corpus has no prefix shared across sessions, so all sharing
 here is within a session and its subagents.
 
 ## Synthetic live run
