@@ -734,8 +734,12 @@ function render(idx) {
       { name: "F3 chosen worker's cache", color: "--s3", values: windowShare("f3") },
       { name: "F4 worker-reported reuse", color: "--s5", values: windowShare("f4") },
     ].filter((x) => x.values.some((v) => v > 0));
+    // A window with almost no prompt tokens (under 2M) has no meaningful share; leave it out rather than draw a spike.
+    const busy = rows.map((r, i) => r.funnel.f0 - rows[windowStart(rows, i, 60000)].funnel.f0 > 2e6);
+    const tb = t.filter((_, i) => busy[i]);
+    sf.forEach((x) => (x.values = x.values.filter((_, i) => busy[i])));
     legend("#leg7", sf);
-    lineChart($("#c7"), { x: t, series: sf, fmtY: (v) => Math.round(v) + "%", fmtTip: (v) => v.toFixed(1) + "%", label: "Cache reuse funnel, share of prompt tokens", max: 100 });
+    lineChart($("#c7"), { x: tb, series: sf, fmtY: (v) => Math.round(v) + "%", fmtTip: (v) => v.toFixed(1) + "%", label: "Cache reuse funnel, share of prompt tokens", max: 100 });
     const f = last.funnel, of = (v) => (f.f0 ? pct(v / f.f0) : "-");
     $("#funnel").innerHTML = `<table><thead><tr><th>Step</th><th>Tokens</th><th>Share of prompt</th></tr></thead><tbody>` +
       [["F0 prompt", f.f0], ["F2 best eligible worker", f.f2], ["F3 chosen worker", f.f3], ["F4 worker-reported reuse", f.f4]]
