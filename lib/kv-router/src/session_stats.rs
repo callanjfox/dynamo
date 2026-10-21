@@ -31,6 +31,20 @@ pub const GAP_BUCKET_EDGES_MS: [u64; 9] = [
 ];
 const GAP_BUCKETS: usize = GAP_BUCKET_EDGES_MS.len() + 1;
 
+/// Metric-label names for the turn-gap buckets, in bucket order.
+pub const GAP_BUCKET_LABELS: [&str; GAP_BUCKETS] = [
+    "le_1s", "le_5s", "le_10s", "le_30s", "le_60s", "le_120s", "le_300s", "le_600s", "le_1800s",
+    "gt_1800s",
+];
+
+/// Index of the turn-gap bucket a gap falls in.
+pub fn gap_bucket(gap_ms: u64) -> usize {
+    GAP_BUCKET_EDGES_MS
+        .iter()
+        .position(|&edge| gap_ms <= edge)
+        .unwrap_or(GAP_BUCKETS - 1)
+}
+
 /// Where a returning session's prior prefix was found, to within a tenth of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReturnOutcome {
@@ -41,6 +55,16 @@ pub enum ReturnOutcome {
 }
 
 impl ReturnOutcome {
+    /// Metric-label name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HitDevice => "gpu",
+            Self::HitHost => "host",
+            Self::HitDisk => "disk",
+            Self::Miss => "miss",
+        }
+    }
+
     fn index(self) -> usize {
         match self {
             Self::HitDevice => 0,
@@ -348,11 +372,7 @@ impl SessionStatsTracker {
         inner.turns += 1;
         inner.thrash.add(thrash);
         if let (Some(gap), Some(outcome)) = (gap_ms, outcome) {
-            let bucket = GAP_BUCKET_EDGES_MS
-                .iter()
-                .position(|&edge| gap <= edge)
-                .unwrap_or(GAP_BUCKETS - 1);
-            inner.gap_outcomes[bucket][outcome.index()] += 1;
+            inner.gap_outcomes[gap_bucket(gap)][outcome.index()] += 1;
         }
 
         ArrivalOutcome {
@@ -580,6 +600,16 @@ mod tests {
         // 3s falls in the (1s, 5s] bucket, outcome device.
         assert_eq!(snapshot.gap_outcomes[1][0], 1);
         assert_eq!(snapshot.gap_outcomes.len(), GAP_BUCKET_EDGES_MS.len() + 1);
+    }
+
+    #[test]
+    fn gap_buckets_include_their_upper_edge() {
+        assert_eq!(gap_bucket(0), 0);
+        assert_eq!(gap_bucket(1_000), 0);
+        assert_eq!(gap_bucket(1_001), 1);
+        assert_eq!(gap_bucket(1_800_000), 8);
+        assert_eq!(gap_bucket(1_800_001), 9);
+        assert_eq!(GAP_BUCKET_LABELS.len(), GAP_BUCKET_EDGES_MS.len() + 1);
     }
 
     #[test]

@@ -66,10 +66,12 @@ use prometheus::{
 use crate::http::service::metrics::generate_log_buckets;
 use crate::protocols::common::timing::RequestPhase;
 
+mod session;
 mod worker_registered;
 use crate::protocols::common::timing::WORKER_TYPE_PREFILL;
 use dynamo_kv_router::indexer::ApproximateLruStats;
 use dynamo_kv_router::sequences::LocalWorkerLoad;
+pub use session::SessionMetrics;
 use worker_registered::RouterWorkerRegistered;
 pub(crate) use worker_registered::{RegistrationAvailabilityProvider, RouterWorkerRegistration};
 
@@ -1278,6 +1280,16 @@ impl RouterRequestMetrics {
     }
 }
 
+impl SessionMetrics {
+    #[cfg(test)]
+    pub(crate) fn for_test(registry: &dynamo_runtime::MetricsRegistry) -> Arc<Self> {
+        let mut hierarchy = kv_publisher_registration_tests::FakeHierarchy::component("", "", 0);
+        hierarchy.registry = registry.clone();
+        hierarchy.connection_id = None;
+        Arc::new(Self::build(&hierarchy, &[]))
+    }
+}
+
 /// Process-local observability for the experimental approximate LRU.
 ///
 /// NOTE: Gauges are last-router-wins. Approximate primaries are expected to be
@@ -1585,6 +1597,25 @@ mod tests {
         let mut buffer = Vec::new();
         encoder.encode(&registry.gather(), &mut buffer).unwrap();
         String::from_utf8(buffer).unwrap()
+    }
+
+    #[test]
+    fn session_metrics_export_zeroes_for_bounded_labels_from_the_first_scrape() {
+        let registry = dynamo_runtime::MetricsRegistry::new();
+        let _metrics = SessionMetrics::for_test(&registry);
+        let output = registry.prometheus_expfmt_combined().unwrap();
+        for series in [
+            "router_sessions_active 0",
+            "router_session_resident_tokens{tier=\"host\"} 0",
+            "router_session_stranded_tokens{tier=\"device\"} 0",
+            "router_session_thrash_tokens_total{outcome=\"reloaded_host\"} 0",
+            "router_session_return_turns_total{gap=\"le_30s\",outcome=\"miss\"} 0",
+            "router_session_return_turns_total{gap=\"gt_1800s\",outcome=\"gpu\"} 0",
+            "router_session_cache_hit_ratio_count 0",
+        ] {
+            assert!(output.contains(series), "missing {series}\n{output}");
+        }
+        assert!(!output.contains("session_id"), "no identity labels");
     }
 
     #[test]

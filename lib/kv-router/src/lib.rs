@@ -87,7 +87,9 @@ pub use session_prefix_index::{
     LogicalNode, NodeId, ResidencySnapshot, SessionId, SessionPrefixIndexError,
     SessionPrefixIndexer, TierBlocks,
 };
-pub use session_stats::{SessionStatsConfig, SessionStatsSnapshot, SessionStatsTracker};
+pub use session_stats::{
+    ReturnOutcome, SessionStatsConfig, SessionStatsSnapshot, SessionStatsTracker, SessionSummary,
+};
 pub use tracking_hash::{TrackingHashAlgorithm, TrackingHashContext, TrackingHashScope};
 pub use worker_type::WorkerType;
 

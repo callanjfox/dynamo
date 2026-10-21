@@ -274,9 +274,19 @@ impl CanonicalOutputTracker {
 }
 
 /// Owns request-scoped timing and metrics state.
+/// What a finished request reports to per-session telemetry.
+struct SessionCompletion {
+    stats: Arc<crate::kv_router::session_stats::SessionStatsRuntime>,
+    session_id: String,
+    /// The prefix the router expected the selected worker to reuse.
+    cached_tokens: u64,
+    session_final: bool,
+}
+
 struct RequestObservability {
     tracker: Option<Arc<RequestTracker>>,
     request_metrics: Arc<RouterRequestMetrics>,
+    session: Option<SessionCompletion>,
     cumulative_osl: usize,
     metrics_recorded: bool,
     first_token_recorded: bool,
@@ -292,6 +302,7 @@ impl RequestObservability {
         Self {
             tracker,
             request_metrics,
+            session: None,
             cumulative_osl: 0,
             metrics_recorded: false,
             first_token_recorded: false,
@@ -402,6 +413,14 @@ impl RequestObservability {
                 .observe(self.cumulative_osl as f64);
         }
         self.request_metrics.requests_total.inc();
+        if let Some(session) = self.session.take() {
+            session.stats.on_complete(
+                &session.session_id,
+                self.cumulative_osl as u64,
+                session.cached_tokens,
+                session.session_final,
+            );
+        }
     }
 }
 
@@ -638,6 +657,9 @@ impl RequestGuard {
         if attempt_id.is_some() {
             request_metrics.requests_started_total.inc();
         }
+        let routed_cached_tokens = kv_route
+            .as_ref()
+            .map_or(0, |route| route.selected_router_tokens);
         let kv_hit = kv_route.map(|route| KvHitTracking {
             prompt_tokens: route.prompt_tokens,
             reused_tokens: Some(request_metrics.observe_kv_route_estimate(
@@ -651,9 +673,21 @@ impl RequestGuard {
         let output_hashes = approximate_lru
             .as_ref()
             .map(|_| CanonicalOutputTracker::new(request, block_size as u32, chooser.is_eagle()));
+        let mut observability = RequestObservability::new(request.tracker.clone(), request_metrics);
+        if attempt_id.is_some()
+            && let (Some(stats), Some(agent)) =
+                (chooser.session_stats(), request.agent_context.as_ref())
+        {
+            observability.session = Some(SessionCompletion {
+                stats: Arc::clone(stats),
+                session_id: agent.session_id.clone(),
+                cached_tokens: routed_cached_tokens,
+                session_final: agent.session_final.unwrap_or(false),
+            });
+        }
         Self {
             cleanup: RequestCleanup::Kv(cleanup),
-            observability: RequestObservability::new(request.tracker.clone(), request_metrics),
+            observability,
             output_blocks: OutputBlockTracker::new(
                 track_output_blocks,
                 isl_tokens,

@@ -400,6 +400,58 @@ vLLM, SGLang, and TensorRT-LLM workers report F4 on the final response chunk of 
 - Engines recompute the last prompt token, so a full-prefix hit reports at least one token less than F3, and up to one block less for vLLM.
 - Preemption, partial-block reuse in TensorRT-LLM, and KV loads that fail under a recompute policy can also make F4 differ from F3 when the router's estimate is accurate.
 
+### Session telemetry
+
+Experimental. Names, labels, and units can change in any release, with a release note.
+
+Per-session workload and cache-pressure telemetry for agent traffic. It is off by default and active only with `--enable-session-prefix-index`. It is passive: nothing reads it to place or admit a request. All names start with `dynamo_component_router_`. No label carries a session, tenant, or worker identity; per-session detail is the `session_summary` log event described below.
+
+A session is the chain of requests sharing an `x-dynamo-session-id`. It is active while it has activity inside the active window and has not ended. It ends on a final-turn marker (`x-dynamo-session-final`) or after idling past the TTL.
+
+**Working set and capacity.** Gauges, refreshed by a sweep every 10 seconds.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `sessions_active` | gauge | none | Sessions active now. |
+| `session_demand_tokens` | gauge | none | Sum over active sessions of the prefix each will present next: the prior turn's input plus output. A shared prefix counts once per session, so this overstates distinct demand. |
+| `session_resident_tokens` | gauge | `tier` (`device`, `host`, `disk`) | Distinct tokens the session index holds, counting a shared prefix once. |
+| `session_stranded_tokens` | gauge | `tier` (`device`, `host`) | Distinct tokens held only for inactive sessions. Evictable, but it crowds out active demand when the cache is full. |
+| `sessions_split` | gauge | none | Active sessions whose GPU-resident prefix is on more than one worker. |
+
+Compare `session_resident_tokens` and demand with worker KV capacity from the engine's own metrics. This router does not re-export capacity.
+
+**Thrash.** Counters, exact for the estimate below.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `session_thrash_tokens_total` | counter | `outcome` (`recomputed`, `reloaded_host`, `reloaded_disk`) | Tokens of a returning session's prior prefix that were not on the GPU when the turn arrived. `recomputed` means no tier held them; the reloaded outcomes mean the named tier did. |
+| `session_return_turns_total` | counter | `gap` (`le_1s`, `le_5s`, `le_10s`, `le_30s`, `le_60s`, `le_120s`, `le_300s`, `le_600s`, `le_1800s`, `gt_1800s`), `outcome` (`gpu`, `host`, `disk`, `miss`) | Returning turns by time since the previous turn finished and where the prior prefix was found, to within a tenth of it. Gives the survival curve per tier. |
+
+The prior prefix is estimated as the previous turn's input plus output, capped at this turn's input, against what the session index holds at arrival. It assumes the harness resends its history. Treat it as an estimate: it carries up to one block of rounding per turn.
+
+**Session shape.** Counters and histograms. Histograms are observed once per session, when it ends.
+
+| Metric | Type | Unit |
+| --- | --- | --- |
+| `sessions_started_total` | counter | sessions |
+| `sessions_ended_total` | counter | sessions |
+| `session_turns` | histogram | turns |
+| `session_input_tokens` | histogram | tokens, summed over the session |
+| `session_output_tokens` | histogram | tokens, summed over the session |
+| `session_peak_context_tokens` | histogram | tokens |
+| `session_cache_hit_ratio` | histogram | ratio from 0.0 to 1.0 |
+| `session_duration_seconds` | histogram | seconds |
+| `session_turn_gap_seconds` | histogram | seconds, mean over the session |
+| `session_subagents` | histogram | subagent sessions spawned |
+
+**Series budget.** About 170 series per router process: 8 gauge series, 45 counter series (2 + 3 + 40), and 8 histograms of 11 to 15 series each. Bounded label values are created at startup. When one process hosts several routers, such as a prefill and a decode pool, gauges are last-router-wins and counters and histograms add up.
+
+**Configuration.** `DYN_SESSION_STATS_SWEEP_SECS` (default 10), `DYN_SESSION_STATS_ACTIVE_WINDOW_SECS` (default 300), and `DYN_SESSION_STATS_IDLE_TTL_SECS` (default 1800).
+
+**Per-session log.** When a session ends, the router logs one `session_summary` event at target `dynamo_session_summary` with `session_id`, `parent_session_id`, `turns`, `input_tokens`, `output_tokens`, `cached_tokens`, `cache_hit_ratio`, `duration_ms`, `mean_turn_gap_ms`, `peak_context_tokens`, `subagents`, and the three `thrash_*_tokens` fields. Use it for per-user and per-tenant analysis; it is the exact record the histograms above summarize.
+
+Limits: a request that migrates or retries counts as another turn. A request that sends no session ID is not tracked. A session that never ends and never idles past the TTL is never summarized.
+
 ### Per-request routing overhead
 
 `dynamo_router_overhead_*` histograms (milliseconds) track time spent in each phase of the routing decision. Registered on the frontend port with a `router_id` label (the frontend's discovery instance ID). Created only when the frontend has DRT discovery enabled (`--router-mode kv`); absent in non-KV modes and on the standalone router.
