@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Session observability demo</title>
+<style>
+  :root {
+    color-scheme: light;
+    --page: #f6f5f2;
+    --surface: #fcfcfb;
+    --ink: #0b0b0b;
+    --ink-2: #52514e;
+    --ink-3: #75746f;
+    --grid: #e7e6e2;
+    --line: #d9d8d3;
+    --s1: #2a78d6;
+    --s2: #eb6834;
+    --s3: #1baf7a;
+    --s5: #e87ba4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --page: #121211;
+      --surface: #1a1a19;
+      --ink: #f0efec;
+      --ink-2: #c3c2b7;
+      --ink-3: #94938b;
+      --grid: #2b2b29;
+      --line: #3a3a37;
+      --s1: #3987e5;
+      --s2: #d95926;
+      --s3: #199e70;
+      --s5: #d55181;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #121211;
+    --surface: #1a1a19;
+    --ink: #f0efec;
+    --ink-2: #c3c2b7;
+    --ink-3: #94938b;
+    --grid: #2b2b29;
+    --line: #3a3a37;
+    --s1: #3987e5;
+    --s2: #d95926;
+    --s3: #199e70;
+    --s5: #d55181;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--ink);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 28px 16px 56px; }
+  h1 { font-size: 22px; margin: 0 0 4px; font-weight: 650; }
+  .sub { color: var(--ink-2); margin: 0 0 20px; max-width: 70ch; }
+  .tabs { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 8px; }
+  .tab {
+    appearance: none; cursor: pointer; text-align: left;
+    background: var(--surface); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px;
+    font: inherit;
+  }
+  .tab small { display: block; color: var(--ink-2); }
+  .tab[aria-pressed="true"] { border-color: var(--s1); box-shadow: inset 0 0 0 1px var(--s1); }
+  .blurb { color: var(--ink-2); margin: 0 0 18px; min-height: 2.9em; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-bottom: 18px; }
+  .tile { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .tile .k { color: var(--ink-2); font-size: 12px; }
+  .tile .v { font-size: 26px; font-weight: 650; line-height: 1.2; margin: 2px 0; font-variant-numeric: tabular-nums; }
+  .tile .d { color: var(--ink-2); font-size: 12px; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 14px 10px; margin-bottom: 14px; }
+  .card h2 { font-size: 15px; margin: 0 0 2px; font-weight: 650; }
+  .card p.note { color: var(--ink-2); font-size: 12.5px; margin: 0 0 8px; max-width: 80ch; }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; margin: 4px 0 6px; font-size: 12.5px; color: var(--ink-2); }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+  .legend i.dash { height: 0; width: 16px; border-top: 2px dashed var(--ink-3); border-radius: 0; vertical-align: 3px; }
+  .chart { position: relative; }
+  .chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .tip {
+    position: absolute; pointer-events: none; display: none; z-index: 5;
+    background: var(--surface); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 10px; font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,.18);
+    white-space: nowrap;
+  }
+  .tip b { display: block; margin-bottom: 3px; }
+  .tip div { display: flex; align-items: center; gap: 6px; font-variant-numeric: tabular-nums; }
+  .tip i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .gaprow { display: grid; grid-template-columns: 78px 1fr 78px; align-items: center; gap: 10px; margin: 5px 0; font-size: 12.5px; }
+  .gaprow .lab { color: var(--ink-2); text-align: right; font-variant-numeric: tabular-nums; }
+  .gaprow .n { color: var(--ink-2); font-variant-numeric: tabular-nums; }
+  .gapbar { display: flex; height: 16px; gap: 2px; background: transparent; }
+  .gapbar span { display: block; border-radius: 3px; min-width: 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--ink-2); font-weight: 600; }
+  .scroll { overflow-x: auto; }
+  .foot { color: var(--ink-3); font-size: 12px; margin-top: 18px; max-width: 90ch; }
+  .axis text { fill: var(--ink-3); font-size: 11px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Session observability demo</h1>
+  <p class="sub">A synthetic agent workload replayed through the Dynamo mocker. The router's session index tracks each session; a stats tracker turns that into the working set, thrash and per-session figures below.</p>
+
+  <div class="tabs" id="tabs"></div>
+  <p class="blurb" id="blurb"></p>
+
+  <div class="tiles" id="tiles"></div>
+
+  <div class="card">
+    <h2>Working set against capacity</h2>
+    <p class="note">Demand is the distinct tokens the active sessions will present next. Resident is what each tier holds. A shared prefix is counted once in both.</p>
+    <div class="legend" id="leg1"></div>
+    <div class="chart" id="c1"></div>
+  </div>
+
+  <div class="card">
+    <h2>Thrash: prefix tokens a returning session had to rebuild</h2>
+    <p class="note">Tokens per 30 seconds. Recomputed means the prefix was in no tier. Reloaded means it was only in host memory.</p>
+    <div class="legend" id="leg2"></div>
+    <div class="chart" id="c2"></div>
+  </div>
+
+  <div class="card">
+    <h2>Sessions</h2>
+    <p class="note">Active sessions, and how many have their GPU-resident prefix on more than one worker.</p>
+    <div class="legend" id="leg3"></div>
+    <div class="chart" id="c3"></div>
+  </div>
+
+  <div class="card">
+    <h2>KV held for idle or finished sessions</h2>
+    <p class="note">Distinct GPU tokens that only inactive sessions still reference. This is evictable, so it matters only when it crowds out active demand.</p>
+    <div class="legend" id="leg4"></div>
+    <div class="chart" id="c4"></div>
+  </div>
+
+  <div class="card">
+    <h2>Where a returning session finds its prefix, by time since its last turn</h2>
+    <p class="note">Share of returning turns whose prior prefix was on the GPU, in host memory, or mostly missing (so recomputed), to within a tenth. Long gaps lose the GPU.</p>
+    <div class="legend" id="leg5"></div>
+    <div id="gap"></div>
+  </div>
+
+  <div class="card">
+    <h2>What the sessions look like</h2>
+    <p class="note">Distribution across all sessions in this run, including subagents. Context is the largest prefix a session presented.</p>
+    <div class="scroll" id="dist"></div>
+  </div>
+
+  <div class="card">
+    <h2>Largest sessions</h2>
+    <p class="note">The per-session record the router writes when a session ends. It carries the session ID, so it is a log, not a metric.</p>
+    <div class="scroll" id="top"></div>
+  </div>
+
+  <p class="foot">Synthetic workload, not a customer trace. Time is simulated. Active means the session had activity within 5 minutes and has not ended. Thrash is estimated from the prior turn's input plus output against what the index holds, so it carries up to one block of rounding per turn.</p>
+</div>
+
+<script>
+const DATA = __DATA__;
+const MIN = 60000;
+const $ = (s) => document.querySelector(s);
+const css = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+const fmtTok = (n) => n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n >= 1e3 ? Math.round(n / 1e3) + "k" : String(Math.round(n));
+const fmtNum = (n) => Math.round(n).toLocaleString("en-US");
+const fmtClock = (m) => { const s = Math.round(m * 60); return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); };
+const pct = (x) => (x * 100).toFixed(0) + "%";
+const quantile = (xs, q) => { const a = [...xs].sort((x, y) => x - y); return a.length ? a[Math.min(a.length - 1, Math.floor(q * a.length))] : 0; };
+
+function niceStep(v) {
+  const p = Math.pow(10, Math.floor(Math.log10(v)));
+  for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= v) return m * p;
+  return 10 * p;
+}
+// Round tick spacing and a maximum on a whole number of ticks.
+function scale(v) {
+  if (v <= 0) return { max: 4, step: 1, n: 4 };
+  const step = niceStep(v / 4), n = Math.ceil(v / step - 1e-9);
+  return { max: step * n, step, n };
+}
+
+function legend(el, items) {
+  $(el).innerHTML = items.map((it) =>
+    `<span>${it.dash ? '<i class="dash"></i>' : `<i style="background:var(${it.color})"></i>`}${it.name}</span>`).join("");
+}
+
+function tipEl(host) {
+  let t = host.querySelector(".tip");
+  if (!t) { t = document.createElement("div"); t.className = "tip"; host.appendChild(t); }
+  return t;
+}
+
+function placeTip(host, tip, x, y, html) {
+  tip.innerHTML = html;
+  tip.style.display = "block";
+  const w = tip.offsetWidth, hw = host.clientWidth;
+  tip.style.left = Math.max(0, Math.min(hw - w, x + 12)) + "px";
+  tip.style.top = Math.max(0, y - tip.offsetHeight - 8) + "px";
+}
+
+const M = { l: 54, r: 14, t: 12, b: 26 };
+
+function axes(W, H, xMax, sc, fmtY) {
+  const iw = W - M.l - M.r, ih = H - M.t - M.b;
+  let out = '<g class="axis">';
+  for (let i = 0; i <= sc.n; i++) {
+    const v = sc.step * i, y = M.t + ih - (ih * v) / sc.max;
+    out += `<line x1="${M.l}" x2="${W - M.r}" y1="${y}" y2="${y}" stroke="var(--grid)" stroke-width="1"/>`;
+    out += `<text x="${M.l - 8}" y="${y + 4}" text-anchor="end">${fmtY(v)}</text>`;
+  }
+  const step = xMax > 40 ? 10 : 5;
+  for (let m = 0; m <= xMax; m += step) {
+    const x = M.l + (iw * m) / xMax;
+    out += `<text x="${x}" y="${H - 6}" text-anchor="middle">${m}m</text>`;
+  }
+  return out + "</g>";
+}
+
+function lineChart(host, spec) {
+  host.innerHTML = "";
+  const W = Math.max(320, host.clientWidth), H = 240;
+  const iw = W - M.l - M.r, ih = H - M.t - M.b;
+  const xMax = Math.max(...spec.x);
+  let top = 0;
+  for (const s of spec.series) top = Math.max(top, ...s.values);
+  for (const r of spec.refs || []) top = Math.max(top, r.y);
+  const sc = scale(top * 1.04), yMax = sc.max;
+  const X = (v) => M.l + (iw * v) / xMax;
+  const Y = (v) => M.t + ih - (ih * v) / yMax;
+  let svg = axes(W, H, xMax, sc, spec.fmtY);
+  for (const r of spec.refs || []) {
+    svg += `<line x1="${M.l}" x2="${W - M.r}" y1="${Y(r.y)}" y2="${Y(r.y)}" stroke="var(--ink-3)" stroke-width="1.5" stroke-dasharray="6 4"/>`;
+    svg += `<text x="${W - M.r - 4}" y="${Y(r.y) - 5}" text-anchor="end" style="fill:var(--ink-2);font-size:11px">${r.label}</text>`;
+  }
+  for (const s of spec.series) {
+    const d = s.values.map((v, i) => `${i ? "L" : "M"}${X(spec.x[i]).toFixed(1)},${Y(v).toFixed(1)}`).join("");
+    svg += `<path d="${d}" fill="none" stroke="var(${s.color})" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+  }
+  svg += `<line id="cx" y1="${M.t}" y2="${M.t + ih}" stroke="var(--ink-3)" stroke-width="1" style="display:none"/>`;
+  for (const s of spec.series) svg += `<circle class="dot" r="4" fill="var(${s.color})" stroke="var(--surface)" stroke-width="2" style="display:none"/>`;
+  svg += `<rect x="${M.l}" y="${M.t}" width="${iw}" height="${ih}" fill="transparent" id="hit"/>`;
+  host.insertAdjacentHTML("afterbegin", `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${spec.label}">${svg}</svg>`);
+  const el = host.querySelector("svg"), tip = tipEl(host);
+  const cx = el.querySelector("#cx"), dots = [...el.querySelectorAll(".dot")];
+  const move = (ev) => {
+    const box = el.getBoundingClientRect();
+    const px = ((ev.clientX - box.left) / box.width) * W;
+    const t = ((px - M.l) / iw) * xMax;
+    let lo = 0, hi = spec.x.length - 1;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (spec.x[mid] < t) lo = mid + 1; else hi = mid; }
+    const i = lo > 0 && Math.abs(spec.x[lo - 1] - t) < Math.abs(spec.x[lo] - t) ? lo - 1 : lo;
+    const x = X(spec.x[i]);
+    cx.setAttribute("x1", x); cx.setAttribute("x2", x); cx.style.display = "";
+    spec.series.forEach((s, k) => { dots[k].setAttribute("cx", x); dots[k].setAttribute("cy", Y(s.values[i])); dots[k].style.display = ""; });
+    const rows = spec.series.map((s) => `<div><i style="background:var(${s.color})"></i>${s.name}: ${spec.fmtTip(s.values[i])}</div>`).join("");
+    const refs = (spec.refs || []).map((r) => `<div><i style="background:var(--ink-3)"></i>${r.label}: ${spec.fmtTip(r.y)}</div>`).join("");
+    placeTip(host, tip, (x / W) * host.clientWidth, (Y(Math.max(...spec.series.map((s) => s.values[i]))) / H) * el.getBoundingClientRect().height, `<b>${fmtClock(spec.x[i])} into the run</b>${rows}${refs}`);
+  };
+  const leave = () => { cx.style.display = "none"; dots.forEach((d) => (d.style.display = "none")); tip.style.display = "none"; };
+  el.querySelector("#hit").addEventListener("pointermove", move);
+  el.querySelector("#hit").addEventListener("pointerleave", leave);
+}
+
+function barChart(host, spec) {
+  host.innerHTML = "";
+  const W = Math.max(320, host.clientWidth), H = 220;
+  const iw = W - M.l - M.r, ih = H - M.t - M.b;
+  const n = spec.bins.length;
+  const xMax = spec.xMax;
+  let top = 0;
+  spec.bins.forEach((b) => (top = Math.max(top, b.a + b.b)));
+  const sc = scale(top * 1.04), yMax = sc.max;
+  const Y = (v) => M.t + ih - (ih * v) / yMax;
+  const bw = iw / n;
+  let svg = axes(W, H, xMax, sc, spec.fmtY);
+  spec.bins.forEach((b, i) => {
+    const x = M.l + i * bw + 1;
+    const w = Math.max(1, bw - 2);
+    const yb = Y(b.b), ya = Y(b.a + b.b);
+    if (b.b > 0) svg += `<rect x="${x}" y="${yb}" width="${w}" height="${Math.max(0, M.t + ih - yb)}" fill="var(${spec.colors[1]})" rx="1.5"/>`;
+    if (b.a > 0) svg += `<rect x="${x}" y="${ya}" width="${w}" height="${Math.max(0, yb - ya - (b.b > 0 ? 1 : 0))}" fill="var(${spec.colors[0]})" rx="1.5"/>`;
+  });
+  svg += `<rect x="${M.l}" y="${M.t}" width="${iw}" height="${ih}" fill="transparent" id="hit"/>`;
+  host.insertAdjacentHTML("afterbegin", `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${spec.label}">${svg}</svg>`);
+  const el = host.querySelector("svg"), tip = tipEl(host);
+  const hit = el.querySelector("#hit");
+  hit.addEventListener("pointermove", (ev) => {
+    const box = el.getBoundingClientRect();
+    const px = ((ev.clientX - box.left) / box.width) * W;
+    const i = Math.max(0, Math.min(n - 1, Math.floor((px - M.l) / bw)));
+    const b = spec.bins[i];
+    placeTip(host, tip, (px / W) * host.clientWidth, (Y(b.a + b.b) / H) * box.height,
+      `<b>${fmtClock(b.t0)} to ${fmtClock(b.t1)}</b><div><i style="background:var(${spec.colors[0]})"></i>${spec.names[0]}: ${fmtNum(b.a)}</div><div><i style="background:var(${spec.colors[1]})"></i>${spec.names[1]}: ${fmtNum(b.b)}</div>`);
+  });
+  hit.addEventListener("pointerleave", () => (tip.style.display = "none"));
+}
+
+function render(idx) {
+  const run = DATA[idx];
+  const rows = run.rows;
+  const t = rows.map((r) => r.now_ms / MIN);
+  const capDev = rows[0].capacity_device_tokens, capHost = rows[0].capacity_host_tokens;
+  const demand = rows.map((r) => r.demand_distinct_tokens);
+  const gpu = rows.map((r) => r.distinct_device_tokens);
+  const host = rows.map((r) => r.distinct_host_tokens);
+  const last = rows[rows.length - 1];
+  const sess = run.sessions;
+
+  document.querySelectorAll(".tab").forEach((b, i) => b.setAttribute("aria-pressed", String(i === idx)));
+  $("#blurb").textContent = run.blurb;
+
+  const peak = Math.max(...demand);
+  const th = last.thrash, thTotal = th.recomputed + th.reloaded_host + th.reloaded_disk;
+  const isl = sess.reduce((a, s) => a + s.isl_tokens, 0), cached = sess.reduce((a, s) => a + s.cached_tokens, 0);
+  const subs = sess.filter((s) => s.parent_session_id).length;
+  const split = Math.max(...rows.map((r) => r.split_sessions));
+  const tile = (k, v, d) => `<div class="tile"><div class="k">${k}</div><div class="v">${v}</div><div class="d">${d}</div></div>`;
+  $("#tiles").innerHTML =
+    tile("Peak working set vs GPU capacity", (peak / capDev).toFixed(2) + "×", `${fmtTok(peak)} needed, ${fmtTok(capDev)} of GPU cache`) +
+    tile("Thrash (tokens)", fmtTok(thTotal), `${fmtTok(th.recomputed)} recomputed, ${fmtTok(th.reloaded_host + th.reloaded_disk)} reloaded`) +
+    tile("Prefix reuse", pct(isl ? cached / isl : 0), `${fmtTok(cached)} of ${fmtTok(isl)} input tokens served from cache`) +
+    tile("Sessions", String(sess.length), `${subs} are subagents`) +
+    tile("Peak sessions split across workers", String(split), "GPU prefix on more than one worker");
+
+  // 1. working set vs capacity
+  const s1 = [
+    { name: "Demand (active sessions)", color: "--s1", values: demand },
+    { name: "GPU resident", color: "--s2", values: gpu },
+  ];
+  const refs = [{ y: capDev, label: "GPU capacity " + fmtTok(capDev) }];
+  if (capHost > 0) {
+    s1.push({ name: "Host resident", color: "--s3", values: host });
+    refs.push({ y: capDev + capHost, label: "GPU + host capacity " + fmtTok(capDev + capHost) });
+  }
+  legend("#leg1", [...s1, { name: "Capacity", dash: true }]);
+  lineChart($("#c1"), { x: t, series: s1, refs, fmtY: fmtTok, fmtTip: fmtTok, label: "Working set against capacity" });
+
+  // 2. thrash per 30s
+  const binMin = 0.5, xMax = Math.max(...t);
+  const nb = Math.ceil(xMax / binMin);
+  const bins = Array.from({ length: nb }, (_, i) => ({ t0: i * binMin, t1: (i + 1) * binMin, a: 0, b: 0 }));
+  let prev = { recomputed: 0, reloaded_host: 0, reloaded_disk: 0 };
+  rows.forEach((r, i) => {
+    const bi = Math.min(nb - 1, Math.floor(t[i] / binMin));
+    bins[bi].a += r.thrash.recomputed - prev.recomputed;
+    bins[bi].b += r.thrash.reloaded_host + r.thrash.reloaded_disk - prev.reloaded_host - prev.reloaded_disk;
+    prev = r.thrash;
+  });
+  legend("#leg2", [{ name: "Recomputed", color: "--s2" }, { name: "Reloaded from host", color: "--s3" }]);
+  barChart($("#c2"), { bins, xMax, colors: ["--s2", "--s3"], names: ["Recomputed", "Reloaded from host"], fmtY: fmtTok, label: "Thrash per 30 seconds" });
+
+  // 3. sessions
+  legend("#leg3", [{ name: "Active sessions", color: "--s1" }, { name: "Split across workers", color: "--s5" }]);
+  lineChart($("#c3"), {
+    x: t,
+    series: [
+      { name: "Active sessions", color: "--s1", values: rows.map((r) => r.active_sessions) },
+      { name: "Split across workers", color: "--s5", values: rows.map((r) => r.split_sessions) },
+    ],
+    fmtY: (v) => String(Math.round(v)), fmtTip: (v) => String(Math.round(v)), label: "Active and split sessions",
+  });
+
+  // 4. stranded
+  legend("#leg4", [{ name: "Held for inactive sessions", color: "--s2" }, { name: "Capacity", dash: true }]);
+  lineChart($("#c4"), {
+    x: t,
+    series: [{ name: "Held for inactive sessions", color: "--s2", values: rows.map((r) => r.stranded_device_tokens) }],
+    refs: [{ y: capDev, label: "GPU capacity " + fmtTok(capDev) }],
+    fmtY: fmtTok, fmtTip: fmtTok, label: "KV held for inactive sessions",
+  });
+
+  // 5. gap outcomes
+  const edges = ["1s", "5s", "10s", "30s", "1m", "2m", "5m", "10m", "30m", "over 30m"];
+  legend("#leg5", [{ name: "Prefix on GPU", color: "--s1" }, ...(capHost > 0 ? [{ name: "Prefix in host memory", color: "--s3" }] : []), { name: "Mostly recomputed", color: "--s2" }]);
+  $("#gap").innerHTML = last.gap_outcomes.map((g, i) => {
+    const n = g[0] + g[1] + g[2] + g[3];
+    if (!n) return "";
+    const seg = (v, c, name) => v ? `<span title="${name}: ${v} of ${n}" style="width:${(v / n) * 100}%;background:var(${c})"></span>` : "";
+    return `<div class="gaprow"><div class="lab">${i < 9 ? "up to " : ""}${edges[i]}</div><div class="gapbar">${seg(g[0], "--s1", "GPU")}${seg(g[1] + g[2], "--s3", "Host or disk")}${seg(g[3], "--s2", "Mostly recomputed")}</div><div class="n">${fmtNum(n)} turns</div></div>`;
+  }).join("");
+
+  // distribution + table
+  const dur = sess.map((s) => s.duration_ms / MIN);
+  const dist = [
+    ["Turns", sess.map((s) => s.turns), (v) => String(Math.round(v))],
+    ["Context (tokens)", sess.map((s) => s.peak_demand_tokens), fmtTok],
+    ["Output (tokens)", sess.map((s) => s.osl_tokens), fmtTok],
+    ["Cache hit rate", sess.map((s) => s.hit_rate), pct],
+    ["Duration (min)", dur, (v) => v.toFixed(1)],
+    ["Mean gap between turns (s)", sess.map((s) => s.mean_turn_gap_ms / 1000), (v) => v.toFixed(1)],
+    ["Subagents spawned", sess.map((s) => s.children), (v) => String(Math.round(v))],
+  ];
+  $("#dist").innerHTML = `<table><thead><tr><th>Per session</th><th>p50</th><th>p90</th><th>max</th></tr></thead><tbody>` +
+    dist.map(([k, xs, f]) => `<tr><td>${k}</td><td>${f(quantile(xs, 0.5))}</td><td>${f(quantile(xs, 0.9))}</td><td>${f(Math.max(...xs))}</td></tr>`).join("") + `</tbody></table>`;
+  const top = [...sess].sort((a, b) => b.peak_demand_tokens - a.peak_demand_tokens).slice(0, 12);
+  $("#top").innerHTML = `<table><thead><tr><th>Session</th><th>Parent</th><th>Turns</th><th>Input tokens</th><th>Context</th><th>Hit rate</th><th>Subagents</th><th>Thrash tokens</th></tr></thead><tbody>` +
+    top.map((s) => `<tr><td>${s.session_id}</td><td>${s.parent_session_id || "-"}</td><td>${s.turns}</td><td>${fmtTok(s.isl_tokens)}</td><td>${fmtTok(s.peak_demand_tokens)}</td><td>${pct(s.hit_rate)}</td><td>${s.children}</td><td>${fmtTok(s.thrash.recomputed + s.thrash.reloaded_host + s.thrash.reloaded_disk)}</td></tr>`).join("") + `</tbody></table>`;
+}
+
+let current = Number(new URLSearchParams(location.search).get("run") || 1);
+$("#tabs").innerHTML = DATA.map((d, i) => `<button class="tab" data-i="${i}" aria-pressed="false">${d.label}<small>${d.detail}</small></button>`).join("");
+$("#tabs").addEventListener("click", (e) => { const b = e.target.closest(".tab"); if (b) { current = Number(b.dataset.i); render(current); } });
+let timer;
+addEventListener("resize", () => { clearTimeout(timer); timer = setTimeout(() => render(current), 120); });
+render(current);
+</script>
+</body>
+</html>
