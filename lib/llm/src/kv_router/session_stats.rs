@@ -457,7 +457,7 @@ mod tests {
         assert_eq!(
             metrics
                 .return_turns_total
-                .with_label_values(&["le_1s", "miss"])
+                .with_label_values(&["le_1m", "miss"])
                 .get(),
             1
         );
@@ -485,7 +485,7 @@ mod tests {
         assert_eq!(
             metrics
                 .return_turns_total
-                .with_label_values(&["le_1s", "gpu"])
+                .with_label_values(&["le_1m", "gpu"])
                 .get(),
             1
         );

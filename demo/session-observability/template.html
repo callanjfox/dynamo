@@ -105,6 +105,7 @@
   .hists { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 8px 24px; }
   .hist h3 { font-size: 13px; margin: 6px 0 2px; color: var(--ink-2); font-weight: 600; }
   .hist .gaprow { grid-template-columns: 78px 1fr 34px; }
+  .newpill { display: inline-block; margin-left: 8px; padding: 1px 7px; border-radius: 999px; background: var(--s1); color: #fff; font-size: 10.5px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; vertical-align: 2px; }
   .nav { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 0 0 18px; font-size: 13px; }
   .nav a { color: var(--s1); text-decoration: none; }
   .nav a:hover { text-decoration: underline; }
@@ -131,7 +132,7 @@
   <p class="section-note">What the workload looks like: how many turns a session runs, how large its prompts and outputs are, how fast its context grows, and how much it fans out into subagents.</p>
   <div class="tiles small" id="stiles"></div>
   <div class="card">
-    <h2>Shape of the sessions</h2>
+    <h2>Shape of the sessions<span class="newpill" title="Metrics added in this work">new</span></h2>
     <p class="note">Number of sessions in each range, including subagents: turns, input and output tokens per turn, and the mean time a primary session waits between turns.</p>
     <div class="hists" id="hists"></div>
   </div>
@@ -147,49 +148,49 @@
   <div class="tiles" id="tiles"></div>
 
   <div class="card">
-    <h2>Working set against capacity</h2>
+    <h2>Working set against capacity<span class="newpill" title="Metrics added in this work">new</span></h2>
     <p class="note" id="note1">Demand is the distinct tokens the active sessions will present next. Resident is what each tier holds. A shared prefix is counted once in both.</p>
     <div class="legend" id="leg1"></div>
     <div class="chart" id="c1"></div>
   </div>
 
   <div class="card">
-    <h2>Thrash: prefix tokens a returning session had to rebuild</h2>
+    <h2>Thrash: prefix tokens a returning session had to rebuild<span class="newpill" title="Metrics added in this work">new</span></h2>
     <p class="note">Tokens per 30 seconds. Recomputed means the prefix was in no tier. Reloaded means it was only in host memory. This is an estimate, not a worker measurement: when a returning turn arrives the router takes the previous turn's input plus output as the prefix the session should find, and subtracts what the session index says each tier still holds for that session. The worker-reported reuse (funnel step F4) would be the measured counterpart; the mock workers do not report it.</p>
     <div class="legend" id="leg2"></div>
     <div class="chart" id="c2"></div>
   </div>
 
   <div class="card">
-    <h2>Active sessions</h2>
+    <h2>Active sessions<span class="newpill" title="Metrics added in this work">new</span></h2>
     <p class="note">Sessions active inside the window, split into primary sessions and the subagents they spawn.</p>
     <div class="legend" id="leg3"></div>
     <div class="chart" id="c3"></div>
   </div>
 
   <div class="card" id="card-role">
-    <h2>Primary sessions and subagents</h2>
+    <h2>Primary sessions and subagents<span class="newpill" title="Metrics added in this work">new</span></h2>
     <p class="note">The distinct working set split by role. A subagent counts only the blocks its primary sessions do not already hold, so its line is the capacity subagents add on top of the sessions that spawned them.</p>
     <div class="legend" id="leg16"></div>
     <div class="chart" id="c16"></div>
   </div>
 
   <div class="card" id="card-decay">
-    <h2>Demand if idle sessions decay</h2>
+    <h2>Demand if idle sessions decay<span class="newpill" title="Metrics added in this work">new</span></h2>
     <p class="note">The same per-session demand counting only sessions active within each window, against the router's active window. A session quiet for minutes may or may not return; the gap between these lines is demand that depends on that bet. The return-gap panel below shows how often sessions do come back.</p>
     <div class="legend" id="leg17"></div>
     <div class="chart" id="c17"></div>
   </div>
 
   <div class="card">
-    <h2>KV held for idle or finished sessions</h2>
+    <h2>KV held for idle or finished sessions<span class="newpill" title="Metrics added in this work">new</span></h2>
     <p class="note">Distinct GPU tokens that only inactive sessions still reference. This is evictable, so it matters only when it crowds out active demand.</p>
     <div class="legend" id="leg4"></div>
     <div class="chart" id="c4"></div>
   </div>
 
   <div class="card" id="card-cov">
-    <h2>Agent traffic against the rest</h2>
+    <h2>Agent traffic against the rest<span class="newpill" title="Metrics added in this work">new</span></h2>
     <p class="note">Input and output tokens per second (60 second window) from requests that carried a session ID, stacked on those that did not. Everything else on this page describes only the session share. Requests without an ID are routed as usual but are not tracked. The partial coverage run sends 30% of its sessions without headers.</p>
     <div class="legend" id="leg8"></div>
     <div class="chart" id="c8"></div>
@@ -200,21 +201,21 @@
   </div>
 
   <div class="card" id="card-repl">
-    <h2>Duplication factor</h2>
+    <h2>Duplication factor<span class="newpill" title="Metrics added in this work">new</span></h2>
     <p class="note">Copies of the cache across workers, within one tier. 1x means each prefix block is held on one worker; 1.2x on the GPU line means the GPUs together hold 20% more blocks than there are distinct blocks, because some blocks sit on more than one worker. The host line is the same for host memory. It says nothing about whether host memory repeats what is on the GPU: the stacked chart above separates that when the run reports the overlap.</p>
     <div class="legend" id="leg6"></div>
     <div class="chart" id="c6"></div>
   </div>
 
   <div class="card" id="card-shared">
-    <h2>Shared prefix across sessions</h2>
+    <h2>Shared prefix across sessions<span class="newpill" title="Metrics added in this work">new</span></h2>
     <p class="note">Prompt tokens that more than one active session presents, such as a system prompt, a repository summary, or a subagent starting from its parent's context. The per-session demand sum counts them each time; the distinct demand counts them once. In the AgentX corpus the sharing is small: sessions share nothing with each other, and a subagent's context is small next to its parent's, so the spikes are subagents starting. Traces with a common system prompt or repository would show much more.</p>
     <div class="legend" id="leg18"></div>
     <div class="chart" id="c18"></div>
   </div>
 
   <div class="card" id="card-worker">
-    <h2>Load across workers</h2>
+    <h2>Load across workers<span class="newpill" title="Metrics added in this work">new</span></h2>
     <p class="note">Distinct demand homed on the busiest, the least busy and the mean worker, against what one worker can hold. A shared block counts once per worker. Fleet totals can look fine while a few workers carry most sessions and spill past their own GPU and host memory. A session is homed on the worker that served its last turn.</p>
     <div class="legend" id="leg19"></div>
     <div class="chart" id="c19"></div>
@@ -229,7 +230,7 @@
   </div>
 
   <div class="card" id="card-select">
-    <h2>Routing decisions</h2>
+    <h2>Routing decisions<span class="newpill" title="Added in this work">new: candidate inputs</span></h2>
     <div id="sel-why">
       <p class="note">Why the router picked the worker it did, from its per-candidate trace (router_selection records), per 60 second window. The router scores each worker on the cache it would reuse and on the load already there, and picks the lowest cost. The first chart splits decisions by how the pick related to cache; the second, for the decisions that left the worker with the most cached tokens, compares the cache given up with the load avoided. When the load avoided is as large as the cache given up, the router did what you would expect: it traded a cache hit for a less busy worker.</p>
       <div class="legend" id="leg22"></div>
@@ -245,7 +246,7 @@
   </div>
 
   <div class="card" id="card-funnel">
-    <h2>Cache reuse funnel</h2>
+    <h2>Cache reuse funnel<span class="newpill" title="Added in this work">new session-history line</span></h2>
     <p class="note">Share of prompt tokens at each step in each 60 second window. The session-history line is what the session index says a returning session could reuse if nothing had been evicted (covered traffic only, and only the part that is a returning session's own prior prefix). F2 is the prefix the router estimates is cached on the best eligible worker. F3 is the same on the worker it chose. F4 is what the worker reports reusing. The table has the cumulative totals.</p>
     <div class="legend" id="leg7"></div>
     <div class="chart" id="c7"></div>
@@ -253,14 +254,14 @@
   </div>
 
   <div class="card">
-    <h2>Where a returning session finds its prefix, by time since its last turn</h2>
-    <p class="note">Share of returning turns whose prior prefix was on the GPU, in host memory, or mostly missing (so recomputed), to within a tenth. A turn is counted when its request arrives, by the time since that session's previous turn finished: a session that waits ten minutes lands in "over 5 min" when it comes back, and one that never returns is never counted. Long gaps lose the GPU.</p>
+    <h2>Where a returning session finds its prefix, by time since its last turn<span class="newpill" title="Metrics added in this work">new</span></h2>
+    <p class="note">Share of returning turns whose prior prefix was on the GPU, in host memory, or mostly missing (so recomputed), to within a tenth. A turn is counted when its request arrives, by the time since that session's previous turn finished: a session that waits ten minutes lands in "5 to 15 min" when it comes back, and one that never returns is never counted. The buckets (1, 5 and 15 minutes) are the same windows the decay chart uses. Long gaps lose the GPU.</p>
     <div class="legend" id="leg5"></div>
     <div id="gap"></div>
   </div>
 
   <div class="card">
-    <h2>What the sessions look like</h2>
+    <h2>What the sessions look like<span class="newpill" title="Metrics added in this work">new</span></h2>
     <p class="note">Distribution across all sessions in this run, including subagents. Context is the largest prefix a session presented.</p>
     <div class="scroll" id="dist"></div>
   </div>
@@ -327,6 +328,9 @@ const fmtNum = (n) => Math.round(n).toLocaleString("en-US");
 const fmtClock = (m) => { const s = Math.round(m * 60); return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); };
 const pct = (x) => (x * 100).toFixed(0) + "%";
 const windowStart = (rows, i, ms) => { let j = i; while (j > 0 && rows[i].now_ms - rows[j].now_ms < ms) j--; return j; };
+// Metrics added in this work; the funnel counters and the frontend and worker series already exist in Dynamo.
+const NEW_GROUPS = new Set(["Working set", "Load across workers", "Thrash and returns", "Coverage", "Per-session shape (observed when a session ends)"]);
+const NEW_ROWS = new Set(["router_selection trace record"]);
 const meta_workers = (run) => run.workers || 4;
 const median = (xs) => quantile(xs, 0.5);
 const REF = [
@@ -337,7 +341,7 @@ const REF = [
     ["session_demand_distinct_tokens", "gauge", "The same demand counting each distinct prompt block once: the working set a cache must hold."],
     ["session_demand_by_role_tokens{role}", "gauge", "Distinct demand split by role. A subagent counts only the blocks its primaries do not cover."],
     ["session_shared_tokens", "gauge", "Prompt tokens referenced by more than one active session."],
-    ["session_demand_window_tokens{window}", "gauge", "Per-session demand counting only sessions active in the last 1 m, 5 m or 30 m: demand with idle sessions decayed. Not de-duplicated."],
+    ["session_demand_window_tokens{window}", "gauge", "Per-session demand counting only sessions active in the last 1 m, 5 m or 15 m (the same windows as the return gaps): demand with idle sessions decayed. Not de-duplicated."],
     ["session_tier_overlap_tokens", "gauge", "Tokens held in both the GPU and host tier of a worker, summed over workers: how much host memory is a copy of GPU memory."],
     ["session_resident_tokens{tier}", "gauge", "Distinct tokens the session index holds in each tier (device, host, disk)."],
     ["session_stranded_tokens{tier}", "gauge", "Tokens held only for inactive sessions (device, host): cache held but not needed."],
@@ -353,7 +357,7 @@ const REF = [
   ]],
   ["Thrash and returns", [
     ["session_thrash_tokens_total{outcome}", "counter", "Prior-prefix tokens a returning session had to recompute, or reload from host or disk. Recomputed is the cost of running out of cache."],
-    ["session_return_turns_total{gap,outcome}", "counter", "Returning turns by time since the previous turn (10 buckets, shown here as 30 s, 1 m, 5 m and longer) and where the prior prefix was found (gpu, host, disk, miss)."],
+    ["session_return_turns_total{gap,outcome}", "counter", "Returning turns by time since the previous turn (up to 1 m, 5 m, 15 m, or over) and where the prior prefix was found (gpu, host, disk, miss)."],
     ["session_prior_prefix_tokens_total", "counter", "Prefix tokens returning sessions could reuse if nothing had been evicted. The session-history line in the funnel."],
     ["session_covered_output_tokens_total", "counter", "Output tokens of requests that carried a session ID. With the frontend output total it gives the output from requests without one."],
   ]],
@@ -658,8 +662,8 @@ function render(idx) {
     fmtY: fmtTok, fmtTip: fmtTok, label: "KV held for inactive sessions",
   });
 
-  // 5. gap outcomes, bucketed to 30 s, 1 min, 5 min and longer
-  const groups = [["up to 30 s", [0, 1, 2, 3]], ["30 s to 1 min", [4]], ["1 to 5 min", [5, 6]], ["over 5 min", [7, 8, 9]]];
+  // 5. gap outcomes, in the same 1, 5 and 15 minute windows as the demand gauges
+  const groups = [["up to 1 min", [0]], ["1 to 5 min", [1]], ["5 to 15 min", [2]], ["over 15 min", [3]]];
   legend("#leg5", [{ name: "Prefix on GPU", color: "--s1" }, ...(capHost > 0 ? [{ name: "Prefix in host memory", color: "--s3" }] : []), { name: "Mostly recomputed", color: "--s2" }]);
   $("#gap").innerHTML = groups.map(([label, idxs]) => {
     const g = [0, 1, 2, 3].map((k) => idxs.reduce((a, i) => a + last.gap_outcomes[i][k], 0));
@@ -728,8 +732,8 @@ function render(idx) {
     const sw = [
       { name: "Busiest worker", color: "--s2", values: wr.map((w) => v(w, "demand_max")) },
       { name: "Mean worker", color: "--s1", values: wr.map((w) => v(w, "demand_mean")) },
-      { name: "Least busy worker", color: "--s3", values: wr.map((w) => v(w, "demand_min")) },
     ];
+    if (wr.some((w) => w.demand_min != null)) sw.push({ name: "Least busy worker", color: "--s3", values: wr.map((w) => v(w, "demand_min")) });
     const wrefs = [{ y: perGpu, label: "one worker's GPU " + fmtTok(perGpu) }];
     if (capHost > 0) wrefs.push({ y: perAll, label: "one worker's GPU + host " + fmtTok(perAll) });
     legend("#leg19", [...sw, { name: "Per-worker capacity", dash: true }]);
@@ -926,7 +930,7 @@ function render(idx) {
   }
 
   $("#ref").innerHTML = `<table class="reftable"><thead><tr><th>Metric</th><th>Type</th><th>What it tells you</th></tr></thead><tbody>` +
-    REF.map(([group, ms]) => `<tr><td colspan="3"><b>${group}</b></td></tr>` + ms.map(([n, ty, d]) => `<tr><td>${n}</td><td>${ty}</td><td>${d}</td></tr>`).join("")).join("") + `</tbody></table>`;
+    REF.map(([group, ms]) => `<tr><td colspan="3"><b>${group}</b>${NEW_GROUPS.has(group) ? '<span class="newpill">new</span>' : ""}</td></tr>` + ms.map(([n, ty, d]) => `<tr><td>${n}${NEW_GROUPS.has(group) || NEW_ROWS.has(n) ? '<span class="newpill">new</span>' : ""}</td><td>${ty}</td><td>${d}</td></tr>`).join("")).join("") + `</tbody></table>`;
 }
 
 let current = Number(new URLSearchParams(location.search).get("run") ?? DATA.findIndex((d) => d.key === "__DEFAULT__"));

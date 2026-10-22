@@ -26,18 +26,13 @@ use serde::Serialize;
 use crate::protocols::WorkerWithDpRank;
 use crate::session_prefix_index::{ResidencySnapshot, SessionId, TierBlocks};
 
-/// Upper edges of the turn-gap buckets, in milliseconds. A gap above the last edge
-/// falls in the overflow bucket.
-pub const GAP_BUCKET_EDGES_MS: [u64; 9] = [
-    1_000, 5_000, 10_000, 30_000, 60_000, 120_000, 300_000, 600_000, 1_800_000,
-];
+/// Upper edges of the turn-gap buckets, in milliseconds: the same 1, 5 and 15 minute
+/// windows the demand gauges use. A gap above the last edge falls in the overflow bucket.
+pub const GAP_BUCKET_EDGES_MS: [u64; 3] = [60_000, 300_000, 900_000];
 const GAP_BUCKETS: usize = GAP_BUCKET_EDGES_MS.len() + 1;
 
 /// Metric-label names for the turn-gap buckets, in bucket order.
-pub const GAP_BUCKET_LABELS: [&str; GAP_BUCKETS] = [
-    "le_1s", "le_5s", "le_10s", "le_30s", "le_60s", "le_120s", "le_300s", "le_600s", "le_1800s",
-    "gt_1800s",
-];
+pub const GAP_BUCKET_LABELS: [&str; GAP_BUCKETS] = ["le_1m", "le_5m", "le_15m", "gt_15m"];
 
 /// Index of the turn-gap bucket a gap falls in.
 pub fn gap_bucket(gap_ms: u64) -> usize {
@@ -212,7 +207,7 @@ pub struct SessionStatsSnapshot {
 
 /// Windows over which demand is also reported, so a session idle longer than the
 /// window stops counting. The configured active window is separate.
-pub const DEMAND_WINDOWS_MS: [u64; 3] = [60_000, 300_000, 1_800_000];
+pub const DEMAND_WINDOWS_MS: [u64; 3] = [60_000, 300_000, 900_000];
 
 #[derive(Debug)]
 struct Stat {
@@ -876,18 +871,19 @@ mod tests {
         tracker.on_complete("s", 0, 0, 0);
         tracker.on_arrival("s", None, 800, blocks(50, 0, 0), 3_000);
         let snapshot = tracker.snapshot(&ResidencySnapshot::default(), 3_000);
-        // 3s falls in the (1s, 5s] bucket, outcome device.
-        assert_eq!(snapshot.gap_outcomes[1][0], 1);
+        // 3s falls in the first bucket (up to 1 minute), outcome device.
+        assert_eq!(snapshot.gap_outcomes[0][0], 1);
         assert_eq!(snapshot.gap_outcomes.len(), GAP_BUCKET_EDGES_MS.len() + 1);
     }
 
     #[test]
     fn gap_buckets_include_their_upper_edge() {
         assert_eq!(gap_bucket(0), 0);
-        assert_eq!(gap_bucket(1_000), 0);
-        assert_eq!(gap_bucket(1_001), 1);
-        assert_eq!(gap_bucket(1_800_000), 8);
-        assert_eq!(gap_bucket(1_800_001), 9);
+        assert_eq!(gap_bucket(60_000), 0);
+        assert_eq!(gap_bucket(60_001), 1);
+        assert_eq!(gap_bucket(300_000), 1);
+        assert_eq!(gap_bucket(900_000), 2);
+        assert_eq!(gap_bucket(900_001), 3);
         assert_eq!(GAP_BUCKET_LABELS.len(), GAP_BUCKET_EDGES_MS.len() + 1);
     }
 

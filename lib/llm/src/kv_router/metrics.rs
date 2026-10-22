@@ -1613,7 +1613,7 @@ mod tests {
             "router_session_shared_tokens 0",
             "router_session_demand_by_role_tokens{role=\"subagent\"} 0",
             "router_sessions_active_by_role{role=\"primary\"} 0",
-            "router_session_demand_window_tokens{window=\"30m\"} 0",
+            "router_session_demand_window_tokens{window=\"15m\"} 0",
             "router_session_worker_resident_tokens{stat=\"max\",tier=\"host\"} 0",
             "router_session_worker_demand_tokens{stat=\"mean\"} 0",
             "router_session_worker_demand_ratio{stat=\"max\"} 0",
@@ -1624,8 +1624,8 @@ mod tests {
             "router_session_coverage_requests_total{coverage=\"uncovered\"} 0",
             "router_session_coverage_input_tokens_total{coverage=\"covered\"} 0",
             "router_session_thrash_tokens_total{outcome=\"reloaded_host\"} 0",
-            "router_session_return_turns_total{gap=\"le_30s\",outcome=\"miss\"} 0",
-            "router_session_return_turns_total{gap=\"gt_1800s\",outcome=\"gpu\"} 0",
+            "router_session_return_turns_total{gap=\"le_5m\",outcome=\"miss\"} 0",
+            "router_session_return_turns_total{gap=\"gt_15m\",outcome=\"gpu\"} 0",
             "router_session_cache_hit_ratio_count 0",
         ] {
             assert!(output.contains(series), "missing {series}\n{output}");

@@ -37,7 +37,11 @@ SCENARIOS = [
 ]
 
 
-GAP_LABELS = ["le_1s", "le_5s", "le_10s", "le_30s", "le_60s", "le_120s", "le_300s", "le_600s", "le_1800s", "gt_1800s"]
+# Return-gap buckets: up to 1 minute, 1 to 5, 5 to 15, over 15. Earlier runs used ten finer buckets.
+GAP_LABELS = ["le_1m", "le_5m", "le_15m", "gt_15m"]
+OLD_GAP_LABELS = ["le_1s", "le_5s", "le_10s", "le_30s", "le_60s", "le_120s", "le_300s", "le_600s", "le_1800s", "gt_1800s"]
+# Which old bucket feeds which new one. The 10 to 30 minute bucket straddles 15 minutes and goes to "over".
+OLD_GAP_TO_NEW = [0, 0, 0, 0, 0, 1, 1, 2, 3, 3]
 OUTCOMES = ["gpu", "host", "disk", "miss"]
 
 
@@ -68,6 +72,22 @@ def percentiles(xs):
     xs = sorted(xs)
     pick = lambda q: xs[min(len(xs) - 1, int(q * len(xs)))] if xs else 0
     return {"p50": pick(0.5), "p90": pick(0.9), "max": xs[-1] if xs else 0}
+
+
+def opt(m, key, cast=int):
+    """The series' value, or None when the router that produced the run did not export it."""
+    return cast(m[key]) if key in m else None
+
+
+def gap_outcomes(m):
+    """Returning turns by gap bucket (rows) and outcome (columns), in the current four buckets."""
+    if any(k.startswith("session_return_turns_total{gap=le_1m") for k in m):
+        return [[int(m.get(f"session_return_turns_total{{gap={gap},outcome={outcome}}}", 0)) for outcome in OUTCOMES] for gap in GAP_LABELS]
+    out = [[0] * len(OUTCOMES) for _ in GAP_LABELS]
+    for old, new in zip(OLD_GAP_LABELS, OLD_GAP_TO_NEW):
+        for k, outcome in enumerate(OUTCOMES):
+            out[new][k] += int(m.get(f"session_return_turns_total{{gap={old},outcome={outcome}}}", 0))
+    return out
 
 
 def sum_prefix(m, prefix):
@@ -142,7 +162,13 @@ def live_run(directory):
     capacity = meta["workers"] * meta["num_gpu_blocks"] * meta["block_size"]
     capacity_host = meta["workers"] * meta.get("num_host_blocks", 0) * meta["block_size"]
     # Runs before the window change report 30s, 1m and 5m; later ones 1m, 5m and 30m.
-    window_labels = ("1m", "5m", "30m") if any("session_demand_window_tokens{window=30m}" in sc["m"] for sc in scrapes[-5:]) else ("30s", "1m", "5m")
+    last_keys = set().union(*(sc["m"].keys() for sc in scrapes[-5:]))
+    if "session_demand_window_tokens{window=15m}" in last_keys:
+        window_labels = ("1m", "5m", "15m")
+    elif "session_demand_window_tokens{window=30m}" in last_keys:
+        window_labels = ("1m", "5m", "30m")
+    else:
+        window_labels = ("30s", "1m", "5m")
     meta["window_labels"] = list(window_labels)
     rows, hists = [], []
     for scrape in scrapes:
@@ -161,14 +187,10 @@ def live_run(directory):
             "shared_tokens": g("session_shared_tokens"),
             "demand_windows": [g(f"session_demand_window_tokens{{window={w}}}") for w in window_labels],
             "worker": {
-                "demand_max": g("session_worker_demand_tokens{stat=max}"),
-                "demand_min": g("session_worker_demand_tokens{stat=min}"),
-                "demand_mean": g("session_worker_demand_tokens{stat=mean}"),
-                "ratio_max": float(m.get("session_worker_demand_ratio{stat=max}", 0)),
-                "ratio_min": float(m.get("session_worker_demand_ratio{stat=min}", 0)),
-                "ratio_mean": float(m.get("session_worker_demand_ratio{stat=mean}", 0)),
-                **{f"resident_{stat}_{tier}": g(f"session_worker_resident_tokens{{stat={stat},tier={tier}}}") for stat in ("max", "min", "mean") for tier in ("device", "host")},
-                **{f"left_{stat}_{tier}": g(f"session_worker_left_behind_tokens{{stat={stat},tier={tier}}}") for stat in ("max", "min", "mean") for tier in ("device", "host")},
+                **{f"demand_{stat}": opt(m, f"session_worker_demand_tokens{{stat={stat}}}") for stat in ("max", "min", "mean")},
+                **{f"ratio_{stat}": opt(m, f"session_worker_demand_ratio{{stat={stat}}}", float) for stat in ("max", "min", "mean")},
+                **{f"resident_{stat}_{tier}": opt(m, f"session_worker_resident_tokens{{stat={stat},tier={tier}}}") for stat in ("max", "min", "mean") for tier in ("device", "host")},
+                **{f"left_{stat}_{tier}": opt(m, f"session_worker_left_behind_tokens{{stat={stat},tier={tier}}}") for stat in ("max", "min", "mean") for tier in ("device", "host")},
             } if "session_worker_demand_tokens{stat=max}" in m else None,
             "prior_prefix": g("session_prior_prefix_tokens_total"),
             "tier_overlap_tokens": g("session_tier_overlap_tokens"),
@@ -197,10 +219,7 @@ def live_run(directory):
                 "reloaded_host": g("session_thrash_tokens_total{outcome=reloaded_host}"),
                 "reloaded_disk": g("session_thrash_tokens_total{outcome=reloaded_disk}"),
             },
-            "gap_outcomes": [
-                [g(f"session_return_turns_total{{gap={gap},outcome={outcome}}}") for outcome in OUTCOMES]
-                for gap in GAP_LABELS
-            ],
+            "gap_outcomes": gap_outcomes(m),
             "capacity_device_tokens": capacity,
             "capacity_host_tokens": capacity_host,
             "requests_started": g("requests_started_total"),

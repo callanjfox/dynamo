@@ -31,14 +31,14 @@ pub(crate) const THRASH_OUTCOMES: [&str; 3] = ["recomputed", "reloaded_host", "r
 pub(crate) const COVERAGE: [&str; 2] = ["covered", "uncovered"];
 pub(crate) const ROLES: [&str; 2] = ["primary", "subagent"];
 /// Follows `dynamo_kv_router::session_stats::DEMAND_WINDOWS_MS`.
-pub(crate) const DEMAND_WINDOWS: [&str; 3] = ["1m", "5m", "30m"];
+pub(crate) const DEMAND_WINDOWS: [&str; 3] = ["1m", "5m", "15m"];
 pub(crate) const WORKER_STATS: [&str; 3] = ["max", "min", "mean"];
 const RETURN_OUTCOMES: [&str; 4] = ["gpu", "host", "disk", "miss"];
 
 /// Experimental. Names, labels and units may change in any release.
 ///
-/// Series per router: 38 gauges, counters 2 + 3 + 40 + 4 + 2, and eight histograms of up
-/// to 14 series each, about 215 in all. No label carries a session, tenant or worker
+/// Series per router: 38 gauges, counters 2 + 3 + 16 + 4 + 2, and eight histograms of up
+/// to 14 series each, about 185 in all. No label carries a session, tenant or worker
 /// identity.
 #[cfg_attr(test, derive(Clone))]
 pub struct SessionMetrics {
@@ -215,7 +215,7 @@ impl SessionMetrics {
         let demand_window_tokens = metrics
             .create_intgaugevec(
                 &router_metric("session_demand_window_tokens"),
-                "Demand counting only sessions active within the window (30s, 1m, 5m)",
+                "Demand counting only sessions active within the window (1m, 5m, 15m)",
                 &[WINDOW_LABEL],
                 extra_labels,
             )

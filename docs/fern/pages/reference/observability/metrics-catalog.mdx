@@ -421,7 +421,7 @@ A session is the chain of requests sharing an `x-dynamo-session-id`. It is activ
 | `session_demand_by_role_tokens` | gauge | `role` (`primary`, `subagent`) | `session_demand_distinct_tokens` split by role. A subagent counts only the blocks its primary sessions do not already cover, so its share is the capacity subagents add. |
 | `sessions_active_by_role` | gauge | `role` (`primary`, `subagent`) | Active sessions by role. A session with a parent session ID is a subagent. |
 | `session_shared_tokens` | gauge | none | Prompt tokens referenced by more than one active session: the sum of each session's prompt blocks minus the distinct blocks. The overlap that `session_demand_tokens` counts twice. |
-| `session_demand_window_tokens` | gauge | `window` (`1m`, `5m`, `30m`) | Per-session demand sum counting only sessions active within the window, so sessions that have gone quiet decay out. Not de-duplicated. |
+| `session_demand_window_tokens` | gauge | `window` (`1m`, `5m`, `15m`) | Per-session demand sum counting only sessions active within the window, so sessions that have gone quiet decay out. Not de-duplicated. |
 | `session_worker_resident_tokens` | gauge | `stat` (`max`, `min`, `mean`), `tier` (`device`, `host`) | Distinct session tokens held on one worker: the busiest, the least busy and the mean over all workers the router knows. Set against one worker's capacity it shows a worker that is full while others are not. |
 | `session_worker_left_behind_tokens` | gauge | `stat` (`max`, `min`, `mean`), `tier` (`device`, `host`) | Tokens a worker still holds for active sessions whose last turn ran on another worker. Cache left behind when a session moves: it stays until evicted and is reusable if the session, or another with the same prefix, returns. |
 | `session_worker_demand_tokens` | gauge | `stat` (`max`, `min`, `mean`) | Distinct demand homed on one worker, meaning the worker that served each session's last turn. A block two homed sessions share counts once. A session that moves takes its demand with it, while the blocks it left stay in the old worker's cache. |
@@ -439,7 +439,7 @@ Compare `session_resident_tokens` and demand with worker KV capacity from the en
 | `session_covered_output_tokens_total` | counter | none | Output tokens of requests that carried a session ID. Subtract it from the frontend output-token total for the output of requests without one. |
 | `session_prior_prefix_tokens_total` | counter | none | Prefix tokens returning sessions could reuse if nothing had been evicted: the prior turn's input plus output, capped at this turn's input. Divide by input tokens for the cache hit the session history makes possible, and compare with the reuse the router and workers report. |
 | `session_thrash_tokens_total` | counter | `outcome` (`recomputed`, `reloaded_host`, `reloaded_disk`) | Tokens of a returning session's prior prefix that were not on the GPU when the turn arrived. `recomputed` means no tier held them; the reloaded outcomes mean the named tier did. |
-| `session_return_turns_total` | counter | `gap` (`le_1s`, `le_5s`, `le_10s`, `le_30s`, `le_60s`, `le_120s`, `le_300s`, `le_600s`, `le_1800s`, `gt_1800s`), `outcome` (`gpu`, `host`, `disk`, `miss`) | Returning turns by time since the previous turn finished and where the prior prefix was found, to within a tenth of it. Gives the survival curve per tier. |
+| `session_return_turns_total` | counter | `gap` (`le_1m`, `le_5m`, `le_15m`, `gt_15m`), `outcome` (`gpu`, `host`, `disk`, `miss`) | Returning turns by time since the previous turn finished and where the prior prefix was found, to within a tenth of it. Gives the survival curve per tier. |
 
 The prior prefix is estimated as the previous turn's input plus output, capped at this turn's input, against what the session index holds at arrival. It assumes the harness resends its history. Treat it as an estimate: it carries up to one block of rounding per turn.
 
@@ -458,7 +458,7 @@ The prior prefix is estimated as the previous turn's input plus output, capped a
 | `session_turn_gap_seconds` | histogram | seconds, mean over the session |
 | `session_subagents` | histogram | subagent sessions spawned |
 
-**Series budget.** About 215 series per router process: 38 gauge series, 51 counter series (2 + 3 + 40 + 4 + 2), and 8 histograms of 11 to 15 series each. Bounded label values are created at startup. When one process hosts several routers, such as a prefill and a decode pool, gauges are last-router-wins and counters and histograms add up.
+**Series budget.** About 185 series per router process: 38 gauge series, 27 counter series (2 + 3 + 16 + 4 + 2), and 8 histograms of 11 to 15 series each. Bounded label values are created at startup. When one process hosts several routers, such as a prefill and a decode pool, gauges are last-router-wins and counters and histograms add up.
 
 **Configuration.** `DYN_SESSION_STATS_SWEEP_SECS` (default 10), `DYN_SESSION_STATS_ACTIVE_WINDOW_SECS` (default 300), and `DYN_SESSION_STATS_IDLE_TTL_SECS` (default 1800).
 
