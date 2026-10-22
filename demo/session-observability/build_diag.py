@@ -37,7 +37,7 @@ def rate(rows, i, ms, get):
     return max(0.0, (get(rows[i]) - get(rows[j])) / dt) if dt > 0 else 0.0
 
 
-def timeline(rows, meta):
+def timeline(rows, meta, adjust=False):
     out = []
     has_compute = any(x["compute"] for x in rows)
     cap_dev, cap_host = rows[0]["capacity_device_tokens"], rows[0]["capacity_host_tokens"]
@@ -47,7 +47,9 @@ def timeline(rows, meta):
         f0d = x["funnel"]["f0"] - rows[j]["funnel"]["f0"]
         busy = f0d > 2e6
         share = lambda key: r(100 * (x["funnel"][key] - rows[j]["funnel"][key]) / f0d, 2) if busy else None
-        pot = r(min(100, 100 * (x["prior_prefix"] - rows[j]["prior_prefix"]) / f0d), 2) if busy and x.get("prior_prefix") else None
+        # A router from before the fix counted the previous turn's output in the prior prefix; take it back out.
+        out_back = (x["covered_output_tokens"] - rows[j]["covered_output_tokens"]) if adjust else 0
+        pot = r(max(0, min(100, 100 * (x["prior_prefix"] - rows[j]["prior_prefix"] - out_back) / f0d)), 2) if busy and x.get("prior_prefix") else None
         out_total = rate(rows, i, 60000, lambda y: y["output_seq"]["sum"])
         out_agent = rate(rows, i, 60000, lambda y: y["covered_output_tokens"])
         in_total = rate(rows, i, 60000, lambda y: y["input_seq"]["sum"])
@@ -90,7 +92,7 @@ def timeline(rows, meta):
     return out
 
 
-def run_summary(key, label, directory):
+def run_summary(key, label, directory, adjust=False):
     rows, sessions, meta, stats = bd.live_run(directory)
     last = rows[-1]
     f0 = last["funnel"]["f0"] or 1
@@ -103,7 +105,7 @@ def run_summary(key, label, directory):
         "gpu_tokens": cap_dev, "host_tokens": cap_host,
         "sessions": len(sessions), "requests": stats["sent"], "failed": stats["failed"],
         "input_tokens": f0, "f2_pct": r(100 * last["funnel"]["f2"] / f0, 1), "f3_pct": r(100 * last["funnel"]["f3"] / f0, 1),
-        "pot_pct": r(min(100, 100 * (last.get("prior_prefix") or 0) / f0), 1) if last.get("prior_prefix") else None,
+        "pot_pct": r(max(0, min(100, 100 * ((last.get("prior_prefix") or 0) - (last["covered_output_tokens"] if adjust else 0)) / f0)), 1) if last.get("prior_prefix") else None,
         "recomputed": th["recomputed"], "reloaded": th["reloaded_host"] + th["reloaded_disk"],
         "peak_demand_ratio": r(peak / cap_dev, 2),
         "ttft_p90_median": r(ttft90[len(ttft90) // 2], 3) if ttft90 else None,
@@ -130,12 +132,14 @@ def main():
     labels = ["up to 1 min", "1 to 5 min", "5 to 15 min", "over 15 min"]
     for spec in args.scenarios:
         key, run = spec.split("=")
+        adjust = run.endswith(":adjust")
+        run = run.split(":")[0]
         label, blurb = SCENARIOS.get(key, (key, ""))
         directory = HERE / "data" / "live" / run
         rows, sessions, meta, stats = bd.live_run(directory)
         cap_dev, cap_host = rows[0]["capacity_device_tokens"], rows[0]["capacity_host_tokens"]
         workers = meta["workers"]
-        summary = run_summary(key, label, directory)
+        summary = run_summary(key, label, directory, adjust)
         metas.append({
             "scenario": key, "label": label, "blurb": blurb, "model": meta.get("model", "Qwen/Qwen3-0.6B"),
             "workers": workers, "block_size": meta["block_size"],
@@ -151,7 +155,7 @@ def main():
             "recomputed": summary["recomputed"], "reloaded": summary["reloaded"], "input_tokens": summary["input_tokens"],
             "peak_demand_ratio": summary["peak_demand_ratio"], "ttft_p90_median": summary["ttft_p90_median"], "ttft_p90_worst": summary["ttft_p90_worst"],
         })
-        for row in timeline(rows, meta):
+        for row in timeline(rows, meta, adjust):
             tl_all.append({"scenario": key, **row})
         for s_ in sessions:
             ses_all.append({
