@@ -118,6 +118,12 @@ pub struct ResidencySnapshot {
     /// Distinct blocks each worker holds per tier for the sessions' prefixes. Set
     /// against that worker's own capacity, it shows whether load is even.
     pub workers: HashMap<WorkerWithDpRank, TierBlocks>,
+    /// Blocks each worker holds only for active sessions whose last turn ran on another
+    /// worker: cache left behind when a session moved, not needed by anyone homed here.
+    pub left_behind: HashMap<WorkerWithDpRank, TierBlocks>,
+    /// Blocks held in both the device and host tiers of one worker, summed over
+    /// workers: how much of host memory is a copy of GPU memory.
+    pub device_host_overlap: u64,
 }
 
 /// Thread-safe session-aware logical prefix index.
@@ -455,11 +461,25 @@ impl SessionPrefixIndexer {
     /// for sessions `is_inactive` accepts: capacity spent on sessions nobody is
     /// waiting on.
     pub fn residency_snapshot_with(&self, is_inactive: impl Fn(&str) -> bool) -> ResidencySnapshot {
+        self.residency_snapshot_with_homes(is_inactive, |_| None)
+    }
+
+    /// As [`Self::residency_snapshot_with`], also reporting the cache each worker holds
+    /// for active sessions whose home (`home`) is another worker.
+    pub fn residency_snapshot_with_homes(
+        &self,
+        is_inactive: impl Fn(&str) -> bool,
+        home: impl Fn(&str) -> Option<WorkerWithDpRank>,
+    ) -> ResidencySnapshot {
         let state = self.state.read();
         let mut memo = FxHashMap::default();
         let mut active_covered: [FxHashSet<NodeId>; 3] = Default::default();
         let mut inactive_covered: [FxHashSet<NodeId>; 3] = Default::default();
         let mut per_worker: FxHashMap<(WorkerWithDpRank, usize), FxHashSet<NodeId>> =
+            FxHashMap::default();
+        let mut on_home: FxHashMap<(WorkerWithDpRank, usize), FxHashSet<NodeId>> =
+            FxHashMap::default();
+        let mut off_home: FxHashMap<(WorkerWithDpRank, usize), FxHashSet<NodeId>> =
             FxHashMap::default();
         let mut snapshot = ResidencySnapshot::default();
         for (session_id, entry) in &state.session_to_worker_frontiers {
@@ -470,6 +490,8 @@ impl SessionPrefixIndexer {
             };
             let mut blocks = TierBlocks::default();
             let mut device_workers: FxHashSet<WorkerWithDpRank> = FxHashSet::default();
+            let session_home = home(session_id);
+            let inactive = is_inactive(session_id);
             for (&(worker, tier), frontiers) in &entry.worker_frontiers {
                 let (tier_index, set) = match tier {
                     StorageTier::Device => (0, &mut covered[0]),
@@ -478,6 +500,12 @@ impl SessionPrefixIndexer {
                     StorageTier::External => continue,
                 };
                 let held = per_worker.entry((worker, tier_index)).or_default();
+                // An unknown home counts as on-home; inactive sessions are the stranded set.
+                let side = (!inactive).then(|| match session_home {
+                    Some(h) if h != worker => off_home.entry((worker, tier_index)).or_default(),
+                    _ => on_home.entry((worker, tier_index)).or_default(),
+                });
+                let mut side = side;
                 for &frontier in frontiers {
                     blocks.raise(tier, state.node_depth(frontier, &mut memo));
                     let mut current = Some(frontier);
@@ -486,6 +514,15 @@ impl SessionPrefixIndexer {
                             break;
                         }
                         current = state.nodes[node].parent;
+                    }
+                    if let Some(side) = side.as_deref_mut() {
+                        let mut current = Some(frontier);
+                        while let Some(node) = current {
+                            if !side.insert(node) {
+                                break;
+                            }
+                            current = state.nodes[node].parent;
+                        }
                     }
                     let mut current = Some(frontier);
                     while let Some(node) = current {
@@ -533,6 +570,27 @@ impl SessionPrefixIndexer {
                 _ => &mut held.disk,
             };
             *slot = nodes.len() as u64;
+        }
+        for (&(worker, tier_index), nodes) in &off_home {
+            let kept = on_home.get(&(worker, tier_index));
+            let left = nodes
+                .iter()
+                .filter(|node| kept.is_none_or(|set| !set.contains(*node)))
+                .count() as u64;
+            let slot = snapshot.left_behind.entry(worker).or_default();
+            match tier_index {
+                0 => slot.device = left,
+                1 => slot.host = left,
+                _ => slot.disk = left,
+            }
+        }
+        for (&(worker, tier_index), device) in &per_worker {
+            if tier_index == 0
+                && let Some(host) = per_worker.get(&(worker, 1))
+            {
+                snapshot.device_host_overlap +=
+                    device.iter().filter(|node| host.contains(*node)).count() as u64;
+            }
         }
         snapshot.replicated = TierBlocks {
             device: worker_sum[0] - snapshot.distinct.device,
@@ -1638,6 +1696,29 @@ mod tests {
         // Worker 1 holds both blocks for s and t together; worker 2 holds the same two.
         assert_eq!(snapshot.workers[&worker(1)].device, 2);
         assert_eq!(snapshot.workers[&worker(2)].device, 2);
+    }
+
+    #[test]
+    fn left_behind_cache_and_device_host_overlap() {
+        let chain = hashes(vec![1, 2, 3]);
+        let indexer = SessionPrefixIndexer::new();
+        // Session s ran on worker 1, then moved to worker 2; blocks stay on both.
+        for worker_id in [1, 2] {
+            indexer
+                .update_session_from_stored_blocks("s", worker(worker_id), None, &chain)
+                .unwrap();
+        }
+        // The first two blocks are also held in worker 1's host tier.
+        indexer.inherit_stored_blocks(worker(1), StorageTier::HostPinned, &chain[..2]);
+
+        let snapshot = indexer.residency_snapshot_with_homes(|_| false, |_| Some(worker(2)));
+        // Worker 1 holds three blocks for a session homed on worker 2.
+        assert_eq!(snapshot.left_behind[&worker(1)].device, 3);
+        assert!(!snapshot.left_behind.contains_key(&worker(2)));
+        // Two of worker 1's blocks are held in both its device and host tiers.
+        assert_eq!(snapshot.device_host_overlap, 2);
+        // With no known home nothing is left behind.
+        assert!(indexer.residency_snapshot().left_behind.is_empty());
     }
 
     #[test]

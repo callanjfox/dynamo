@@ -178,7 +178,8 @@ pub struct SessionStatsSnapshot {
     /// Prompt tokens referenced by more than one active session: the sum of each
     /// session's prompt blocks minus the distinct blocks.
     pub shared_tokens: u64,
-    /// Demand of active sessions grouped by the worker that served their last turn.
+    /// Distinct demand of the active sessions homed on each worker, meaning the worker
+    /// that served their last turn: a block two of them share counts once.
     #[serde(skip)]
     pub home_demand: HashMap<WorkerWithDpRank, u64>,
     /// The demand sum counting only sessions active within each of
@@ -211,7 +212,7 @@ pub struct SessionStatsSnapshot {
 
 /// Windows over which demand is also reported, so a session idle longer than the
 /// window stops counting. The configured active window is separate.
-pub const DEMAND_WINDOWS_MS: [u64; 3] = [30_000, 60_000, 300_000];
+pub const DEMAND_WINDOWS_MS: [u64; 3] = [60_000, 300_000, 1_800_000];
 
 #[derive(Debug)]
 struct Stat {
@@ -246,6 +247,8 @@ struct Stat {
 struct DistinctBlocks {
     all: FxHashMap<u64, u32>,
     primary: FxHashMap<u64, u32>,
+    /// The same counts per home worker, so a worker's own distinct need is known.
+    by_worker: FxHashMap<WorkerWithDpRank, FxHashMap<u64, u32>>,
     /// Sum over sessions of their block count, shared blocks counted per session.
     references: u64,
 }
@@ -275,9 +278,41 @@ impl DistinctBlocks {
         self.references = self.references.saturating_sub(1);
     }
 
+    fn add_to_worker(&mut self, worker: WorkerWithDpRank, hash: u64) {
+        *self
+            .by_worker
+            .entry(worker)
+            .or_default()
+            .entry(hash)
+            .or_default() += 1;
+    }
+
+    fn remove_from_worker(&mut self, worker: WorkerWithDpRank, hash: u64) {
+        if let Some(map) = self.by_worker.get_mut(&worker) {
+            if let Some(count) = map.get_mut(&hash) {
+                *count -= 1;
+                if *count == 0 {
+                    map.remove(&hash);
+                }
+            }
+            if map.is_empty() {
+                self.by_worker.remove(&worker);
+            }
+        }
+    }
+
     /// Swap a session's blocks for `new`, touching only the part after the shared
-    /// prefix: a prompt usually extends the previous one.
-    fn replace(&mut self, held: &mut Vec<u64>, new: Vec<u64>, primary: bool) {
+    /// prefix: a prompt usually extends the previous one. When the session moved to
+    /// another worker its need moves with it (blocks it left behind stay cached on
+    /// the old worker, which the residency index reports).
+    fn replace(
+        &mut self,
+        held: &mut Vec<u64>,
+        new: Vec<u64>,
+        primary: bool,
+        old_home: Option<WorkerWithDpRank>,
+        home: WorkerWithDpRank,
+    ) {
         let common = held.iter().zip(&new).take_while(|(a, b)| a == b).count();
         for &hash in &held[common..] {
             self.remove(hash, primary);
@@ -285,12 +320,32 @@ impl DistinctBlocks {
         for &hash in &new[common..] {
             self.add(hash, primary);
         }
+        if old_home == Some(home) {
+            for &hash in &held[common..] {
+                self.remove_from_worker(home, hash);
+            }
+            for &hash in &new[common..] {
+                self.add_to_worker(home, hash);
+            }
+        } else {
+            if let Some(old) = old_home {
+                for &hash in held.iter() {
+                    self.remove_from_worker(old, hash);
+                }
+            }
+            for &hash in &new {
+                self.add_to_worker(home, hash);
+            }
+        }
         *held = new;
     }
 
-    fn release(&mut self, held: &mut Vec<u64>, primary: bool) {
+    fn release(&mut self, held: &mut Vec<u64>, primary: bool, home: Option<WorkerWithDpRank>) {
         for &hash in held.iter() {
             self.remove(hash, primary);
+            if let Some(home) = home {
+                self.remove_from_worker(home, hash);
+            }
         }
         held.clear();
     }
@@ -525,11 +580,15 @@ impl SessionStatsTracker {
         let Some(stat) = inner.sessions.get_mut(session_id) else {
             return;
         };
-        stat.home = Some(worker);
+        let old_home = stat.home.replace(worker);
         let primary = stat.parent.is_none();
-        inner
-            .distinct
-            .replace(&mut stat.blocks, chain_hashes(local_hashes), primary);
+        inner.distinct.replace(
+            &mut stat.blocks,
+            chain_hashes(local_hashes),
+            primary,
+            old_home,
+            worker,
+        );
     }
 
     /// Record a request finishing. `cached_tokens` is the prefix the worker reused.
@@ -556,7 +615,7 @@ impl SessionStatsTracker {
         stat.ended_ms = Some(now_ms);
         let summary = stat.summary(session_id, now_ms);
         let primary = stat.parent.is_none();
-        inner.distinct.release(&mut stat.blocks, primary);
+        inner.distinct.release(&mut stat.blocks, primary, stat.home);
         inner.ended += 1;
         Some(summary)
     }
@@ -575,7 +634,7 @@ impl SessionStatsTracker {
                 summaries.push(stat.summary(session_id, now_ms));
             }
             let primary = stat.parent.is_none();
-            distinct.release(&mut stat.blocks, primary);
+            distinct.release(&mut stat.blocks, primary, stat.home);
         }
         inner.ended += summaries.len() as u64;
         summaries
@@ -599,7 +658,7 @@ impl SessionStatsTracker {
             // A session idle past the active window no longer counts toward demand.
             if !stat.is_active(now_ms, window) {
                 let primary = stat.parent.is_none();
-                distinct.release(&mut stat.blocks, primary);
+                distinct.release(&mut stat.blocks, primary, stat.home);
             }
         }
         inner.ended += summaries.len() as u64;
@@ -636,6 +695,7 @@ impl SessionStatsTracker {
             ..SessionStatsSnapshot::default()
         };
         let (mut primary_output, mut subagent_output) = (0u64, 0u64);
+        let mut worker_output: HashMap<WorkerWithDpRank, u64> = HashMap::new();
         for stat in inner.sessions.values() {
             let demand = stat.demand.max(stat.inflight_isl);
             if stat.is_active(now_ms, self.config.active_window_ms) {
@@ -652,7 +712,7 @@ impl SessionStatsTracker {
                     primary_output += output;
                 }
                 if let Some(home) = stat.home {
-                    *snapshot.home_demand.entry(home).or_default() += demand;
+                    *worker_output.entry(home).or_default() += output;
                 }
             }
             for (slot, window) in snapshot
@@ -673,6 +733,12 @@ impl SessionStatsTracker {
         snapshot.demand_distinct_tokens =
             snapshot.demand_distinct_primary_tokens + snapshot.demand_distinct_subagent_tokens;
         snapshot.shared_tokens = inner.distinct.references.saturating_sub(distinct_blocks) * block;
+        for (worker, blocks) in &inner.distinct.by_worker {
+            let output = worker_output.get(worker).copied().unwrap_or(0);
+            snapshot
+                .home_demand
+                .insert(*worker, blocks.len() as u64 * block + output);
+        }
         snapshot
     }
 
@@ -692,6 +758,17 @@ impl SessionStatsTracker {
             .collect()
     }
 
+    /// The worker that served each active session's last turn.
+    pub fn active_homes(&self, now_ms: u64) -> HashMap<SessionId, WorkerWithDpRank> {
+        self.inner
+            .lock()
+            .sessions
+            .iter()
+            .filter(|(_, stat)| stat.is_active(now_ms, self.config.active_window_ms))
+            .filter_map(|(session_id, stat)| stat.home.map(|home| (session_id.clone(), home)))
+            .collect()
+    }
+
     pub fn session_count(&self) -> usize {
         self.inner.lock().sessions.len()
     }
@@ -708,7 +785,7 @@ impl Inner {
             && let Some(mut stat) = self.sessions.remove(&victim)
         {
             let primary = stat.parent.is_none();
-            self.distinct.release(&mut stat.blocks, primary);
+            self.distinct.release(&mut stat.blocks, primary, stat.home);
         }
     }
 }
@@ -922,7 +999,7 @@ mod tests {
         assert_eq!(snapshot.home_demand[&worker(1)], 8 * 16);
         assert_eq!(snapshot.home_demand[&worker(2)], 7 * 16);
         // The primary was last active 55 s ago, the subagent 5 s ago.
-        assert_eq!(snapshot.demand_window_tokens, [7 * 16, 15 * 16, 15 * 16]);
+        assert_eq!(snapshot.demand_window_tokens, [15 * 16, 15 * 16, 15 * 16]);
 
         // The primary idles past the 60 s window: its blocks stop counting, the
         // subagent's shared ones now count in full.
@@ -957,6 +1034,33 @@ mod tests {
                 .demand_distinct_tokens,
             0
         );
+    }
+
+    #[test]
+    fn worker_demand_is_distinct_and_follows_a_session_that_moves() {
+        let tracker = tracker();
+        // Two sessions on worker 1 share their first three blocks.
+        tracker.on_arrival("a", None, 4 * 16, TierBlocks::default(), 0);
+        tracker.on_routed("a", worker(1), &[1, 2, 3, 4]);
+        tracker.on_arrival("b", None, 4 * 16, TierBlocks::default(), 0);
+        tracker.on_routed("b", worker(1), &[1, 2, 3, 9]);
+        let snapshot = tracker.snapshot(&ResidencySnapshot::default(), 1_000);
+        // Five distinct blocks, not eight.
+        assert_eq!(snapshot.home_demand[&worker(1)], 5 * 16);
+
+        // Session b moves to worker 2: its need leaves worker 1 and lands on worker 2.
+        tracker.on_arrival("b", None, 5 * 16, TierBlocks::default(), 2_000);
+        tracker.on_routed("b", worker(2), &[1, 2, 3, 9, 10]);
+        let moved = tracker.snapshot(&ResidencySnapshot::default(), 2_000);
+        assert_eq!(moved.home_demand[&worker(1)], 4 * 16);
+        assert_eq!(moved.home_demand[&worker(2)], 5 * 16);
+        assert_eq!(tracker.active_homes(2_000)["b"], worker(2));
+
+        // Ending both sessions leaves no worker holding need.
+        tracker.end_session("a", 3_000);
+        tracker.end_session("b", 3_000);
+        let ended = tracker.snapshot(&ResidencySnapshot::default(), 3_000);
+        assert!(ended.home_demand.is_empty());
     }
 
     #[test]

@@ -31,14 +31,14 @@ pub(crate) const THRASH_OUTCOMES: [&str; 3] = ["recomputed", "reloaded_host", "r
 pub(crate) const COVERAGE: [&str; 2] = ["covered", "uncovered"];
 pub(crate) const ROLES: [&str; 2] = ["primary", "subagent"];
 /// Follows `dynamo_kv_router::session_stats::DEMAND_WINDOWS_MS`.
-pub(crate) const DEMAND_WINDOWS: [&str; 3] = ["30s", "1m", "5m"];
-pub(crate) const WORKER_STATS: [&str; 2] = ["max", "mean"];
+pub(crate) const DEMAND_WINDOWS: [&str; 3] = ["1m", "5m", "30m"];
+pub(crate) const WORKER_STATS: [&str; 3] = ["max", "min", "mean"];
 const RETURN_OUTCOMES: [&str; 4] = ["gpu", "host", "disk", "miss"];
 
 /// Experimental. Names, labels and units may change in any release.
 ///
-/// Series per router: 27 gauges, counters 2 + 3 + 40 + 4 + 1, and eight histograms of up
-/// to 14 series each, about 200 in all. No label carries a session, tenant or worker
+/// Series per router: 38 gauges, counters 2 + 3 + 40 + 4 + 2, and eight histograms of up
+/// to 14 series each, about 215 in all. No label carries a session, tenant or worker
 /// identity.
 #[cfg_attr(test, derive(Clone))]
 pub struct SessionMetrics {
@@ -72,8 +72,14 @@ pub struct SessionMetrics {
     /// The same demand as a share of that worker's GPU KV capacity. Above 1.0 means the
     /// worker is asked to hold more than its GPU can.
     pub worker_demand_ratio: GaugeVec,
-    /// Workers whose homed demand exceeds their GPU KV capacity.
-    pub workers_over_capacity: IntGauge,
+    /// Distinct tokens each worker holds for active sessions whose last turn ran elsewhere:
+    /// the cache left behind when sessions move.
+    pub worker_left_behind_tokens: IntGaugeVec,
+    /// Tokens held in both the GPU and host tier of a worker, summed over workers: how
+    /// much host memory is a copy of GPU memory.
+    pub tier_overlap_tokens: IntGauge,
+    /// Output tokens of requests that carried a session ID.
+    pub covered_output_tokens_total: IntCounter,
     /// Prefix tokens returning sessions could reuse if nothing had been evicted.
     pub prior_prefix_tokens_total: IntCounter,
     pub sessions_started_total: IntCounter,
@@ -226,7 +232,7 @@ impl SessionMetrics {
         let worker_demand_tokens = metrics
             .create_intgaugevec(
                 &router_metric("session_worker_demand_tokens"),
-                "Demand homed on one worker: the busiest (max) and the mean over all workers",
+                "Distinct demand homed on one worker: the busiest (max), the least busy (min) and the mean over all workers",
                 &[STAT_LABEL],
                 extra_labels,
             )
@@ -234,11 +240,20 @@ impl SessionMetrics {
         let worker_demand_ratio = metrics
             .create_gaugevec(
                 &router_metric("session_worker_demand_ratio"),
-                "Homed demand over the worker's GPU KV capacity: the most loaded worker (max) and the mean over workers",
+                "Distinct homed demand over the worker's GPU KV capacity: the most loaded worker (max), the least (min) and the mean",
                 &[STAT_LABEL],
                 extra_labels,
             )
             .expect("failed to create router_session_worker_demand_ratio");
+
+        let worker_left_behind_tokens = metrics
+            .create_intgaugevec(
+                &router_metric("session_worker_left_behind_tokens"),
+                "Distinct tokens one worker holds for active sessions homed elsewhere: busiest (max), least (min) and mean, by tier (device, host)",
+                &[STAT_LABEL, TIER_LABEL],
+                extra_labels,
+            )
+            .expect("failed to create router_session_worker_left_behind_tokens");
 
         // Bounded label values exist from the first scrape so rate() and absent() work.
         for stat in WORKER_STATS {
@@ -254,6 +269,7 @@ impl SessionMetrics {
         }
         for tier in STRANDED_TIERS {
             for stat in WORKER_STATS {
+                worker_left_behind_tokens.with_label_values(&[stat, tier]);
                 worker_resident_tokens.with_label_values(&[stat, tier]);
             }
         }
@@ -301,9 +317,14 @@ impl SessionMetrics {
             ),
             worker_demand_tokens,
             worker_demand_ratio,
-            workers_over_capacity: gauge(
-                "session_workers_over_capacity",
-                "Workers whose homed session demand exceeds their GPU KV capacity",
+            worker_left_behind_tokens,
+            tier_overlap_tokens: gauge(
+                "session_tier_overlap_tokens",
+                "Tokens held in both the GPU and host tier of a worker, summed over workers",
+            ),
+            covered_output_tokens_total: counter(
+                "session_covered_output_tokens_total",
+                "Output tokens of requests that carried a session ID",
             ),
             active_by_role,
             demand_by_role_tokens,

@@ -150,8 +150,9 @@ impl SessionStatsRuntime {
         self.tracker.on_routed(session_id, worker, &hashes);
     }
 
-    /// Per-worker load: how much of the index each worker holds, and how much session
-    /// demand is homed on it against its GPU KV capacity. Gauges carry no worker identity.
+    /// Per-worker load: what each worker holds, what it holds for sessions that moved
+    /// away, and the distinct demand homed on it against its GPU KV capacity. The gauges
+    /// carry no worker identity: busiest, least busy and mean over all workers.
     fn publish_workers(
         &self,
         home_demand: &std::collections::HashMap<WorkerWithDpRank, u64>,
@@ -159,40 +160,9 @@ impl SessionStatsRuntime {
     ) {
         let metrics = &self.metrics;
         let block = u64::from(self.block_size);
-        for (tier, held) in [
-            (
-                "device",
-                residency
-                    .workers
-                    .values()
-                    .map(|w| w.device)
-                    .collect::<Vec<_>>(),
-            ),
-            (
-                "host",
-                residency
-                    .workers
-                    .values()
-                    .map(|w| w.host)
-                    .collect::<Vec<_>>(),
-            ),
-        ] {
-            let holding: Vec<u64> = held.into_iter().filter(|&blocks| blocks > 0).collect();
-            let max = holding.iter().copied().max().unwrap_or(0);
-            let mean = holding
-                .iter()
-                .sum::<u64>()
-                .checked_div(holding.len() as u64)
-                .unwrap_or(0);
-            for (stat, blocks) in [("max", max), ("mean", mean)] {
-                metrics
-                    .worker_resident_tokens
-                    .with_label_values(&[stat, tier])
-                    .set(i64::try_from(blocks * block).unwrap_or(i64::MAX));
-            }
-        }
+        let gauge = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
 
-        // Every worker the router knows, so an idle worker pulls the mean down.
+        // Every worker the router knows, so an idle worker pulls the mean and min down.
         let mut workers: Vec<(WorkerWithDpRank, Option<u64>)> = Vec::new();
         if let Some(watch) = &self.workers {
             for (&worker_id, config) in watch.borrow().iter() {
@@ -205,44 +175,73 @@ impl SessionStatsRuntime {
             }
         }
         if workers.is_empty() {
-            workers = home_demand.keys().map(|&worker| (worker, None)).collect();
+            let mut known: std::collections::HashSet<WorkerWithDpRank> =
+                home_demand.keys().copied().collect();
+            known.extend(residency.workers.keys().copied());
+            workers = known.into_iter().map(|worker| (worker, None)).collect();
         }
         if workers.is_empty() {
             return;
         }
-        let demands: Vec<u64> = workers
-            .iter()
-            .map(|(worker, _)| home_demand.get(worker).copied().unwrap_or(0))
-            .collect();
-        let max = demands.iter().copied().max().unwrap_or(0);
-        let mean = demands.iter().sum::<u64>() / demands.len() as u64;
-        let ratios: Vec<f64> = workers
-            .iter()
-            .zip(&demands)
-            .filter_map(|((_, capacity), &demand)| {
-                capacity
-                    .filter(|&c| c > 0)
-                    .map(|c| demand as f64 / c as f64)
-            })
-            .collect();
-        for (stat, tokens) in WORKER_STATS.iter().zip([max, mean]) {
+
+        // Max, min and mean of one value per worker.
+        let stats = |values: Vec<u64>| {
+            let max = values.iter().copied().max().unwrap_or(0);
+            let min = values.iter().copied().min().unwrap_or(0);
+            let mean = values.iter().sum::<u64>() / values.len().max(1) as u64;
+            [max, min, mean]
+        };
+        let per_worker = |f: &dyn Fn(&WorkerWithDpRank) -> u64| {
+            stats(workers.iter().map(|(worker, _)| f(worker)).collect())
+        };
+
+        let demand = per_worker(&|worker| home_demand.get(worker).copied().unwrap_or(0));
+        for (stat, tokens) in WORKER_STATS.iter().zip(demand) {
             metrics
                 .worker_demand_tokens
                 .with_label_values(&[stat])
-                .set(i64::try_from(tokens).unwrap_or(i64::MAX));
+                .set(gauge(tokens));
         }
-        if !ratios.is_empty() {
-            let ratio_max = ratios.iter().copied().fold(0.0, f64::max);
-            let ratio_mean = ratios.iter().sum::<f64>() / ratios.len() as f64;
-            for (stat, ratio) in WORKER_STATS.iter().zip([ratio_max, ratio_mean]) {
+        for (tier, pick) in [
+            ("device", (|b: &dynamo_kv_router::session_prefix_index::TierBlocks| b.device) as fn(&_) -> u64),
+            ("host", |b| b.host),
+        ] {
+            let resident = per_worker(&|worker| {
+                residency.workers.get(worker).map_or(0, pick) * block
+            });
+            let left = per_worker(&|worker| {
+                residency.left_behind.get(worker).map_or(0, pick) * block
+            });
+            for (stat, (held, left)) in WORKER_STATS.iter().zip(resident.into_iter().zip(left)) {
                 metrics
-                    .worker_demand_ratio
-                    .with_label_values(&[stat])
-                    .set(ratio);
+                    .worker_resident_tokens
+                    .with_label_values(&[stat, tier])
+                    .set(gauge(held));
+                metrics
+                    .worker_left_behind_tokens
+                    .with_label_values(&[stat, tier])
+                    .set(gauge(left));
             }
-            metrics
-                .workers_over_capacity
-                .set(ratios.iter().filter(|&&ratio| ratio > 1.0).count() as i64);
+        }
+        metrics
+            .tier_overlap_tokens
+            .set(gauge(residency.device_host_overlap * block));
+
+        let ratios: Vec<f64> = workers
+            .iter()
+            .filter_map(|(worker, capacity)| {
+                capacity
+                    .filter(|&c| c > 0)
+                    .map(|c| home_demand.get(worker).copied().unwrap_or(0) as f64 / c as f64)
+            })
+            .collect();
+        if !ratios.is_empty() {
+            let max = ratios.iter().copied().fold(f64::MIN, f64::max);
+            let min = ratios.iter().copied().fold(f64::MAX, f64::min);
+            let mean = ratios.iter().sum::<f64>() / ratios.len() as f64;
+            for (stat, ratio) in WORKER_STATS.iter().zip([max, min, mean]) {
+                metrics.worker_demand_ratio.with_label_values(&[stat]).set(ratio);
+            }
         }
     }
 
@@ -256,6 +255,7 @@ impl SessionStatsRuntime {
         session_final: bool,
     ) {
         let now_ms = self.now_ms();
+        self.metrics.covered_output_tokens_total.inc_by(osl_tokens);
         self.tracker
             .on_complete(session_id, osl_tokens, cached_tokens, now_ms);
         if session_final && let Some(summary) = self.tracker.end_session(session_id, now_ms) {
@@ -316,9 +316,11 @@ impl SessionStatsRuntime {
             self.record_summary(&summary);
         }
         let active = self.tracker.active_sessions(now_ms);
-        let residency = self
-            .index
-            .residency_snapshot_with(|session| !active.contains(session));
+        let homes = self.tracker.active_homes(now_ms);
+        let residency = self.index.residency_snapshot_with_homes(
+            |session| !active.contains(session),
+            |session| homes.get(session).copied(),
+        );
         let snapshot = self.tracker.snapshot(&residency, now_ms);
         let metrics = &self.metrics;
         let gauge = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);

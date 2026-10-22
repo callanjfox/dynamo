@@ -141,6 +141,9 @@ def live_run(directory):
     t0 = scrapes[0]["t"]
     capacity = meta["workers"] * meta["num_gpu_blocks"] * meta["block_size"]
     capacity_host = meta["workers"] * meta.get("num_host_blocks", 0) * meta["block_size"]
+    # Runs before the window change report 30s, 1m and 5m; later ones 1m, 5m and 30m.
+    window_labels = ("1m", "5m", "30m") if any("session_demand_window_tokens{window=30m}" in sc["m"] for sc in scrapes[-5:]) else ("30s", "1m", "5m")
+    meta["window_labels"] = list(window_labels)
     rows, hists = [], []
     for scrape in scrapes:
         m = scrape["m"]
@@ -156,19 +159,20 @@ def live_run(directory):
             "active_primary": g("sessions_active_by_role{role=primary}"),
             "active_subagent": g("sessions_active_by_role{role=subagent}"),
             "shared_tokens": g("session_shared_tokens"),
-            "demand_windows": [g(f"session_demand_window_tokens{{window={w}}}") for w in ("30s", "1m", "5m")],
+            "demand_windows": [g(f"session_demand_window_tokens{{window={w}}}") for w in window_labels],
             "worker": {
                 "demand_max": g("session_worker_demand_tokens{stat=max}"),
+                "demand_min": g("session_worker_demand_tokens{stat=min}"),
                 "demand_mean": g("session_worker_demand_tokens{stat=mean}"),
                 "ratio_max": float(m.get("session_worker_demand_ratio{stat=max}", 0)),
+                "ratio_min": float(m.get("session_worker_demand_ratio{stat=min}", 0)),
                 "ratio_mean": float(m.get("session_worker_demand_ratio{stat=mean}", 0)),
-                "over": g("session_workers_over_capacity"),
-                "resident_max_device": g("session_worker_resident_tokens{stat=max,tier=device}"),
-                "resident_max_host": g("session_worker_resident_tokens{stat=max,tier=host}"),
-                "resident_mean_device": g("session_worker_resident_tokens{stat=mean,tier=device}"),
-                "resident_mean_host": g("session_worker_resident_tokens{stat=mean,tier=host}"),
+                **{f"resident_{stat}_{tier}": g(f"session_worker_resident_tokens{{stat={stat},tier={tier}}}") for stat in ("max", "min", "mean") for tier in ("device", "host")},
+                **{f"left_{stat}_{tier}": g(f"session_worker_left_behind_tokens{{stat={stat},tier={tier}}}") for stat in ("max", "min", "mean") for tier in ("device", "host")},
             } if "session_worker_demand_tokens{stat=max}" in m else None,
             "prior_prefix": g("session_prior_prefix_tokens_total"),
+            "tier_overlap_tokens": g("session_tier_overlap_tokens"),
+            "covered_output_tokens": g("session_covered_output_tokens_total"),
             "distinct_demand": "session_demand_distinct_tokens" in m,
             "distinct_device_tokens": g("session_resident_tokens{tier=device}"),
             "distinct_host_tokens": g("session_resident_tokens{tier=host}"),
@@ -287,7 +291,10 @@ def main():
                 sessions=len(sessions),
             ),
             "selection": meta.get("selection", []),
+            "window_labels": meta["window_labels"],
+            "block_size": meta["block_size"],
             "workers": meta["workers"],
+            "time_scale": meta.get("time_scale", 1),
             "meta_window": meta["active_window_s"],
             "demandIsSum": not any(r.get("distinct_demand") for r in rows),
             "requests": request_stats,
@@ -299,8 +306,11 @@ def main():
                 "These are the router's own session metrics, scraped from /metrics while the workload ran."
             ),
             "note1": (
-                "Demand is the router's sum over active sessions of the prefix each will present next. "
-                "Resident is the distinct tokens the session index holds in each tier."
+                ("Demand counts each distinct prompt block once across the active sessions, so a shared prefix is not counted twice. "
+                 if any(r.get("distinct_demand") for r in rows) else
+                 "Demand is the router's sum over active sessions of the prefix each will present next, so a shared prefix counts once per session. ")
+                + "Held memory is stacked: GPU resident, then host resident"
+                + (" that is not also on the GPU." if any(r.get("tier_overlap_tokens") for r in rows) else ", which may include copies of GPU blocks (this run does not report the overlap).")
             ),
             "foot": (
                 "Wall-clock time. Real frontend and KV router with the session index on; workers are mockers, "
@@ -315,8 +325,9 @@ def main():
             "rows": rows,
             "sessions": sessions,
         })
+    default = "ax_host"
     template = (HERE / "template.html").read_text()
-    out = template.replace("__DATA__", json.dumps(payload, separators=(",", ":")))
+    out = template.replace("__DATA__", json.dumps(payload, separators=(",", ":"))).replace("__DEFAULT__", default)
     (HERE / "index.html").write_text(out)
     print(f"wrote {HERE / 'index.html'} ({len(out) // 1024} KiB)")
 

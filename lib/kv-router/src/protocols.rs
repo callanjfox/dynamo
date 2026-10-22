@@ -1119,6 +1119,23 @@ pub struct SelectionTraceSpec {
 pub struct SelectionTraceRow {
     pub worker: WorkerWithDpRank,
     pub cost: f64,
+    /// The inputs the builtin cost combined, when the policy exposes them.
+    pub inputs: Option<SelectionTraceInputs>,
+}
+
+/// What a candidate looked like when it was scored: the cache the request would reuse
+/// there and the load already on it. Explains why a cheaper-looking cache hit can lose
+/// to a less busy worker.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SelectionTraceInputs {
+    /// Prompt tokens the router expects this worker to reuse from cache.
+    pub cached_tokens: u64,
+    /// Prompt tokens already queued or being prefilled on the worker.
+    pub active_prefill_tokens: u64,
+    /// Decode-side KV blocks the worker's active requests hold.
+    pub decode_blocks: f64,
+    /// Requests the worker has booked.
+    pub active_requests: u64,
 }
 
 /// Per-candidate costs captured for one worker selection.
@@ -1132,6 +1149,8 @@ pub struct SelectionTrace {
     pub candidate_count: usize,
     /// Whether the host pinned the selection to one worker and rank.
     pub pinned: bool,
+    /// Prompt length of the request, in tokens.
+    pub prompt_tokens: u64,
     /// Retained candidates, unordered.
     pub rows: Vec<SelectionTraceRow>,
 }
