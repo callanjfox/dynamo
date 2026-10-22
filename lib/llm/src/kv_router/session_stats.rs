@@ -16,6 +16,7 @@
 //!   `dynamo_session_summary`, when a session ends. Session IDs never reach a metric.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use dynamo_kv_router::protocols::{LocalBlockHash, WorkerWithDpRank};
@@ -25,7 +26,6 @@ use dynamo_kv_router::{SessionPrefixIndexer, SessionStatsConfig, SessionStatsTra
 use tokio_util::sync::CancellationToken;
 
 use super::metrics::SessionMetrics;
-use super::metrics::session::{DEMAND_WINDOWS, WORKER_STATS};
 use crate::discovery::RuntimeConfigWatch;
 
 const SWEEP_SECS_ENV: &str = "DYN_SESSION_STATS_SWEEP_SECS";
@@ -35,6 +35,8 @@ const IDLE_TTL_SECS_ENV: &str = "DYN_SESSION_STATS_IDLE_TTL_SECS";
 const DEFAULT_SWEEP_SECS: u64 = 10;
 const DEFAULT_ACTIVE_WINDOW_SECS: u64 = 300;
 const DEFAULT_IDLE_TTL_SECS: u64 = 1_800;
+/// How often the per-worker load rows are logged.
+const WORKER_LOG_PERIOD_MS: u64 = 60_000;
 
 fn env_secs(name: &str, default: u64) -> u64 {
     std::env::var(name)
@@ -52,6 +54,8 @@ pub(crate) struct SessionStatsRuntime {
     workers: Option<RuntimeConfigWatch>,
     block_size: u32,
     epoch: Instant,
+    /// When the per-worker load log last ran, in ms since `epoch`; 0 until the first run.
+    last_worker_log_ms: AtomicU64,
 }
 
 impl SessionStatsRuntime {
@@ -75,6 +79,7 @@ impl SessionStatsRuntime {
             workers,
             block_size,
             epoch: Instant::now(),
+            last_worker_log_ms: AtomicU64::new(0),
         })
     }
 
@@ -110,9 +115,6 @@ impl SessionStatsRuntime {
         let outcome =
             self.tracker
                 .on_arrival(session_id, parent, isl_tokens, resident, self.now_ms());
-        if outcome.started {
-            self.metrics.sessions_started_total.inc();
-        }
         if outcome.returning {
             self.metrics
                 .prior_prefix_tokens_total
@@ -150,9 +152,9 @@ impl SessionStatsRuntime {
         self.tracker.on_routed(session_id, worker, &hashes);
     }
 
-    /// Per-worker load: what each worker holds, what it holds for sessions that moved
-    /// away, and the distinct demand homed on it against its GPU KV capacity. The gauges
-    /// carry no worker identity: busiest, least busy and mean over all workers.
+    /// Per-worker load. Metrics carry only fleet-level figures: how uneven the workers are
+    /// (busiest over mean) and the cache left behind by sessions that moved. The per-worker
+    /// rows go to a log, at most once a minute, because a worker identity is not a label.
     fn publish_workers(
         &self,
         home_demand: &std::collections::HashMap<WorkerWithDpRank, u64>,
@@ -161,8 +163,11 @@ impl SessionStatsRuntime {
         let metrics = &self.metrics;
         let block = u64::from(self.block_size);
         let gauge = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+        metrics
+            .tier_overlap_tokens
+            .set(gauge(residency.device_host_overlap * block));
 
-        // Every worker the router knows, so an idle worker pulls the mean and min down.
+        // Every worker the router knows, so an idle worker pulls the mean down.
         let mut workers: Vec<(WorkerWithDpRank, Option<u64>)> = Vec::new();
         if let Some(watch) = &self.workers {
             for (&worker_id, config) in watch.borrow().iter() {
@@ -184,64 +189,63 @@ impl SessionStatsRuntime {
             return;
         }
 
-        // Max, min and mean of one value per worker.
-        let stats = |values: Vec<u64>| {
-            let max = values.iter().copied().max().unwrap_or(0);
-            let min = values.iter().copied().min().unwrap_or(0);
-            let mean = values.iter().sum::<u64>() / values.len().max(1) as u64;
-            [max, min, mean]
+        // Busiest over mean; 1.0 when nothing is held, so an empty fleet reads as even.
+        let imbalance = |values: Vec<u64>| {
+            let max = values.iter().copied().max().unwrap_or(0) as f64;
+            let mean = values.iter().sum::<u64>() as f64 / values.len().max(1) as f64;
+            if mean > 0.0 { max / mean } else { 1.0 }
         };
-        let per_worker = |f: &dyn Fn(&WorkerWithDpRank) -> u64| {
-            stats(workers.iter().map(|(worker, _)| f(worker)).collect())
-        };
-
-        let demand = per_worker(&|worker| home_demand.get(worker).copied().unwrap_or(0));
-        for (stat, tokens) in WORKER_STATS.iter().zip(demand) {
+        metrics.worker_demand_imbalance_ratio.set(imbalance(
+            workers
+                .iter()
+                .map(|(worker, _)| home_demand.get(worker).copied().unwrap_or(0))
+                .collect(),
+        ));
+        type Pick = fn(&dynamo_kv_router::session_prefix_index::TierBlocks) -> u64;
+        let tiers: [(&str, Pick); 2] = [("device", |b| b.device), ("host", |b| b.host)];
+        for (tier, pick) in tiers {
+            let held = workers
+                .iter()
+                .map(|(worker, _)| residency.workers.get(worker).map_or(0, pick))
+                .collect();
             metrics
-                .worker_demand_tokens
-                .with_label_values(&[stat])
-                .set(gauge(tokens));
+                .worker_resident_imbalance_ratio
+                .with_label_values(&[tier])
+                .set(imbalance(held));
+            let left: u64 = residency.left_behind.values().map(pick).sum();
+            metrics
+                .left_behind_tokens
+                .with_label_values(&[tier])
+                .set(gauge(left * block));
         }
-        for (tier, pick) in [
-            ("device", (|b: &dynamo_kv_router::session_prefix_index::TierBlocks| b.device) as fn(&_) -> u64),
-            ("host", |b| b.host),
-        ] {
-            let resident = per_worker(&|worker| {
-                residency.workers.get(worker).map_or(0, pick) * block
-            });
-            let left = per_worker(&|worker| {
-                residency.left_behind.get(worker).map_or(0, pick) * block
-            });
-            for (stat, (held, left)) in WORKER_STATS.iter().zip(resident.into_iter().zip(left)) {
-                metrics
-                    .worker_resident_tokens
-                    .with_label_values(&[stat, tier])
-                    .set(gauge(held));
-                metrics
-                    .worker_left_behind_tokens
-                    .with_label_values(&[stat, tier])
-                    .set(gauge(left));
-            }
-        }
-        metrics
-            .tier_overlap_tokens
-            .set(gauge(residency.device_host_overlap * block));
 
-        let ratios: Vec<f64> = workers
-            .iter()
-            .filter_map(|(worker, capacity)| {
-                capacity
-                    .filter(|&c| c > 0)
-                    .map(|c| home_demand.get(worker).copied().unwrap_or(0) as f64 / c as f64)
-            })
-            .collect();
-        if !ratios.is_empty() {
-            let max = ratios.iter().copied().fold(f64::MIN, f64::max);
-            let min = ratios.iter().copied().fold(f64::MAX, f64::min);
-            let mean = ratios.iter().sum::<f64>() / ratios.len() as f64;
-            for (stat, ratio) in WORKER_STATS.iter().zip([max, min, mean]) {
-                metrics.worker_demand_ratio.with_label_values(&[stat]).set(ratio);
-            }
+        let now_ms = self.now_ms();
+        let last = self.last_worker_log_ms.load(Ordering::Relaxed);
+        if last != 0 && now_ms.saturating_sub(last) < WORKER_LOG_PERIOD_MS {
+            return;
+        }
+        self.last_worker_log_ms
+            .store(now_ms.max(1), Ordering::Relaxed);
+        for (worker, capacity) in &workers {
+            let held = residency.workers.get(worker).copied().unwrap_or_default();
+            let left = residency
+                .left_behind
+                .get(worker)
+                .copied()
+                .unwrap_or_default();
+            tracing::info!(
+                target: "dynamo_session_worker",
+                event = "session_worker_load",
+                worker_id = worker.worker_id,
+                dp_rank = worker.dp_rank,
+                demand_tokens = home_demand.get(worker).copied().unwrap_or(0),
+                resident_device_tokens = held.device * block,
+                resident_host_tokens = held.host * block,
+                left_behind_device_tokens = left.device * block,
+                left_behind_host_tokens = left.host * block,
+                capacity_tokens = capacity.unwrap_or(0),
+                "worker load"
+            );
         }
     }
 
@@ -265,14 +269,7 @@ impl SessionStatsRuntime {
 
     fn record_summary(&self, summary: &SessionSummary) {
         let metrics = &self.metrics;
-        metrics.sessions_ended_total.inc();
         metrics.session_turns.observe(f64::from(summary.turns));
-        metrics
-            .session_input_tokens
-            .observe(summary.isl_tokens as f64);
-        metrics
-            .session_output_tokens
-            .observe(summary.osl_tokens as f64);
         metrics
             .session_peak_context_tokens
             .observe(summary.peak_demand_tokens as f64);
@@ -324,11 +321,6 @@ impl SessionStatsRuntime {
         let snapshot = self.tracker.snapshot(&residency, now_ms);
         let metrics = &self.metrics;
         let gauge = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
-        metrics.sessions_active.set(gauge(snapshot.active_sessions));
-        metrics.demand_tokens.set(gauge(snapshot.demand_tokens));
-        metrics
-            .demand_distinct_tokens
-            .set(gauge(snapshot.demand_distinct_tokens));
         metrics.shared_tokens.set(gauge(snapshot.shared_tokens));
         for (role, sessions, demand) in [
             (
@@ -351,10 +343,10 @@ impl SessionStatsRuntime {
                 .with_label_values(&[role])
                 .set(gauge(demand));
         }
-        for (window, tokens) in DEMAND_WINDOWS.iter().zip(snapshot.demand_window_tokens) {
+        for (idle, tokens) in GAP_BUCKET_LABELS.iter().zip(snapshot.demand_idle_tokens) {
             metrics
-                .demand_window_tokens
-                .with_label_values(&[window])
+                .demand_by_idle_tokens
+                .with_label_values(&[idle])
                 .set(gauge(tokens));
         }
         self.publish_workers(&snapshot.home_demand, &residency);
@@ -446,7 +438,6 @@ mod tests {
         runtime.on_arrival("s", None, 1_700);
 
         let metrics = &runtime.metrics;
-        assert_eq!(metrics.sessions_started_total.get(), 1);
         assert_eq!(
             metrics
                 .thrash_tokens_total
@@ -501,7 +492,6 @@ mod tests {
         runtime.on_complete("root", 20, 0, true);
 
         let metrics = &runtime.metrics;
-        assert_eq!(metrics.sessions_ended_total.get(), 2);
         assert_eq!(metrics.session_turns.get_sample_count(), 2);
         assert_eq!(metrics.session_subagents.get_sample_sum(), 1.0);
     }
@@ -518,14 +508,30 @@ mod tests {
         runtime.publish();
 
         let metrics = &runtime.metrics;
-        assert_eq!(metrics.sessions_active.get(), 1);
-        assert_eq!(metrics.demand_tokens.get(), 160);
+        assert_eq!(
+            metrics.active_by_role.with_label_values(&["primary"]).get(),
+            1
+        );
+        // The session was last active just now, so its demand is in the first idle bucket.
+        assert_eq!(
+            metrics
+                .demand_by_idle_tokens
+                .with_label_values(&["le_1m"])
+                .get(),
+            160
+        );
         assert_eq!(
             metrics.resident_tokens.with_label_values(&["device"]).get(),
             160
         );
         // Nothing was routed with hashes, so no block is referenced yet.
-        assert_eq!(metrics.demand_distinct_tokens.get(), 0);
+        assert_eq!(
+            metrics
+                .demand_by_role_tokens
+                .with_label_values(&["primary"])
+                .get(),
+            0
+        );
     }
 
     fn local(ids: impl IntoIterator<Item = u64>) -> Vec<LocalBlockHash> {
@@ -547,8 +553,8 @@ mod tests {
         runtime.publish();
 
         let metrics = &runtime.metrics;
-        assert_eq!(metrics.demand_tokens.get(), 15 * 16);
-        assert_eq!(metrics.demand_distinct_tokens.get(), 10 * 16);
+        // The roles add up to the distinct demand: ten blocks, not the fifteen the sessions
+        // present between them.
         assert_eq!(metrics.shared_tokens.get(), 5 * 16);
         assert_eq!(
             metrics.active_by_role.with_label_values(&["primary"]).get(),
@@ -575,21 +581,10 @@ mod tests {
                 .get(),
             2 * 16
         );
-        // Without a capacity source the workers are the two that hold sessions.
-        assert_eq!(
-            metrics
-                .worker_demand_tokens
-                .with_label_values(&["max"])
-                .get(),
-            8 * 16
-        );
-        assert_eq!(
-            metrics
-                .worker_demand_tokens
-                .with_label_values(&["mean"])
-                .get(),
-            120
-        );
+        // Without a capacity source the workers are the two that hold sessions: 128 and 112
+        // tokens of distinct demand, so the busiest is 128 over a mean of 120.
+        let ratio = metrics.worker_demand_imbalance_ratio.get();
+        assert!((ratio - 128.0 / 120.0).abs() < 1e-9, "{ratio}");
 
         // A returning turn adds the prior turn's prefix to the reusable total.
         runtime.on_complete("main", 20, 0, false);

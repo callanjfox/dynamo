@@ -61,6 +61,8 @@ def timeline(rows, meta, adjust=False):
         thr_l = lambda y: y["thrash"]["reloaded_host"] + y["thrash"]["reloaded_disk"]
         w = x.get("worker") or {}
         host_only = max(0, x["distinct_host_tokens"] - (x.get("tier_overlap_tokens") or 0))
+        workers = meta["workers"]
+        left_total = x.get("left_total_device") if x.get("left_total_device") is not None else (w.get("left_mean_device") * workers if w.get("left_mean_device") is not None else None)
         windows = x.get("demand_windows") or [None, None, None]
         out.append({
             "t": r(x["now_ms"] / 60000, 3),
@@ -86,8 +88,10 @@ def timeline(rows, meta, adjust=False):
             "shared": x.get("shared_tokens"),
             "thrash_recomputed_pm": r(rate(rows, i, 60000, thr) * 60, 0), "thrash_reloaded_pm": r(rate(rows, i, 60000, thr_l) * 60, 0),
             "wd_max": w.get("demand_max"), "wd_min": w.get("demand_min"), "wd_mean": w.get("demand_mean"),
-            "wr_gpu_max": w.get("resident_max_device"), "wr_host_max": w.get("resident_max_host"),
+            "wr_gpu_max": w.get("resident_max_device"), "wr_gpu_min": w.get("resident_min_device"), "wr_gpu_mean": r(w.get("resident_mean_device"), 0) if w.get("resident_mean_device") is not None else None,
+            "wr_host_max": w.get("resident_max_host"), "wr_host_min": w.get("resident_min_host"), "wr_host_mean": r(w.get("resident_mean_host"), 0) if w.get("resident_mean_host") is not None else None,
             "wl_gpu_max": w.get("left_max_device"), "wl_gpu_mean": w.get("left_mean_device"), "wl_host_max": w.get("left_max_host"),
+            "left_gpu_total": left_total, "needed_gpu": max(0, x["distinct_device_tokens"] - (left_total or 0) - x["stranded_device_tokens"]) if left_total is not None else None,
         })
     return out
 

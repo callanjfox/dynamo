@@ -13,6 +13,8 @@
   const quantile = (xs, q) => { const a = xs.filter((v) => v != null).sort((x, y) => x - y); return a.length ? a[Math.min(a.length - 1, Math.floor(q * a.length))] : null; };
   const median = (xs) => quantile(xs, 0.5);
   const sum = (xs) => xs.reduce((a, v) => a + (v || 0), 0);
+  // A nested array in a dataset row can arrive as JSON text.
+  const parseList = (v) => { if (typeof v === "string") { try { return JSON.parse(v); } catch (e) { return null; } } return v; };
   const ok = (id) => { const d = dash.data(id); return d.status === "ok" ? d.data : null; };
 
   function legend(id, items) {
@@ -38,7 +40,10 @@
   function lineChart(el, spec) {
     el.replaceChildren();
     const rows = spec.rows;
-    const has = spec.series.some((s) => rows.some((r) => r[s.key] != null));
+    // A series with nothing in it (for example reloads when there is no host tier) draws a flat line over the others.
+    spec.series = spec.series.filter((s) => spec.keepEmpty || rows.some((r) => r[s.key] != null && r[s.key] !== 0));
+    if (spec.legendId) legend(spec.legendId, [...spec.series.map((s) => ({ label: s.label, color: s.color })), ...(spec.refs && spec.refs.length ? [{ label: spec.refLabel || "Capacity", dash: true }] : [])]);
+    const has = spec.series.length > 0;
     if (!has) { muted(el, spec.empty || "This run did not report this series."); return; }
     const W = Math.max(280, el.clientWidth || 600), H = 220;
     const right = spec.series.some((s) => s.axis === "right");
@@ -57,13 +62,16 @@
     let topL = 0, topR = 0;
     spec.series.forEach((s, k) => { const mx = d3.max(tops[k]) || 0; if (s.axis === "right") topR = Math.max(topR, mx); else topL = Math.max(topL, mx); });
     for (const r of spec.refs || []) topL = Math.max(topL, r.y);
-    const yL = d3.scaleLinear([0, spec.max || topL * 1.05 || 1], [m.t + ih, m.t]).nice(4);
+    let lowL = 0;
+    spec.series.forEach((s, k) => { if (s.axis !== "right" && !stacked[k]) lowL = Math.min(lowL, d3.min(tops[k]) || 0); });
+    const yL = d3.scaleLinear([lowL, spec.max || topL * 1.05 || 1], [m.t + ih, m.t]).nice(4);
     const yR = d3.scaleLinear([0, topR * 1.05 || 1], [m.t + ih, m.t]).nice(4);
     const Y = (s) => (s.axis === "right" ? yR : yL);
     const svg = d3.select(el).append("svg").attr("viewBox", `0 0 ${W} ${H}`).attr("width", "100%").attr("role", "img").attr("aria-label", spec.label);
     svg.append("g").attr("transform", `translate(${m.l},0)`).call(d3.axisLeft(yL).ticks(4).tickSize(-iw).tickFormat(spec.fmt)).call((g) => { g.select(".domain").remove(); g.selectAll("line").attr("stroke", "var(--cds-chart-grid)"); g.selectAll("text").attr("font-size", null).attr("font-family", null); });
     svg.append("g").attr("transform", `translate(0,${m.t + ih})`).call(d3.axisBottom(x).ticks(Math.min(8, Math.round(iw / 80))).tickFormat((d) => d + "m")).call((g) => { g.select(".domain").attr("stroke", "var(--cds-chart-axis)"); g.selectAll("line").attr("stroke", "var(--cds-chart-axis)"); g.selectAll("text").attr("font-size", null).attr("font-family", null); });
     if (right) svg.append("g").attr("transform", `translate(${m.l + iw},0)`).call(d3.axisRight(yR).ticks(4).tickFormat(spec.fmt2 || spec.fmt)).call((g) => { g.select(".domain").remove(); g.selectAll("line").remove(); g.selectAll("text").attr("font-size", null).attr("font-family", null); });
+    if (lowL < 0) svg.append("line").attr("x1", m.l).attr("x2", m.l + iw).attr("y1", yL(0)).attr("y2", yL(0)).attr("stroke", "var(--cds-chart-axis)").attr("stroke-width", 1);
     for (const r of spec.refs || []) {
       svg.append("line").attr("x1", m.l).attr("x2", m.l + iw).attr("y1", yL(r.y)).attr("y2", yL(r.y)).attr("stroke", "var(--cds-chart-reference)").attr("stroke-width", 1.5).attr("stroke-dasharray", "6 4");
       svg.append("text").attr("x", m.l + iw - 4).attr("y", yL(r.y) - 5).attr("text-anchor", "end").text(r.label);
@@ -132,7 +140,7 @@
     $("blurb").textContent = meta.blurb;
     const act = tl.filter((r) => (r.in_tps || 0) > 0);
     const minutes = Math.round(Math.max(...tl.map((r) => r.t)));
-    const wl = meta.window_labels || ["1m", "5m", "15m"];
+    const wl = parseList(meta.window_labels) || ["1m", "5m", "15m"];
     const words0 = (w) => ({ "30s": "30 seconds", "1m": "1 minute", "5m": "5 minutes", "15m": "15 minutes", "30m": "30 minutes" }[w] || w);
 
     // 1. workload and response
@@ -165,10 +173,10 @@
       hasOut ? ["Output tokens from agents", pct((100 * outAgent) / (outAgent + outChat || 1)), "chat is " + pct((100 * outChat) / (outAgent + outChat || 1)) + " of output"] : null,
       meta.has_chat ? ["Chat prompt size", fmtTok(meta.chat_prompt_p50) + " median", "single turn, shared system prompts"] : null,
     ]);
-    legend("l-mixin", [{ label: "Agents", color: col(0) }, { label: "Chat", color: col(1) }]);
-    lineChart($("c-mixin"), { rows: tl, series: [{ key: "agent_in_tps", label: "Agents", color: col(0), stack: true }, { key: "chat_in_tps", label: "Chat", color: col(1), stack: true }], fmt: fmtTok, label: "Input tokens per second by traffic type" });
-    legend("l-mixout", [{ label: "Agents", color: col(0) }, { label: "Chat", color: col(1) }]);
-    lineChart($("c-mixout"), { rows: tl, series: [{ key: "agent_out_tps", label: "Agents", color: col(0), stack: true }, { key: "chat_out_tps", label: "Chat", color: col(1), stack: true }], fmt: fmtTok, label: "Output tokens per second by traffic type", empty: "This run did not split output tokens by traffic type." });
+    legend("l-mixin", [{ label: "Agents (with a session ID)", color: col(0) }, { label: "Chat (no session ID)", color: col(1) }]);
+    lineChart($("c-mixin"), { rows: tl, series: [{ key: "agent_in_tps", label: "Agents (with a session ID)", color: col(0), stack: true }, { key: "chat_in_tps", label: "Chat (no session ID)", color: col(1), stack: true }], fmt: fmtTok, label: "Input tokens per second by traffic type" });
+    legend("l-mixout", [{ label: "Agents (with a session ID)", color: col(0) }, { label: "Chat (no session ID)", color: col(1) }]);
+    lineChart($("c-mixout"), { rows: tl, series: [{ key: "agent_out_tps", label: "Agents (with a session ID)", color: col(0), stack: true }, { key: "chat_out_tps", label: "Chat (no session ID)", color: col(1), stack: true }], fmt: fmtTok, label: "Output tokens per second by traffic type", empty: "This run did not split output tokens by traffic type." });
 
     // 3. cache funnel
     const pot = median(tl.map((r) => r.pot_pct)), f2 = median(tl.map((r) => r.f2_pct)), f3 = median(tl.map((r) => r.f3_pct));
@@ -200,7 +208,7 @@
     legend("l-held", [...held.map((s) => ({ label: s.label, color: s.color })), { label: "Capacity", dash: true }]);
     lineChart($("c-held"), { rows: tl, series: held, refs: fitRefs, fmt: fmtTok, label: "What the fleet holds" });
     legend("l-thr", [{ label: "Recomputed", color: col(1) }, { label: "Reloaded from host", color: col(2) }]);
-    lineChart($("c-thr"), { rows: tl, series: [{ key: "thrash_recomputed_pm", label: "Recomputed", color: col(1), stack: true }, { key: "thrash_reloaded_pm", label: "Reloaded from host", color: col(2), stack: true }], fmt: fmtTok, label: "Prefix rebuilt by returning sessions" });
+    lineChart($("c-thr"), { legendId: "l-thr", rows: tl, series: [{ key: "thrash_recomputed_pm", label: "Recomputed", color: col(1), stack: true }, { key: "thrash_reloaded_pm", label: "Reloaded from host", color: col(2), stack: true }], fmt: fmtTok, label: "Prefix rebuilt by returning sessions" });
 
     // 5. storage
     const dupG = median(tl.map((r) => r.dup_gpu)), dupH = median(tl.map((r) => r.dup_host));
@@ -219,15 +227,22 @@
     lineChart($("c-dup"), { rows: tl, series: [{ key: "dup_gpu", label: "GPU copies", color: col(1) }].concat(meta.cap_host ? [{ key: "dup_host", label: "Host copies", color: col(2) }] : []), fmt: (v) => v.toFixed(1) + "x", refs: [{ y: 1, label: "1x: one copy" }], label: "Redundant copies" });
     legend("l-ovl", [{ label: "Host, also on GPU", color: col(3) }, { label: "Host only", color: col(2) }]);
     if (!meta.has_overlap) muted($("c-ovl"), "This run did not report GPU and host overlap, or has no host tier."); else lineChart($("c-ovl"), { rows: tl, series: [{ key: "overlap", label: "Host, also on GPU", color: col(3), stack: true }, { key: "host_only", label: "Host only", color: col(2), stack: true }], fmt: fmtTok, label: "GPU and host overlap", empty: "This run did not report GPU and host overlap, or has no host tier." });
-    const wref = [{ y: meta.per_worker_gpu, label: "one worker's GPU " + fmtTok(meta.per_worker_gpu) }].concat(meta.cap_host ? [{ y: meta.per_worker_all, label: "one worker's GPU + host " + fmtTok(meta.per_worker_all) }] : []);
-    const wser = [{ key: "wd_max", label: "Busiest worker", color: col(1) }, { key: "wd_mean", label: "Average worker", color: col(0) }, { key: "wd_min", label: "Least busy worker", color: col(2) }];
-    legend("l-wrk", [...wser.map((s) => ({ label: s.label, color: s.color })), { label: "Per-worker capacity", dash: true }]);
-    lineChart($("c-wrk"), { rows: tl, series: wser, refs: wref, fmt: fmtTok, label: "Demand per worker" });
-    const lser = [{ key: "wl_gpu_max", label: "GPU, busiest", color: col(1) }, { key: "wl_gpu_mean", label: "GPU, average", color: col(0) }].concat(meta.cap_host ? [{ key: "wl_host_max", label: "Host, busiest", color: col(2) }] : []);
-    legend("l-left", lser.map((s) => ({ label: s.label, color: s.color })));
-    lineChart($("c-left"), { rows: tl, series: lser, fmt: fmtTok, label: "Cache left behind", empty: "This run did not report cache left behind by moved sessions." });
+    const wref = [{ y: meta.per_worker_gpu, label: "one worker's GPU " + fmtTok(meta.per_worker_gpu) }];
+    const wser = [{ key: "wr_gpu_max", label: "Busiest worker", color: col(1) }, { key: "wr_gpu_mean", label: "Average worker", color: col(0) }, { key: "wr_gpu_min", label: "Least busy worker", color: col(2) }];
+    legend("l-wrk", [...wser.map((x) => ({ label: x.label, color: x.color })), { label: "One worker's GPU capacity", dash: true }]);
+    lineChart($("c-wrk"), { rows: tl, series: wser, refs: wref, fmt: fmtTok, label: "GPU-resident session tokens per worker", empty: "This run did not log per-worker cache." });
+    const comp = [
+      { key: "needed_gpu", label: "Needed by active sessions", color: col(0), stack: true },
+      { key: "left_gpu_total", label: "Left behind by sessions that moved", color: col(1), stack: true },
+      { key: "stranded_gpu", label: "Held for finished sessions", color: col(3), stack: true },
+    ];
+    legend("l-left", comp.map((x) => ({ label: x.label, color: x.color })).concat([{ label: "GPU capacity", dash: true }]));
+    lineChart($("c-left"), { rows: tl, series: comp, refs: [{ y: meta.cap_gpu, label: "GPU " + fmtTok(meta.cap_gpu) }], fmt: fmtTok, label: "What is in GPU memory", empty: "This run did not report cache left behind by moved sessions." });
+    // The idle wait after the last request ends every session at once; leave that tail out.
+    const lastBusy = tl.reduce((n, r, i) => ((r.in_tps || 0) > 0 ? i : n), 0);
+    const tlBusy = tl.slice(0, lastBusy + 1);
     legend("l-str", [{ label: "GPU", color: col(1) }, ...(meta.cap_host ? [{ label: "Host", color: col(2) }] : [])]);
-    lineChart($("c-str"), { rows: tl, series: [{ key: "stranded_gpu", label: "GPU", color: col(1) }].concat(meta.cap_host ? [{ key: "stranded_host", label: "Host", color: col(2) }] : []), refs: [{ y: meta.cap_gpu, label: "GPU " + fmtTok(meta.cap_gpu) }], fmt: fmtTok, label: "State kept for finished sessions" });
+    lineChart($("c-str"), { rows: tlBusy, series: [{ key: "stranded_gpu", label: "GPU", color: col(1) }].concat(meta.cap_host ? [{ key: "stranded_host", label: "Host", color: col(2) }] : []), refs: [{ y: meta.cap_gpu, label: "GPU " + fmtTok(meta.cap_gpu) }], fmt: fmtTok, label: "State kept for finished sessions" });
     legend("l-shr", [{ label: "Shared by more than one session", color: col(2) }, { label: "Distinct demand", color: col(0) }]);
     lineChart($("c-shr"), { rows: tl, series: [{ key: "shared", label: "Shared by more than one session", color: col(2) }, { key: "demand", label: "Distinct demand", color: col(0) }], fmt: fmtTok, label: "Prefix shared between sessions" });
 
@@ -272,7 +287,7 @@
     // 3b. routing decisions, from the router's decision log
     const rr = routing.map((x) => ({ ...x, pct_best: x.decisions ? (100 * x.best_cache) / x.decisions : 0, pct_load: x.decisions ? (100 * (x.left_cache - x.no_load_advantage)) / x.decisions : 0, pct_other: x.decisions ? (100 * x.no_load_advantage) / x.decisions : 0, pct_same: x.decisions ? (100 * (x.decisions - x.differ)) / x.decisions : 0, decode_tokens: x.decode_saved_blocks * meta.block_size }));
     $("g-route").hidden = !rr.length;
-    $("n-route").textContent = rr.length ? "" : "This run did not record the router decision log.";
+    if (!rr.length) $("n-route").textContent = "This run did not record the router decision log.";
     if (rr.length) {
       const rs = [
         { key: "pct_best", label: "Picked the highest-cache worker", color: col(0), stack: true },
@@ -282,79 +297,78 @@
       ];
       legend("l-rsplit", rs.map((x) => ({ label: x.label, color: x.color })));
       lineChart($("c-rsplit"), { rows: rr, series: rs, fmt: (v) => Math.round(v) + "%", max: 100, label: "How decisions related to cache" });
-      const rt = [{ key: "gave_up_tokens", label: "Cached tokens given up", color: col(0) }, { key: "prefill_saved_tokens", label: "Prefill backlog avoided (tokens)", color: col(1) }, { key: "decode_tokens", label: "Decode load avoided (blocks x block size)", color: col(2) }];
+      const pctOf = (x, n) => (x.left_cache > 0 ? (100 * n) / x.left_cache : null);
+      const rr2 = rr.map((x) => ({ ...x, p_pre: pctOf(x, x.lighter_prefill), p_dec: pctOf(x, x.lighter_decode), p_req: pctOf(x, x.lighter_requests) }));
+      const rt = [
+        { key: "p_pre", label: "Chosen worker had less prefill backlog", color: col(1) },
+        { key: "p_dec", label: "Chosen worker had less decode load", color: col(2) },
+        { key: "p_req", label: "Chosen worker had fewer active requests", color: col(3) },
+      ];
       legend("l-rtrade", rt.map((x) => ({ label: x.label, color: x.color })));
-      lineChart($("c-rtrade"), { rows: rr, series: rt, fmt: fmtTok, label: "What a decision away from the highest cache traded" });
+      lineChart($("c-rtrade"), { rows: rr2, series: rt, fmt: (v) => Math.round(v) + "%", max: 100, label: "Why the router left the highest-cache worker" });
+      const left = d3.sum(rr, (x) => x.left_cache), gave = d3.sum(rr, (x) => x.gave_up_tokens * x.left_cache);
+      $("n-route").textContent = left ? `Over the run the router left the highest-cache worker on ${fmtInt(left)} decisions, giving up ${fmtTok(gave / left)} cached tokens on average. A decision can count in more than one line.` : "";
     }
 
     // 8. metric reference
     const NEW_GROUPS = new Set(["Working set", "Load across workers", "Thrash and returns", "Coverage", "Per-session shape (observed when a session ends)"]);
-    const NEW_ROWS = new Set(["router_selection trace record"]);
+    const NEW_ROWS = new Set(["router_selection trace record", "session_worker_load log", "session_summary log"]);
     const REF = [
       ["Working set", [
-        ["sessions_active", "gauge", "Sessions active inside the window that have not ended."],
-        ["sessions_active_by_role{role}", "gauge", "Active sessions split into primary and subagent."],
-        ["session_demand_tokens", "gauge", "Sum over active sessions of the prefix each will present next. A shared prefix counts once per session."],
-        ["session_demand_distinct_tokens", "gauge", "The same demand counting each distinct prompt block once: the working set a cache must hold."],
-        ["session_demand_by_role_tokens{role}", "gauge", "Distinct demand split by role. A subagent counts only the blocks its primaries do not cover."],
+        ["sessions_active_by_role{role}", "gauge", "Active sessions, primary and subagent."],
+        ["session_demand_by_role_tokens{role}", "gauge", "Distinct prompt tokens the active sessions will present next, each block counted once. A subagent counts only the blocks its primaries do not cover. The sum is the working set."],
+        ["session_demand_by_idle_tokens{idle}", "gauge", "Per-session demand of sessions that have not ended, by time since last activity (up to 1 m, 5 m, 15 m, over). Disjoint buckets, the same as the return gaps. Cumulative sums give demand over several timescales."],
         ["session_shared_tokens", "gauge", "Prompt tokens referenced by more than one active session."],
-        ["session_demand_window_tokens{window}", "gauge", "Per-session demand counting only sessions active in the last 1 m, 5 m or 15 m (the same windows as the return gaps): demand with idle sessions decayed. Not de-duplicated."],
-        ["session_tier_overlap_tokens", "gauge", "Tokens held in both the GPU and host tier of a worker, summed over workers: how much host memory is a copy of GPU memory."],
         ["session_resident_tokens{tier}", "gauge", "Distinct tokens the session index holds in each tier (device, host, disk)."],
         ["session_stranded_tokens{tier}", "gauge", "Tokens held only for inactive sessions (device, host): cache held but not needed."],
         ["session_replicated_tokens{tier}", "gauge", "Copies of session prefix beyond the first on other workers (device, host). The duplication factor is 1 + replicated / resident."],
-        ["sessions_started_total", "counter", "Sessions first seen. A session resuming after it ended counts as a new start."],
-        ["sessions_ended_total", "counter", "Sessions ended by a final-turn marker or by idling past the TTL."],
+        ["session_tier_overlap_tokens", "gauge", "Tokens held in both the GPU and host tier of a worker, summed: how much host memory is a copy of GPU memory."],
       ]],
       ["Load across workers", [
-        ["session_worker_demand_tokens{stat}", "gauge", "Distinct demand homed on one worker (where the session's last turn ran): busiest (max), least busy (min) and mean. A block two sessions share counts once."],
-        ["session_worker_demand_ratio{stat}", "gauge", "That demand over the worker's GPU KV capacity (max, min, mean). Above 1.0 the worker is asked to hold more than its GPU can."],
-        ["session_worker_resident_tokens{stat,tier}", "gauge", "Distinct session tokens a worker holds: busiest, least busy and mean, for GPU and host."],
-        ["session_worker_left_behind_tokens{stat,tier}", "gauge", "Tokens a worker still holds for active sessions whose last turn ran elsewhere: the cache left behind when a session moves."],
+        ["session_left_behind_tokens{tier}", "gauge", "Tokens workers hold for active sessions whose last turn ran elsewhere: cache left behind when a session moves."],
+        ["session_worker_demand_imbalance_ratio", "gauge", "Distinct demand homed on the busiest worker over the mean worker's. 1.0 is even."],
+        ["session_worker_resident_imbalance_ratio{tier}", "gauge", "Distinct session tokens on the busiest worker over the mean worker's, per tier. 1.0 is even."],
+        ["session_worker_load log", "log", "One event per worker each minute: demand, resident and left-behind tokens and capacity. The busiest, least busy and mean worker on this page come from it. A worker identity is never a metric label."],
       ]],
       ["Thrash and returns", [
         ["session_thrash_tokens_total{outcome}", "counter", "Prior-prefix tokens a returning session had to recompute, or reload from host or disk. Recomputed is the cost of running out of cache."],
-        ["session_return_turns_total{gap,outcome}", "counter", "Returning turns by time since the previous turn (up to 1 m, 5 m, 15 m, or over) and where the prior prefix was found (gpu, host, disk, miss)."],
-        ["session_prior_prefix_tokens_total", "counter", "Prefix tokens returning sessions could reuse if nothing had been evicted. The session-history line in the funnel."],
-        ["session_covered_output_tokens_total", "counter", "Output tokens of requests that carried a session ID. With the frontend output total it gives the output from requests without one."],
+        ["session_return_turns_total{gap,outcome}", "counter", "Returning turns by time since the previous turn (up to 1 m, 5 m, 15 m, or over) and where the prior prefix was found (gpu, host, disk, miss). A count over the run."],
+        ["session_prior_prefix_tokens_total", "counter", "Prefix tokens returning sessions could reuse if nothing had been evicted: the prior turn's input, not its output. The session-history line in the funnel."],
       ]],
       ["Coverage", [
         ["session_coverage_requests_total{coverage}", "counter", "Routed requests with (covered) or without (uncovered) a session ID."],
         ["session_coverage_input_tokens_total{coverage}", "counter", "The same split in input tokens: how much of the traffic the session metrics describe."],
+        ["session_covered_output_tokens_total", "counter", "Output tokens of requests that carried a session ID. With the frontend output total it gives the output from requests without one."],
       ]],
       ["Per-session shape (observed when a session ends)", [
-        ["session_turns", "histogram", "Turns per session."],
-        ["session_input_tokens", "histogram", "Input tokens summed over a session."],
-        ["session_output_tokens", "histogram", "Output tokens summed over a session."],
+        ["session_turns", "histogram", "Turns per session. Its _count is the number of sessions."],
         ["session_peak_context_tokens", "histogram", "Largest context a session presented."],
         ["session_cache_hit_ratio", "histogram", "Share of a session's input served from cache, 0 to 1."],
         ["session_duration_seconds", "histogram", "First request to end."],
         ["session_turn_gap_seconds", "histogram", "Mean time between a session's turns."],
         ["session_subagents", "histogram", "Subagent sessions a session spawned."],
+        ["session_summary log", "log", "One event per ended session with its ID, parent, turns, input and output tokens, cache hit, duration, gaps, peak context, fan-out and thrash. The per-session figures on this page come from it."],
       ]],
       ["Cache reuse funnel (already in Dynamo)", [
         ["input_sequence_tokens", "histogram", "F0: every prompt token. Its sum and count give mean input size per request."],
-        ["kv_best_eligible_cached_prefix_tokens_total", "counter", "F2: prefix the router estimates is cached on the best eligible worker."],
+        ["kv_best_eligible_cached_prefix_tokens_total", "counter", "F2: the prefix cached on the highest-cache eligible worker."],
         ["kv_selected_cached_prefix_tokens_total", "counter", "F3: the same on the worker the router chose."],
         ["kv_worker_reused_tokens_total", "counter", "F4: tokens the worker reports reusing."],
         ["output_sequence_tokens", "histogram", "Output tokens per request."],
       ]],
       ["Routing decisions (already in Dynamo, #16395)", [
-        ["router_selection trace record", "trace", "One record per routed request with every candidate worker and the cost the router gave it (DYN_REQUEST_TRACE_RECORDS=router_selection). Not a Prometheus metric: it is a request-trace record, summarized here per minute."],
+        ["router_selection trace record", "trace", "One record per routed request with every candidate worker's cost, and (added in this work) its cached tokens, prefill backlog, decode load and active requests. A request-trace record, not a metric: DYN_REQUEST_TRACE_RECORDS=router_selection."],
       ]],
       ["Compute health (already in Dynamo)", [
         ["frontend time_to_first_token_seconds", "histogram", "Request arrival to first token."],
         ["frontend inter_token_latency_seconds", "histogram", "Time between streamed tokens."],
-        ["frontend request_duration_seconds", "histogram", "Whole-request latency, arrival to last token."],
-        ["frontend worker_last_time_to_first_token_seconds", "gauge", "The most recent TTFT each worker reported."],
-        ["frontend worker_last_inter_token_latency_seconds", "gauge", "The most recent inter-token latency each worker reported."],
         ["frontend queued_requests", "gauge", "Requests waiting in the HTTP queue before a first response."],
         ["frontend inflight_requests", "gauge", "Requests being served."],
         ["frontend router_queue_pending_requests", "gauge", "Requests held in the router's scheduler queue."],
         ["frontend worker_active_requests{request_phase}", "gauge", "Requests booked per worker, split prefill (not yet prefill-complete) and decode."],
         ["frontend worker_active_prefill_tokens", "gauge", "Prompt tokens queued or being prefilled per worker."],
         ["frontend worker_active_decode_blocks", "gauge", "KV blocks booked by active requests per worker."],
-    ]],
+      ]],
     ];
     const rt2 = document.createElement("table"); rt2.className = "reftable";
     rt2.innerHTML = "<thead><tr><th>Metric</th><th>Type</th><th>What it tells you</th></tr></thead>";

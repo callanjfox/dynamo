@@ -25,6 +25,7 @@ ANON=${ANON:-0}
 MAXSEQS=${MAXSEQS:-64}
 FRONTEND_EXTRA=${FRONTEND_EXTRA:-}      # extra frontend flags, for example a router weight
 MOCKER_EXTRA=${MOCKER_EXTRA:-}          # extra mocker flags, for example the AISimulate perf model
+SHARED_PREFIX=${SHARED_PREFIX:-0}       # tokens every session shares at the start of its prompt
 REPEAT=${REPEAT:-1}                     # replay the subset this many times as distinct sessions
 CHAT_RPS=${CHAT_RPS:-0}                 # background chat requests per second, no session headers
 CHAT_PROMPT=${CHAT_PROMPT:-1500}        # median chat prompt, tokens
@@ -74,7 +75,7 @@ if [ "$CHAT_RPS" != "0" ]; then
   CHAT=$!
 fi
 python "$HERE/agentx_drive.py" --subset "$SUBSET" --url http://localhost:$PORT --model "$MODEL" \
-  --sessions "$SESSIONS" --repeat "$REPEAT" --duration-s "$DURATION_S" --ramp-s "$RAMP_S" --time-scale "$TIME_SCALE" --anonymous-fraction "$ANON" \
+  --sessions "$SESSIONS" --repeat "$REPEAT" --shared-prefix-tokens "$SHARED_PREFIX" --duration-s "$DURATION_S" --ramp-s "$RAMP_S" --time-scale "$TIME_SCALE" --anonymous-fraction "$ANON" \
   --out "$OUT/requests.jsonl"
 [ -n "${CHAT:-}" ] && wait $CHAT
 # Let idle sessions expire and the sweep publish before stopping.

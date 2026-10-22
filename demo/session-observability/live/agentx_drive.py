@@ -39,6 +39,8 @@ class Replay:
         self.log = log
         self.deadline = time.time() + args.duration_s
         self.sent = 0
+        rng = random.Random(4242)
+        self.shared_prefix = [rng.randrange(1000, VOCAB) for _ in range(args.shared_prefix_tokens)]
 
     def anonymous(self, salt):
         """Sessions the client sends without Dynamo session headers, to leave traffic uncovered."""
@@ -75,9 +77,14 @@ class Replay:
                 headers["x-dynamo-parent-session-id"] = parent
             if final:
                 headers["x-dynamo-session-final"] = "true"
+        prompt = token_ids(salt, q["hash_ids"], block_size)
+        n = self.args.shared_prefix_tokens
+        if n and len(prompt) >= n:
+            # A system prompt and tool definitions every session starts with.
+            prompt[:n] = self.shared_prefix[:n]
         body = {
             "model": self.args.model,
-            "prompt": token_ids(salt, q["hash_ids"], block_size),
+            "prompt": prompt,
             "max_tokens": max(1, min(q["out"], self.args.max_output)),
             "stream": False,
         }
@@ -114,6 +121,8 @@ async def main():
                         help="share of sessions sent without session headers")
     parser.add_argument("--repeat", type=int, default=1,
                         help="replay the subset this many times as different sessions (distinct KV, same shapes)")
+    parser.add_argument("--shared-prefix-tokens", type=int, default=0,
+                        help="start every prompt with the same N tokens (a multiple of the block size), like a shared system prompt")
     parser.add_argument("--max-output", type=int, default=256)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--out", default="requests.jsonl")

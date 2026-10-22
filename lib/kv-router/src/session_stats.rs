@@ -29,7 +29,7 @@ use crate::session_prefix_index::{ResidencySnapshot, SessionId, TierBlocks};
 /// Upper edges of the turn-gap buckets, in milliseconds: the same 1, 5 and 15 minute
 /// windows the demand gauges use. A gap above the last edge falls in the overflow bucket.
 pub const GAP_BUCKET_EDGES_MS: [u64; 3] = [60_000, 300_000, 900_000];
-const GAP_BUCKETS: usize = GAP_BUCKET_EDGES_MS.len() + 1;
+pub const GAP_BUCKETS: usize = GAP_BUCKET_EDGES_MS.len() + 1;
 
 /// Metric-label names for the turn-gap buckets, in bucket order.
 pub const GAP_BUCKET_LABELS: [&str; GAP_BUCKETS] = ["le_1m", "le_5m", "le_15m", "gt_15m"];
@@ -177,9 +177,10 @@ pub struct SessionStatsSnapshot {
     /// that served their last turn: a block two of them share counts once.
     #[serde(skip)]
     pub home_demand: HashMap<WorkerWithDpRank, u64>,
-    /// The demand sum counting only sessions active within each of
-    /// [`DEMAND_WINDOWS_MS`], so a short window shows demand with idle sessions decayed away.
-    pub demand_window_tokens: [u64; 3],
+    /// Per-session demand of sessions that have not ended, by time since their last
+    /// activity, in the [`GAP_BUCKET_EDGES_MS`] buckets (up to 1, 5, 15 minutes, then over).
+    /// The buckets are disjoint, so their sum is the demand of every session still tracked.
+    pub demand_idle_tokens: [u64; GAP_BUCKETS],
 
     /// Tokens held per tier if no prefix were shared between sessions.
     pub resident_device_tokens: u64,
@@ -204,10 +205,6 @@ pub struct SessionStatsSnapshot {
     /// device, host, disk, miss.
     pub gap_outcomes: Vec<[u64; 4]>,
 }
-
-/// Windows over which demand is also reported, so a session idle longer than the
-/// window stops counting. The configured active window is separate.
-pub const DEMAND_WINDOWS_MS: [u64; 3] = [60_000, 300_000, 900_000];
 
 #[derive(Debug)]
 struct Stat {
@@ -713,14 +710,9 @@ impl SessionStatsTracker {
                     *worker_output.entry(home).or_default() += output;
                 }
             }
-            for (slot, window) in snapshot
-                .demand_window_tokens
-                .iter_mut()
-                .zip(DEMAND_WINDOWS_MS)
-            {
-                if stat.is_active(now_ms, window) {
-                    *slot += demand;
-                }
+            if stat.ended_ms.is_none() {
+                let idle = now_ms.saturating_sub(stat.last_activity_ms());
+                snapshot.demand_idle_tokens[gap_bucket(idle)] += demand;
             }
         }
         let distinct_blocks = inner.distinct.all.len() as u64;
@@ -998,8 +990,8 @@ mod tests {
         assert_eq!(snapshot.shared_tokens, 5 * 16);
         assert_eq!(snapshot.home_demand[&worker(1)], 8 * 16);
         assert_eq!(snapshot.home_demand[&worker(2)], 7 * 16);
-        // The primary was last active 55 s ago, the subagent 5 s ago.
-        assert_eq!(snapshot.demand_window_tokens, [15 * 16, 15 * 16, 15 * 16]);
+        // The primary was last active 55 s ago, the subagent 5 s ago: both in the first bucket.
+        assert_eq!(snapshot.demand_idle_tokens, [15 * 16, 0, 0, 0]);
 
         // The primary idles past the 60 s window: its blocks stop counting, the
         // subagent's shared ones now count in full.

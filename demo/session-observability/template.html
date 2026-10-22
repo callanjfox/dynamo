@@ -330,74 +330,65 @@ const pct = (x) => (x * 100).toFixed(0) + "%";
 const windowStart = (rows, i, ms) => { let j = i; while (j > 0 && rows[i].now_ms - rows[j].now_ms < ms) j--; return j; };
 // Metrics added in this work; the funnel counters and the frontend and worker series already exist in Dynamo.
 const NEW_GROUPS = new Set(["Working set", "Load across workers", "Thrash and returns", "Coverage", "Per-session shape (observed when a session ends)"]);
-const NEW_ROWS = new Set(["router_selection trace record"]);
+const NEW_ROWS = new Set(["router_selection trace record", "session_worker_load log", "session_summary log"]);
 const meta_workers = (run) => run.workers || 4;
 const median = (xs) => quantile(xs, 0.5);
 const REF = [
   ["Working set", [
-    ["sessions_active", "gauge", "Sessions active inside the window that have not ended."],
-    ["sessions_active_by_role{role}", "gauge", "Active sessions split into primary and subagent."],
-    ["session_demand_tokens", "gauge", "Sum over active sessions of the prefix each will present next. A shared prefix counts once per session."],
-    ["session_demand_distinct_tokens", "gauge", "The same demand counting each distinct prompt block once: the working set a cache must hold."],
-    ["session_demand_by_role_tokens{role}", "gauge", "Distinct demand split by role. A subagent counts only the blocks its primaries do not cover."],
+    ["sessions_active_by_role{role}", "gauge", "Active sessions, primary and subagent."],
+    ["session_demand_by_role_tokens{role}", "gauge", "Distinct prompt tokens the active sessions will present next, each block counted once. A subagent counts only the blocks its primaries do not cover. The sum is the working set."],
+    ["session_demand_by_idle_tokens{idle}", "gauge", "Per-session demand of sessions that have not ended, by time since last activity (up to 1 m, 5 m, 15 m, over). Disjoint buckets, the same as the return gaps. Cumulative sums give demand over several timescales."],
     ["session_shared_tokens", "gauge", "Prompt tokens referenced by more than one active session."],
-    ["session_demand_window_tokens{window}", "gauge", "Per-session demand counting only sessions active in the last 1 m, 5 m or 15 m (the same windows as the return gaps): demand with idle sessions decayed. Not de-duplicated."],
-    ["session_tier_overlap_tokens", "gauge", "Tokens held in both the GPU and host tier of a worker, summed over workers: how much host memory is a copy of GPU memory."],
     ["session_resident_tokens{tier}", "gauge", "Distinct tokens the session index holds in each tier (device, host, disk)."],
     ["session_stranded_tokens{tier}", "gauge", "Tokens held only for inactive sessions (device, host): cache held but not needed."],
     ["session_replicated_tokens{tier}", "gauge", "Copies of session prefix beyond the first on other workers (device, host). The duplication factor is 1 + replicated / resident."],
-    ["sessions_started_total", "counter", "Sessions first seen. A session resuming after it ended counts as a new start."],
-    ["sessions_ended_total", "counter", "Sessions ended by a final-turn marker or by idling past the TTL."],
+    ["session_tier_overlap_tokens", "gauge", "Tokens held in both the GPU and host tier of a worker, summed: how much host memory is a copy of GPU memory."],
   ]],
   ["Load across workers", [
-    ["session_worker_demand_tokens{stat}", "gauge", "Distinct demand homed on one worker (where the session's last turn ran): busiest (max), least busy (min) and mean. A block two sessions share counts once."],
-    ["session_worker_demand_ratio{stat}", "gauge", "That demand over the worker's GPU KV capacity (max, min, mean). Above 1.0 the worker is asked to hold more than its GPU can."],
-    ["session_worker_resident_tokens{stat,tier}", "gauge", "Distinct session tokens a worker holds: busiest, least busy and mean, for GPU and host."],
-    ["session_worker_left_behind_tokens{stat,tier}", "gauge", "Tokens a worker still holds for active sessions whose last turn ran elsewhere: the cache left behind when a session moves."],
+    ["session_left_behind_tokens{tier}", "gauge", "Tokens workers hold for active sessions whose last turn ran elsewhere: cache left behind when a session moves."],
+    ["session_worker_demand_imbalance_ratio", "gauge", "Distinct demand homed on the busiest worker over the mean worker's. 1.0 is even."],
+    ["session_worker_resident_imbalance_ratio{tier}", "gauge", "Distinct session tokens on the busiest worker over the mean worker's, per tier. 1.0 is even."],
+    ["session_worker_load log", "log", "One event per worker each minute: demand, resident and left-behind tokens and capacity. The busiest, least busy and mean worker on this page come from it. A worker identity is never a metric label."],
   ]],
   ["Thrash and returns", [
     ["session_thrash_tokens_total{outcome}", "counter", "Prior-prefix tokens a returning session had to recompute, or reload from host or disk. Recomputed is the cost of running out of cache."],
-    ["session_return_turns_total{gap,outcome}", "counter", "Returning turns by time since the previous turn (up to 1 m, 5 m, 15 m, or over) and where the prior prefix was found (gpu, host, disk, miss)."],
-    ["session_prior_prefix_tokens_total", "counter", "Prefix tokens returning sessions could reuse if nothing had been evicted. The session-history line in the funnel."],
-    ["session_covered_output_tokens_total", "counter", "Output tokens of requests that carried a session ID. With the frontend output total it gives the output from requests without one."],
+    ["session_return_turns_total{gap,outcome}", "counter", "Returning turns by time since the previous turn (up to 1 m, 5 m, 15 m, or over) and where the prior prefix was found (gpu, host, disk, miss). A count over the run."],
+    ["session_prior_prefix_tokens_total", "counter", "Prefix tokens returning sessions could reuse if nothing had been evicted: the prior turn's input, not its output. The session-history line in the funnel."],
   ]],
   ["Coverage", [
     ["session_coverage_requests_total{coverage}", "counter", "Routed requests with (covered) or without (uncovered) a session ID."],
     ["session_coverage_input_tokens_total{coverage}", "counter", "The same split in input tokens: how much of the traffic the session metrics describe."],
+    ["session_covered_output_tokens_total", "counter", "Output tokens of requests that carried a session ID. With the frontend output total it gives the output from requests without one."],
   ]],
   ["Per-session shape (observed when a session ends)", [
-    ["session_turns", "histogram", "Turns per session."],
-    ["session_input_tokens", "histogram", "Input tokens summed over a session."],
-    ["session_output_tokens", "histogram", "Output tokens summed over a session."],
+    ["session_turns", "histogram", "Turns per session. Its _count is the number of sessions."],
     ["session_peak_context_tokens", "histogram", "Largest context a session presented."],
     ["session_cache_hit_ratio", "histogram", "Share of a session's input served from cache, 0 to 1."],
     ["session_duration_seconds", "histogram", "First request to end."],
     ["session_turn_gap_seconds", "histogram", "Mean time between a session's turns."],
     ["session_subagents", "histogram", "Subagent sessions a session spawned."],
+    ["session_summary log", "log", "One event per ended session with its ID, parent, turns, input and output tokens, cache hit, duration, gaps, peak context, fan-out and thrash. The per-session figures on this page come from it."],
   ]],
   ["Cache reuse funnel (already in Dynamo)", [
     ["input_sequence_tokens", "histogram", "F0: every prompt token. Its sum and count give mean input size per request."],
-    ["kv_best_eligible_cached_prefix_tokens_total", "counter", "F2: prefix the router estimates is cached on the best eligible worker."],
+    ["kv_best_eligible_cached_prefix_tokens_total", "counter", "F2: the prefix cached on the highest-cache eligible worker."],
     ["kv_selected_cached_prefix_tokens_total", "counter", "F3: the same on the worker the router chose."],
     ["kv_worker_reused_tokens_total", "counter", "F4: tokens the worker reports reusing."],
     ["output_sequence_tokens", "histogram", "Output tokens per request."],
   ]],
   ["Routing decisions (already in Dynamo, #16395)", [
-    ["router_selection trace record", "trace", "One record per routed request with every candidate worker and the cost the router gave it (DYN_REQUEST_TRACE_RECORDS=router_selection). Not a Prometheus metric: it is a request-trace record, summarized here per minute."],
+    ["router_selection trace record", "trace", "One record per routed request with every candidate worker's cost, and (added in this work) its cached tokens, prefill backlog, decode load and active requests. A request-trace record, not a metric: DYN_REQUEST_TRACE_RECORDS=router_selection."],
   ]],
   ["Compute health (already in Dynamo)", [
     ["frontend time_to_first_token_seconds", "histogram", "Request arrival to first token."],
     ["frontend inter_token_latency_seconds", "histogram", "Time between streamed tokens."],
-    ["frontend request_duration_seconds", "histogram", "Whole-request latency, arrival to last token."],
-    ["frontend worker_last_time_to_first_token_seconds", "gauge", "The most recent TTFT each worker reported."],
-    ["frontend worker_last_inter_token_latency_seconds", "gauge", "The most recent inter-token latency each worker reported."],
     ["frontend queued_requests", "gauge", "Requests waiting in the HTTP queue before a first response."],
     ["frontend inflight_requests", "gauge", "Requests being served."],
     ["frontend router_queue_pending_requests", "gauge", "Requests held in the router's scheduler queue."],
     ["frontend worker_active_requests{request_phase}", "gauge", "Requests booked per worker, split prefill (not yet prefill-complete) and decode."],
     ["frontend worker_active_prefill_tokens", "gauge", "Prompt tokens queued or being prefilled per worker."],
     ["frontend worker_active_decode_blocks", "gauge", "KV blocks booked by active requests per worker."],
-]],
+  ]],
 ];
 const quantile = (xs, q) => { const a = [...xs].sort((x, y) => x - y); return a.length ? a[Math.min(a.length - 1, Math.floor(q * a.length))] : 0; };
 

@@ -75,6 +75,30 @@ def percentiles(xs):
     return {"p50": pick(0.5), "p90": pick(0.9), "max": xs[-1] if xs else 0}
 
 
+def worker_snapshots(directory):
+    """Per-worker rows from the router's session_worker_load log, grouped by log time."""
+    path = directory / "workers.jsonl"
+    if not path.exists():
+        return []
+    import datetime
+    groups = {}
+    for r in read_jsonl(path):
+        t = datetime.datetime.fromisoformat(r["time"].replace("Z", "+00:00")).timestamp()
+        groups.setdefault(round(t / 5), []).append(r)
+    return [{"t": min(datetime.datetime.fromisoformat(x["time"].replace("Z", "+00:00")).timestamp() for x in g), "workers": g} for _, g in sorted(groups.items())]
+
+
+def worker_stats(snapshot):
+    """Busiest, least busy and mean worker for demand, resident and left-behind tokens."""
+    ws = snapshot["workers"]
+    out = {}
+    for prefix, tier, key in (("demand", "", "demand_tokens"), ("resident", "device", "resident_device_tokens"), ("resident", "host", "resident_host_tokens"), ("left", "device", "left_behind_device_tokens"), ("left", "host", "left_behind_host_tokens")):
+        xs = [w[key] for w in ws]
+        for stat, v in (("max", max(xs)), ("min", min(xs)), ("mean", sum(xs) / len(xs))):
+            out[f"{prefix}_{stat}" + (f"_{tier}" if tier else "")] = v
+    return out
+
+
 def opt(m, key, cast=int):
     """The series' value, or None when the router that produced the run did not export it."""
     return cast(m[key]) if key in m else None
@@ -164,7 +188,7 @@ def live_run(directory):
     capacity_host = meta["workers"] * meta.get("num_host_blocks", 0) * meta["block_size"]
     # Runs before the window change report 30s, 1m and 5m; later ones 1m, 5m and 30m.
     last_keys = set().union(*(sc["m"].keys() for sc in scrapes[-5:]))
-    if "session_demand_window_tokens{window=15m}" in last_keys:
+    if "session_demand_by_idle_tokens{idle=le_1m}" in last_keys or "session_demand_window_tokens{window=15m}" in last_keys:
         window_labels = ("1m", "5m", "15m")
     elif "session_demand_window_tokens{window=30m}" in last_keys:
         window_labels = ("1m", "5m", "30m")
@@ -177,16 +201,21 @@ def live_run(directory):
         g = lambda key: int(m.get(key, 0))
         rows.append({
             "now_ms": int((scrape["t"] - t0) * 1000),
-            "active_sessions": g("sessions_active"),
-            "demand_tokens": g("session_demand_tokens"),
-            # Newer runs report demand with a shared prefix counted once; older ones only the per-session sum.
-            "demand_distinct_tokens": g("session_demand_distinct_tokens") if "session_demand_distinct_tokens" in m else g("session_demand_tokens"),
+            "active_sessions": g("sessions_active_by_role{role=primary}") + g("sessions_active_by_role{role=subagent}") if "sessions_active_by_role{role=primary}" in m else g("sessions_active"),
+            "demand_tokens": sum(g(f"session_demand_by_idle_tokens{{idle={i}}}") for i in ("le_1m", "le_5m", "le_15m", "gt_15m")) if "session_demand_by_idle_tokens{idle=le_1m}" in m else g("session_demand_tokens"),
+            # Runs from before the metric pruning report demand with a shared prefix counted once under its own name.
+            "demand_distinct_tokens": g("session_demand_by_role_tokens{role=primary}") + g("session_demand_by_role_tokens{role=subagent}") if "session_demand_by_role_tokens{role=primary}" in m and "session_demand_by_idle_tokens{idle=le_1m}" in m else (g("session_demand_distinct_tokens") if "session_demand_distinct_tokens" in m else g("session_demand_tokens")),
             "demand_primary_tokens": g("session_demand_by_role_tokens{role=primary}"),
             "demand_subagent_tokens": g("session_demand_by_role_tokens{role=subagent}"),
             "active_primary": g("sessions_active_by_role{role=primary}"),
             "active_subagent": g("sessions_active_by_role{role=subagent}"),
             "shared_tokens": g("session_shared_tokens"),
-            "demand_windows": [g(f"session_demand_window_tokens{{window={w}}}") for w in window_labels],
+            "demand_windows": ([sum(g(f"session_demand_by_idle_tokens{{idle={i}}}") for i in ("le_1m", "le_5m", "le_15m", "gt_15m")[:k]) for k in (1, 2, 3)] if "session_demand_by_idle_tokens{idle=le_1m}" in m else [g(f"session_demand_window_tokens{{window={w}}}") for w in window_labels]),
+            "left_total_device": opt(m, "session_left_behind_tokens{tier=device}"),
+            "left_total_host": opt(m, "session_left_behind_tokens{tier=host}"),
+            "demand_imbalance": opt(m, "session_worker_demand_imbalance_ratio", float),
+            "resident_imbalance_device": opt(m, "session_worker_resident_imbalance_ratio{tier=device}", float),
+            "resident_imbalance_host": opt(m, "session_worker_resident_imbalance_ratio{tier=host}", float),
             "worker": {
                 **{f"demand_{stat}": opt(m, f"session_worker_demand_tokens{{stat={stat}}}") for stat in ("max", "min", "mean")},
                 **{f"ratio_{stat}": opt(m, f"session_worker_demand_ratio{{stat={stat}}}", float) for stat in ("max", "min", "mean")},
@@ -196,7 +225,7 @@ def live_run(directory):
             "prior_prefix": g("session_prior_prefix_tokens_total"),
             "tier_overlap_tokens": g("session_tier_overlap_tokens"),
             "covered_output_tokens": g("session_covered_output_tokens_total"),
-            "distinct_demand": "session_demand_distinct_tokens" in m,
+            "distinct_demand": "session_demand_distinct_tokens" in m or "session_demand_by_idle_tokens{idle=le_1m}" in m,
             "distinct_device_tokens": g("session_resident_tokens{tier=device}"),
             "distinct_host_tokens": g("session_resident_tokens{tier=host}"),
             "stranded_device_tokens": g("session_stranded_tokens{tier=device}"),
@@ -229,6 +258,13 @@ def live_run(directory):
             "compute": compute_row(m),
         })
         hists.append({name: buckets(m, "fe_" + name) for name in ("time_to_first_token_seconds", "inter_token_latency_seconds", "request_duration_seconds")})
+    snapshots = worker_snapshots(directory)
+    if snapshots:
+        for row in rows:
+            at = t0 + row["now_ms"] / 1000
+            latest = [x for x in snapshots if x["t"] <= at]
+            if latest:
+                row["worker"] = worker_stats(latest[-1])
     for row in rows:
         if row["compute"]:
             row["compute"]["block_capacity"] = meta["num_gpu_blocks"]
