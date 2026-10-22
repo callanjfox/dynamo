@@ -596,6 +596,7 @@ function render(idx) {
     tile("Prefix reuse", pct(isl ? cached / isl : 0), last.prior_prefix > 0 && isl ? `${fmtTok(cached)} of ${fmtTok(isl)} input tokens from cache; session history says up to ${pct(Math.min(1, last.prior_prefix / isl))} was possible` : `${fmtTok(cached)} of ${fmtTok(isl)} input tokens served from cache`) +
     tile("Sessions", String(sess.length), `${subs} are subagents`) +
     ((lc) => lc && lc.requests_covered + lc.requests_uncovered > 0 ? tile("Session coverage", pct(lc.requests_covered / (lc.requests_covered + lc.requests_uncovered)), `of requests carry a session ID, ${pct(lc.tokens_covered / (lc.tokens_covered + lc.tokens_uncovered || 1))} of input tokens`) : "")(last.coverage) +
+    (run.requests && run.requests.chat ? tile("Chat requests", fmtNum(run.requests.chat.sent), `${pct(run.requests.chat.sent / (run.requests.chat.sent + run.requests.sent))} of all requests, median prompt ${fmtTok(run.requests.chat.prompt_p50)}, p50 ${run.requests.chat.p50_s.toFixed(2)}s`) : "") +
     (run.requests ? tile("Requests", fmtNum(run.requests.sent), `${fmtNum(run.requests.failed)} failed, p50 ${run.requests.p50_s.toFixed(1)}s, p90 ${run.requests.p90_s.toFixed(1)}s`) : "");
 
   // 1. working set vs capacity

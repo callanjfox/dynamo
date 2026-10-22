@@ -51,9 +51,10 @@ LIVE_RUNS = [
      "{workers} mock workers ({gpu}k tokens of GPU cache){host_note}."),
     ("ax_host", "AgentX, live", "GPU + host memory",
      "The same AgentX sessions with a host-memory tier on each worker: {workers} mock workers, {gpu}k tokens of GPU cache{host_note}."),
-    ("ax_mixed", "AgentX, partial coverage", "30% of sessions without headers",
-     "A shorter AgentX run through the same router, where about 30% of the sessions are sent without Dynamo session headers. "
-     "{workers} mock workers, {gpu}k tokens of GPU cache{host_note}. The coverage panel shows how much of the traffic the session metrics describe."),
+    ("ax_mixed", "AgentX plus chat traffic", "GPU + host, chat without session IDs",
+     "The same AgentX sessions with background chat traffic added: single-turn requests with no session headers, about one a second with a median 2,000-token prompt, "
+     "some starting with a shared system prompt. They stand in for the non-agentic share of a fleet. {workers} mock workers, {gpu}k tokens of GPU cache{host_note}. "
+     "The session metrics describe only the agentic part; the agent traffic panel shows the split."),
     ("ax_trace", "AgentX, routing decisions", "GPU + host, router_selection trace on",
      "A shorter AgentX run with the router's per-candidate cost trace (router_selection records) turned on, "
      "{workers} mock workers, {gpu}k tokens of GPU cache{host_note}. The routing decisions panel shows how the router chose between workers."),
@@ -276,6 +277,17 @@ def live_run(directory):
         t0_ms = t0 * 1000
         selection = [{**r, "now_ms": int(r["t_ms"] - t0_ms)} for r in read_jsonl(directory / "selection.jsonl")]
     meta["selection"] = selection
+    chat_path = directory / "chat.jsonl"
+    if chat_path.exists():
+        chat = [r for r in read_jsonl(chat_path)]
+        chat_ok = [r for r in chat if r.get("status") == 200]
+        lat = sorted(r["latency_s"] for r in chat_ok)
+        request_stats["chat"] = {
+            "sent": len(chat),
+            "failed": len(chat) - len(chat_ok),
+            "p50_s": lat[len(lat) // 2] if lat else 0,
+            "prompt_p50": percentiles([r["prompt_tokens"] for r in chat_ok if r.get("prompt_tokens")])["p50"],
+        }
     return rows, sessions, meta, request_stats
 
 

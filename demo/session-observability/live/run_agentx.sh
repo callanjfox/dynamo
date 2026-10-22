@@ -22,6 +22,8 @@ MODEL=${MODEL:-Qwen/Qwen3-0.6B}
 PORT=${PORT:-8000}
 WPORT=${WPORT:-8081}   # the mocker's system status server: engine-style worker metrics
 ANON=${ANON:-0}
+CHAT_RPS=${CHAT_RPS:-0}                 # background chat requests per second, no session headers
+CHAT_PROMPT=${CHAT_PROMPT:-1500}        # median chat prompt, tokens
 HERE=$(cd "$(dirname "$0")" && pwd)
 
 mkdir "$OUT" || { echo "$OUT exists"; exit 1; }
@@ -62,9 +64,15 @@ echo "ready"
 python "$HERE/scrape.py" --url http://localhost:$PORT/metrics --out "$OUT/metrics.jsonl" \
   --stop-file "$OUT/stop" --interval 5 &
 SCRAPER=$!
+if [ "$CHAT_RPS" != "0" ]; then
+  python "$HERE/chat_load.py" --url http://localhost:$PORT --model "$MODEL" --rps "$CHAT_RPS" \
+    --prompt-median "$CHAT_PROMPT" --duration-s "$DURATION_S" --out "$OUT/chat.jsonl" &
+  CHAT=$!
+fi
 python "$HERE/agentx_drive.py" --subset "$SUBSET" --url http://localhost:$PORT --model "$MODEL" \
   --sessions "$SESSIONS" --duration-s "$DURATION_S" --ramp-s "$RAMP_S" --time-scale "$TIME_SCALE" --anonymous-fraction "$ANON" \
   --out "$OUT/requests.jsonl"
+[ -n "${CHAT:-}" ] && wait $CHAT
 # Let idle sessions expire and the sweep publish before stopping.
 sleep $(( ${TTL:-180} + 15 ))
 touch "$OUT/stop"
