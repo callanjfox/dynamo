@@ -20,6 +20,7 @@ pub mod scheduling;
 pub mod sequences;
 pub mod services;
 pub mod session_prefix_index;
+pub mod session_stats;
 pub mod tracking_hash;
 pub mod worker_type;
 pub mod zmq_wire;
@@ -83,7 +84,11 @@ pub use plugins::worker_selection::{
     WorkerSelectionContext, WorkerSelectionPolicy,
 };
 pub use session_prefix_index::{
-    LogicalNode, NodeId, SessionId, SessionPrefixIndexError, SessionPrefixIndexer,
+    LogicalNode, NodeId, ResidencySnapshot, SessionId, SessionPrefixIndexError,
+    SessionPrefixIndexer, TierBlocks,
+};
+pub use session_stats::{
+    ReturnOutcome, SessionStatsConfig, SessionStatsSnapshot, SessionStatsTracker, SessionSummary,
 };
 pub use tracking_hash::{TrackingHashAlgorithm, TrackingHashContext, TrackingHashScope};
 pub use worker_type::WorkerType;

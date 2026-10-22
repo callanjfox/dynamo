@@ -31,8 +31,8 @@ use reference::pick_default_worker;
 use super::filter::{RoutingEligibility, WorkerEligibilityError};
 use super::types::{KvSchedulerError, SchedulingRequest, WorkerSelectionPolicyError};
 use crate::protocols::{
-    SelectionTrace, SelectionTraceRow, SelectionTraceSpec, WorkerConfigLike, WorkerId,
-    WorkerSelectionResult, WorkerWithDpRank,
+    SelectionTrace, SelectionTraceInputs, SelectionTraceRow, SelectionTraceSpec, WorkerConfigLike,
+    WorkerId, WorkerSelectionResult, WorkerWithDpRank,
 };
 
 /// Low-level selector used by routing hosts.
@@ -330,27 +330,34 @@ fn build_selection_trace(
     candidates: &[ScoredWorkerCandidate],
     selected_row: usize,
     pinned: bool,
+    prompt_tokens: u64,
+    inputs_of: &dyn Fn(usize) -> Option<SelectionTraceInputs>,
     spec: SelectionTraceSpec,
 ) -> SelectionTrace {
     let candidate_count = candidates.len();
-    let row_of = |candidate: &ScoredWorkerCandidate| SelectionTraceRow {
+    let row_of = |index: usize, candidate: &ScoredWorkerCandidate| SelectionTraceRow {
         worker: candidate.worker,
         cost: candidate.cost,
+        inputs: inputs_of(index),
     };
     let rows = if spec.top_k == 0 || spec.top_k >= candidate_count {
-        candidates.iter().map(row_of).collect()
+        candidates
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| row_of(index, candidate))
+            .collect()
     } else {
         let mut rows: Vec<SelectionTraceRow> = Vec::with_capacity(spec.top_k + 1);
         // Index into `rows` of the costliest retained row.
         let mut costliest = 0;
-        for candidate in candidates {
+        for (index, candidate) in candidates.iter().enumerate() {
             if rows.len() < spec.top_k {
                 if rows.is_empty() || candidate.cost > rows[costliest].cost {
                     costliest = rows.len();
                 }
-                rows.push(row_of(candidate));
+                rows.push(row_of(index, candidate));
             } else if candidate.cost < rows[costliest].cost {
-                rows[costliest] = row_of(candidate);
+                rows[costliest] = row_of(index, candidate);
                 for (index, row) in rows.iter().enumerate() {
                     if row.cost > rows[costliest].cost {
                         costliest = index;
@@ -360,13 +367,14 @@ fn build_selection_trace(
         }
         let selected = &candidates[selected_row];
         if !rows.iter().any(|row| row.worker == selected.worker) {
-            rows.push(row_of(selected));
+            rows.push(row_of(selected_row, selected));
         }
         rows
     };
     SelectionTrace {
         candidate_count,
         pinned,
+        prompt_tokens,
         rows,
     }
 }
@@ -510,6 +518,7 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
                 candidates,
                 cache_inputs,
                 load_inputs,
+                unscored_candidates,
                 ..
             } = &mut *state;
             if candidates.is_empty() {
@@ -548,10 +557,24 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
                 };
                 log_scored_candidates(request, worker_type, candidates, row);
                 let trace = trace.map(|spec| {
+                    // Scorer rows line up with `candidates` when any scorer ran; a picker-only
+                    // policy keeps none, and its trace carries costs alone.
+                    let inputs_of = |index: usize| {
+                        let data = unscored_candidates.get(index)?;
+                        let worker = candidates.get(index)?.worker;
+                        Some(SelectionTraceInputs {
+                            cached_tokens: request.effective_cached_tokens_for(worker) as u64,
+                            active_prefill_tokens: data.load.active_prefill_tokens as u64,
+                            decode_blocks: data.load.decode_cost_blocks,
+                            active_requests: data.load.active_requests as u64,
+                        })
+                    };
                     build_selection_trace(
                         candidates,
                         row,
                         input.context.pinned_worker.is_some(),
+                        input.context.prompt_tokens() as u64,
+                        &inputs_of,
                         spec,
                     )
                 });
@@ -606,7 +629,14 @@ mod selection_trace_tests {
     #[test]
     fn zero_top_k_keeps_every_candidate() {
         let rows = candidates(&[3.0, 1.0, 2.0]);
-        let trace = build_selection_trace(&rows, 2, false, SelectionTraceSpec { top_k: 0 });
+        let trace = build_selection_trace(
+            &rows,
+            2,
+            false,
+            0,
+            &|_| None,
+            SelectionTraceSpec { top_k: 0 },
+        );
         assert_eq!(trace.candidate_count, 3);
         assert_eq!(worker_ids_by_cost(&trace), vec![1, 2, 0]);
         assert!(!trace.pinned);
@@ -616,20 +646,41 @@ mod selection_trace_tests {
     fn top_k_keeps_lowest_costs_and_appends_selected_row() {
         let rows = candidates(&[5.0, 1.0, 4.0, 2.0, 3.0, 0.5]);
         // Selected row 0 costs 5.0, the worst candidate: it is appended after the three cheapest.
-        let trace = build_selection_trace(&rows, 0, true, SelectionTraceSpec { top_k: 3 });
+        let trace = build_selection_trace(
+            &rows,
+            0,
+            true,
+            0,
+            &|_| None,
+            SelectionTraceSpec { top_k: 3 },
+        );
         assert_eq!(trace.candidate_count, 6);
         assert_eq!(worker_ids_by_cost(&trace), vec![5, 1, 3, 0]);
         assert!(trace.pinned);
 
         // Selected row already among the cheapest: nothing is appended.
-        let trace = build_selection_trace(&rows, 1, false, SelectionTraceSpec { top_k: 3 });
+        let trace = build_selection_trace(
+            &rows,
+            1,
+            false,
+            0,
+            &|_| None,
+            SelectionTraceSpec { top_k: 3 },
+        );
         assert_eq!(worker_ids_by_cost(&trace), vec![5, 1, 3]);
     }
 
     #[test]
     fn top_k_at_or_above_candidate_count_keeps_everything() {
         let rows = candidates(&[2.0, 1.0]);
-        let trace = build_selection_trace(&rows, 0, false, SelectionTraceSpec { top_k: 8 });
+        let trace = build_selection_trace(
+            &rows,
+            0,
+            false,
+            0,
+            &|_| None,
+            SelectionTraceSpec { top_k: 8 },
+        );
         assert_eq!(worker_ids_by_cost(&trace), vec![1, 0]);
     }
 
@@ -637,7 +688,14 @@ mod selection_trace_tests {
     fn top_k_pass_tracks_the_costliest_retained_row() {
         // Descending costs force a replacement on every candidate after the first k.
         let rows = candidates(&[9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0]);
-        let trace = build_selection_trace(&rows, 6, false, SelectionTraceSpec { top_k: 2 });
+        let trace = build_selection_trace(
+            &rows,
+            6,
+            false,
+            0,
+            &|_| None,
+            SelectionTraceSpec { top_k: 2 },
+        );
         assert_eq!(worker_ids_by_cost(&trace), vec![6, 5]);
     }
 }

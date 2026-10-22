@@ -89,6 +89,14 @@ pub struct RequestTraceRouterSelection {
     pub pinned: bool,
     pub candidate_count: u64,
     pub candidates: Vec<(u64, u32, f64)>,
+    /// Prompt length of the routed request, in tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u64>,
+    /// What each candidate looked like when scored, in the same order as `candidates`:
+    /// `[cached_tokens, active_prefill_tokens, decode_blocks, active_requests]`. Empty when
+    /// the policy does not expose them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<[f64; 4]>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -501,6 +509,8 @@ mod tests {
                 pinned: false,
                 candidate_count: 40,
                 candidates: vec![(7, 0, 1.5), (9, 1, 1.5), (3, 0, 2.25)],
+                prompt_tokens: Some(1_000),
+                inputs: vec![[640.0, 0.0, 12.0, 3.0]; 3],
             }),
         };
 

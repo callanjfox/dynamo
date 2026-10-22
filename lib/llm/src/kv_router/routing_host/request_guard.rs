@@ -274,9 +274,24 @@ impl CanonicalOutputTracker {
 }
 
 /// Owns request-scoped timing and metrics state.
+/// What a finished request reports to per-session telemetry.
+struct SessionCompletion {
+    stats: Arc<crate::kv_router::session_stats::SessionStatsRuntime>,
+    session_id: String,
+    request_id: String,
+    /// The tracker's number for this attempt, so a retry's earlier attempt is told apart.
+    attempt: Option<u64>,
+    isl_tokens: u64,
+    /// The prefix the router expected the selected worker to reuse, replaced by the worker's
+    /// own report when it sends one.
+    cached_tokens: u64,
+    session_final: bool,
+}
+
 struct RequestObservability {
     tracker: Option<Arc<RequestTracker>>,
     request_metrics: Arc<RouterRequestMetrics>,
+    session: Option<SessionCompletion>,
     cumulative_osl: usize,
     metrics_recorded: bool,
     first_token_recorded: bool,
@@ -292,6 +307,7 @@ impl RequestObservability {
         Self {
             tracker,
             request_metrics,
+            session: None,
             cumulative_osl: 0,
             metrics_recorded: false,
             first_token_recorded: false,
@@ -375,9 +391,25 @@ impl RequestObservability {
         }
     }
 
+    /// This attempt will not complete (it never dispatched, or its retry takes over): undo
+    /// its session arrival and do not let its final-turn marker end the session.
+    fn abandon_session(&mut self) {
+        if let Some(session) = self.session.take() {
+            session.stats.on_abandoned(
+                &session.session_id,
+                session.attempt.map(|a| (session.request_id.as_str(), a)),
+                session.isl_tokens,
+            );
+        }
+    }
+
     fn record_metrics(&mut self, record_itl_at_completion: bool) {
         // A failed dispatch never reached the backend and must not count as a request.
-        if self.metrics_recorded || !self.dispatched {
+        if !self.dispatched {
+            self.abandon_session();
+            return;
+        }
+        if self.metrics_recorded {
             return;
         }
         self.metrics_recorded = true;
@@ -402,6 +434,15 @@ impl RequestObservability {
                 .observe(self.cumulative_osl as f64);
         }
         self.request_metrics.requests_total.inc();
+        if let Some(session) = self.session.take() {
+            session.stats.on_complete_with(
+                &session.session_id,
+                session.attempt.map(|a| (session.request_id.as_str(), a)),
+                self.cumulative_osl as u64,
+                session.cached_tokens,
+                session.session_final,
+            );
+        }
     }
 }
 
@@ -638,6 +679,9 @@ impl RequestGuard {
         if attempt_id.is_some() {
             request_metrics.requests_started_total.inc();
         }
+        let routed_cached_tokens = kv_route
+            .as_ref()
+            .map_or(0, |route| route.selected_router_tokens);
         let kv_hit = kv_route.map(|route| KvHitTracking {
             prompt_tokens: route.prompt_tokens,
             reused_tokens: Some(request_metrics.observe_kv_route_estimate(
@@ -651,9 +695,24 @@ impl RequestGuard {
         let output_hashes = approximate_lru
             .as_ref()
             .map(|_| CanonicalOutputTracker::new(request, block_size as u32, chooser.is_eagle()));
+        let mut observability = RequestObservability::new(request.tracker.clone(), request_metrics);
+        if attempt_id.is_some()
+            && let (Some(stats), Some(agent)) =
+                (chooser.session_stats(), request.agent_context.as_ref())
+        {
+            observability.session = Some(SessionCompletion {
+                stats: Arc::clone(stats),
+                session_id: agent.session_id.clone(),
+                request_id: cleanup.context_id.clone(),
+                attempt: stats.attempt_of(&agent.session_id, &cleanup.context_id),
+                isl_tokens: isl_tokens as u64,
+                cached_tokens: routed_cached_tokens,
+                session_final: agent.session_final.unwrap_or(false),
+            });
+        }
         Self {
             cleanup: RequestCleanup::Kv(cleanup),
-            observability: RequestObservability::new(request.tracker.clone(), request_metrics),
+            observability,
             output_blocks: OutputBlockTracker::new(
                 track_output_blocks,
                 isl_tokens,
@@ -879,6 +938,7 @@ impl RequestGuard {
             return false;
         };
         lifecycle.prepare_retry();
+        self.observability.abandon_session();
         migration_state.store_request_lifecycle(lifecycle);
         self.cleanup.finish().await;
         true
@@ -910,6 +970,11 @@ impl RequestGuard {
         };
         if let Some(counter) = kv.reused_tokens.take() {
             counter.inc_by(reused);
+            // Under cache pressure the worker reuses far less than the router expected, so the
+            // session hit ratio should carry what was served.
+            if let Some(session) = self.observability.session.as_mut() {
+                session.cached_tokens = reused;
+            }
         }
     }
 }
