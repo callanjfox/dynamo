@@ -231,16 +231,19 @@
     const wser = [{ key: "wr_gpu_max", label: "Busiest worker", color: col(1) }, { key: "wr_gpu_mean", label: "Average worker", color: col(0) }, { key: "wr_gpu_min", label: "Least busy worker", color: col(2) }];
     legend("l-wrk", [...wser.map((x) => ({ label: x.label, color: x.color })), { label: "One worker's GPU capacity", dash: true }]);
     lineChart($("c-wrk"), { rows: tl, series: wser, refs: wref, fmt: fmtTok, label: "GPU-resident session tokens per worker", empty: "This run did not log per-worker cache." });
+    // The idle wait after the last request ends every session at once; leave that tail out of the cache-composition charts.
+    const lastBusy = tl.reduce((n, r, i) => ((r.in_tps || 0) > 0 ? i : n), 0);
+    const tlBusy = tl.slice(0, lastBusy + 1);
+    const imbS = [{ key: "imb_res_gpu", label: "GPU-resident tokens, busiest over average", color: col(1) }, { key: "imb_demand", label: "Homed demand, busiest over average", color: col(0) }].concat(meta.cap_host ? [{ key: "imb_res_host", label: "Host-resident tokens, busiest over average", color: col(2) }] : []);
+    legend("l-imb", imbS.map((x) => ({ label: x.label, color: x.color })).concat([{ label: "1.0 is even", dash: true }]));
+    lineChart($("c-imb"), { rows: tlBusy, series: imbS, refs: [{ y: 1, label: "even" }], fmt: (v) => v.toFixed(1) + "x", label: "Imbalance ratio", min1: true, empty: "This run did not report the imbalance ratios." });
     const comp = [
       { key: "needed_gpu", label: "Needed by active sessions", color: col(0), stack: true },
       { key: "left_gpu_total", label: "Left behind by sessions that moved", color: col(1), stack: true },
       { key: "stranded_gpu", label: "Held for finished sessions", color: col(3), stack: true },
     ];
     legend("l-left", comp.map((x) => ({ label: x.label, color: x.color })).concat([{ label: "GPU capacity", dash: true }]));
-    lineChart($("c-left"), { rows: tl, series: comp, refs: [{ y: meta.cap_gpu, label: "GPU " + fmtTok(meta.cap_gpu) }], fmt: fmtTok, label: "What is in GPU memory", empty: "This run did not report cache left behind by moved sessions." });
-    // The idle wait after the last request ends every session at once; leave that tail out.
-    const lastBusy = tl.reduce((n, r, i) => ((r.in_tps || 0) > 0 ? i : n), 0);
-    const tlBusy = tl.slice(0, lastBusy + 1);
+    lineChart($("c-left"), { rows: tlBusy, series: comp, refs: [{ y: meta.cap_gpu, label: "GPU " + fmtTok(meta.cap_gpu) }], fmt: fmtTok, label: "What is in GPU memory", empty: "This run did not report cache left behind by moved sessions." });
     legend("l-str", [{ label: "GPU", color: col(1) }, ...(meta.cap_host ? [{ label: "Host", color: col(2) }] : [])]);
     lineChart($("c-str"), { rows: tlBusy, series: [{ key: "stranded_gpu", label: "GPU", color: col(1) }].concat(meta.cap_host ? [{ key: "stranded_host", label: "Host", color: col(2) }] : []), refs: [{ y: meta.cap_gpu, label: "GPU " + fmtTok(meta.cap_gpu) }], fmt: fmtTok, label: "State kept for finished sessions" });
     legend("l-shr", [{ label: "Shared by more than one session", color: col(2) }, { label: "Distinct demand", color: col(0) }]);

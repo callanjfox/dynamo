@@ -91,6 +91,7 @@ def timeline(rows, meta, adjust=False):
             "wr_gpu_max": w.get("resident_max_device"), "wr_gpu_min": w.get("resident_min_device"), "wr_gpu_mean": r(w.get("resident_mean_device"), 0) if w.get("resident_mean_device") is not None else None,
             "wr_host_max": w.get("resident_max_host"), "wr_host_min": w.get("resident_min_host"), "wr_host_mean": r(w.get("resident_mean_host"), 0) if w.get("resident_mean_host") is not None else None,
             "wl_gpu_max": w.get("left_max_device"), "wl_gpu_mean": w.get("left_mean_device"), "wl_host_max": w.get("left_max_host"),
+            "imb_demand": x.get("demand_imbalance"), "imb_res_gpu": x.get("resident_imbalance_device"), "imb_res_host": x.get("resident_imbalance_host"),
             "left_gpu_total": left_total, "needed_gpu": max(0, x["distinct_device_tokens"] - (left_total or 0) - x["stranded_device_tokens"]) if left_total is not None else None,
         })
     return out

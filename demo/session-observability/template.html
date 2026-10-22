@@ -106,6 +106,9 @@
   .hist h3 { font-size: 13px; margin: 6px 0 2px; color: var(--ink-2); font-weight: 600; }
   .hist .gaprow { grid-template-columns: 78px 1fr 34px; }
   .newpill { display: inline-block; margin-left: 8px; padding: 1px 7px; border-radius: 999px; background: var(--s1); color: #fff; font-size: 10.5px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; vertical-align: 2px; }
+  .src { display: inline-block; margin-left: 8px; padding: 0 7px; border-radius: 999px; font-size: 10.5px; font-weight: 500; letter-spacing: .02em; vertical-align: 1px; white-space: nowrap; }
+  .src.metric { border: 1px solid var(--ink-3); color: var(--ink-2); }
+  .src.log { background: var(--ink); color: var(--surface); }
   .nav { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 0 0 18px; font-size: 13px; }
   .nav a { color: var(--s1); text-decoration: none; }
   .nav a:hover { text-decoration: underline; }
@@ -126,6 +129,7 @@
   <div class="tabs" id="tabs"></div>
   <p class="blurb" id="blurb"></p>
 
+  <p class="sub"><span class="src metric" style="margin-left:0">metric</span> a Prometheus metric the router or frontend exports. <span class="src log" style="margin-left:0">log</span> a structured log event (session_summary, session_worker_load, the router_selection trace).</p>
   <div class="nav"><a href="#sec-sessions">Your sessions</a><a href="#sec-cache">Working set and cache</a><a href="#sec-compute">Compute health</a><a href="#sec-ref">Metric reference</a></div>
 
   <h2 class="section" id="sec-sessions">Your sessions</h2>
@@ -137,7 +141,7 @@
     <div class="hists" id="hists"></div>
   </div>
   <div class="card" id="card-shape">
-    <h2>Request size over time</h2>
+    <h2>Request size over time<span class="src metric">metric</span></h2>
     <p class="note">Mean input tokens (left axis) and output tokens (right axis) per request in each 60 second window. Input grows as sessions accumulate context; output stays small. Two axes, so compare the shapes, not the heights.</p>
     <div class="legend" id="leg9"></div>
     <div class="chart" id="c9"></div>
@@ -148,49 +152,49 @@
   <div class="tiles" id="tiles"></div>
 
   <div class="card">
-    <h2>Working set against capacity<span class="newpill" title="Metrics added in this work">new</span></h2>
+    <h2>Working set against capacity<span class="newpill" title="Metrics added in this work">new</span><span class="src metric">metric</span></h2>
     <p class="note" id="note1">Demand is the distinct tokens the active sessions will present next. Resident is what each tier holds. A shared prefix is counted once in both.</p>
     <div class="legend" id="leg1"></div>
     <div class="chart" id="c1"></div>
   </div>
 
   <div class="card">
-    <h2>Thrash: prefix tokens a returning session had to rebuild<span class="newpill" title="Metrics added in this work">new</span></h2>
+    <h2>Thrash: prefix tokens a returning session had to rebuild<span class="newpill" title="Metrics added in this work">new</span><span class="src metric">metric</span></h2>
     <p class="note">Tokens per 30 seconds. Recomputed means the prefix was in no tier. Reloaded means it was only in host memory. This is an estimate, not a worker measurement: when a returning turn arrives the router takes the previous turn's input plus output as the prefix the session should find, and subtracts what the session index says each tier still holds for that session. The worker-reported reuse (funnel step F4) would be the measured counterpart; the mock workers do not report it.</p>
     <div class="legend" id="leg2"></div>
     <div class="chart" id="c2"></div>
   </div>
 
   <div class="card">
-    <h2>Active sessions<span class="newpill" title="Metrics added in this work">new</span></h2>
+    <h2>Active sessions<span class="newpill" title="Metrics added in this work">new</span><span class="src metric">metric</span></h2>
     <p class="note">Sessions active inside the window, split into primary sessions and the subagents they spawn.</p>
     <div class="legend" id="leg3"></div>
     <div class="chart" id="c3"></div>
   </div>
 
   <div class="card" id="card-role">
-    <h2>Primary sessions and subagents<span class="newpill" title="Metrics added in this work">new</span></h2>
+    <h2>Primary sessions and subagents<span class="newpill" title="Metrics added in this work">new</span><span class="src metric">metric</span></h2>
     <p class="note">The distinct working set split by role. A subagent counts only the blocks its primary sessions do not already hold, so its line is the capacity subagents add on top of the sessions that spawned them.</p>
     <div class="legend" id="leg16"></div>
     <div class="chart" id="c16"></div>
   </div>
 
   <div class="card" id="card-decay">
-    <h2>Demand if idle sessions decay<span class="newpill" title="Metrics added in this work">new</span></h2>
+    <h2>Demand if idle sessions decay<span class="newpill" title="Metrics added in this work">new</span><span class="src metric">metric</span></h2>
     <p class="note">The same per-session demand counting only sessions active within each window, against the router's active window. A session quiet for minutes may or may not return; the gap between these lines is demand that depends on that bet. The return-gap panel below shows how often sessions do come back.</p>
     <div class="legend" id="leg17"></div>
     <div class="chart" id="c17"></div>
   </div>
 
   <div class="card">
-    <h2>KV held for idle or finished sessions<span class="newpill" title="Metrics added in this work">new</span></h2>
+    <h2>KV held for idle or finished sessions<span class="newpill" title="Metrics added in this work">new</span><span class="src metric">metric</span></h2>
     <p class="note">Distinct GPU tokens that only inactive sessions still reference. This is evictable, so it matters only when it crowds out active demand.</p>
     <div class="legend" id="leg4"></div>
     <div class="chart" id="c4"></div>
   </div>
 
   <div class="card" id="card-cov">
-    <h2>Agent traffic against the rest<span class="newpill" title="Metrics added in this work">new</span></h2>
+    <h2>Agent traffic against the rest<span class="newpill" title="Metrics added in this work">new</span><span class="src metric">metric</span></h2>
     <p class="note">Input and output tokens per second (60 second window) from requests that carried a session ID, stacked on those that did not. Everything else on this page describes only the session share. Requests without an ID are routed as usual but are not tracked. The partial coverage run sends 30% of its sessions without headers.</p>
     <div class="legend" id="leg8"></div>
     <div class="chart" id="c8"></div>
@@ -201,21 +205,21 @@
   </div>
 
   <div class="card" id="card-repl">
-    <h2>Duplication factor<span class="newpill" title="Metrics added in this work">new</span></h2>
+    <h2>Duplication factor<span class="newpill" title="Metrics added in this work">new</span><span class="src metric">metric</span></h2>
     <p class="note">Copies of the cache across workers, within one tier. 1x means each prefix block is held on one worker; 1.2x on the GPU line means the GPUs together hold 20% more blocks than there are distinct blocks, because some blocks sit on more than one worker. The host line is the same for host memory. It says nothing about whether host memory repeats what is on the GPU: the stacked chart above separates that when the run reports the overlap.</p>
     <div class="legend" id="leg6"></div>
     <div class="chart" id="c6"></div>
   </div>
 
   <div class="card" id="card-shared">
-    <h2>Shared prefix across sessions<span class="newpill" title="Metrics added in this work">new</span></h2>
+    <h2>Shared prefix across sessions<span class="newpill" title="Metrics added in this work">new</span><span class="src metric">metric</span></h2>
     <p class="note">Prompt tokens that more than one active session presents, such as a system prompt, a repository summary, or a subagent starting from its parent's context. The per-session demand sum counts them each time; the distinct demand counts them once. In the AgentX corpus the sharing is small: sessions share nothing with each other, and a subagent's context is small next to its parent's, so the spikes are subagents starting. Traces with a common system prompt or repository would show much more.</p>
     <div class="legend" id="leg18"></div>
     <div class="chart" id="c18"></div>
   </div>
 
   <div class="card" id="card-worker">
-    <h2>Load across workers<span class="newpill" title="Metrics added in this work">new</span></h2>
+    <h2>Load across workers<span class="newpill" title="Metrics added in this work">new</span><span class="src log">log: session_worker_load</span></h2>
     <p class="note">Distinct demand homed on the busiest, the least busy and the mean worker, against what one worker can hold. A shared block counts once per worker. Fleet totals can look fine while a few workers carry most sessions and spill past their own GPU and host memory. A session is homed on the worker that served its last turn.</p>
     <div class="legend" id="leg19"></div>
     <div class="chart" id="c19"></div>
@@ -230,7 +234,7 @@
   </div>
 
   <div class="card" id="card-select">
-    <h2>Routing decisions<span class="newpill" title="Added in this work">new: candidate inputs</span></h2>
+    <h2>Routing decisions<span class="newpill" title="Added in this work">new: candidate inputs</span><span class="src log">log: router_selection trace</span></h2>
     <div id="sel-why">
       <p class="note">Why the router picked the worker it did, from its per-candidate trace (router_selection records), per 60 second window. The router scores each worker on the cache it would reuse and on the load already there, and picks the lowest cost. The first chart splits decisions by how the pick related to cache; the second, for the decisions that left the worker with the most cached tokens, compares the cache given up with the load avoided. When the load avoided is as large as the cache given up, the router did what you would expect: it traded a cache hit for a less busy worker.</p>
       <div class="legend" id="leg22"></div>
@@ -246,7 +250,7 @@
   </div>
 
   <div class="card" id="card-funnel">
-    <h2>Cache reuse funnel<span class="newpill" title="Added in this work">new session-history line</span></h2>
+    <h2>Cache reuse funnel<span class="newpill" title="Added in this work">new session-history line</span><span class="src metric">metric</span></h2>
     <p class="note">Share of prompt tokens at each step in each 60 second window. The session-history line is what the session index says a returning session could reuse if nothing had been evicted (covered traffic only, and only the part that is a returning session's own prior prefix). F2 is the prefix the router estimates is cached on the best eligible worker. F3 is the same on the worker it chose. F4 is what the worker reports reusing. The table has the cumulative totals.</p>
     <div class="legend" id="leg7"></div>
     <div class="chart" id="c7"></div>
@@ -254,14 +258,14 @@
   </div>
 
   <div class="card">
-    <h2>Where a returning session finds its prefix, by time since its last turn<span class="newpill" title="Metrics added in this work">new</span></h2>
+    <h2>Where a returning session finds its prefix, by time since its last turn<span class="newpill" title="Metrics added in this work">new</span><span class="src metric">metric</span></h2>
     <p class="note">Share of returning turns whose prior prefix was on the GPU, in host memory, or mostly missing (so recomputed), to within a tenth. A turn is counted when its request arrives, by the time since that session's previous turn finished: a session that waits ten minutes lands in "5 to 15 min" when it comes back, and one that never returns is never counted. The buckets (1, 5 and 15 minutes) are the same windows the decay chart uses. Long gaps lose the GPU.</p>
     <div class="legend" id="leg5"></div>
     <div id="gap"></div>
   </div>
 
   <div class="card">
-    <h2>What the sessions look like<span class="newpill" title="Metrics added in this work">new</span></h2>
+    <h2>What the sessions look like<span class="newpill" title="Metrics added in this work">new</span><span class="src log">log: session_summary</span></h2>
     <p class="note">Distribution across all sessions in this run, including subagents. Context is the largest prefix a session presented.</p>
     <div class="scroll" id="dist"></div>
   </div>
@@ -271,25 +275,25 @@
   <p class="section-note">How the workers cope with that load. If the working set is too big the cost shows up here: longer time to first token as prefixes are recomputed, a queue building, the KV cache full. Latency and queue series come from the frontend and the router's per-worker load tracking. Workers are mockers, so absolute times are the simulation's.</p>
   <div class="tiles small" id="ctiles"></div>
   <div class="card">
-    <h2>Time to first token</h2>
+    <h2>Time to first token<span class="src metric">metric</span></h2>
     <p class="note">Median and 90th percentile over a trailing 30 seconds. Prompts that recompute a large prefix wait longer for their first token.</p>
     <div class="legend" id="leg11"></div>
     <div class="chart" id="c11"></div>
   </div>
   <div class="card">
-    <h2>Inter-token latency</h2>
+    <h2>Inter-token latency<span class="src metric">metric</span></h2>
     <p class="note">Median and 90th percentile over a trailing 30 seconds, in milliseconds. It rises with batch size and context length.</p>
     <div class="legend" id="leg12"></div>
     <div class="chart" id="c12"></div>
   </div>
   <div class="card">
-    <h2>Throughput</h2>
+    <h2>Throughput<span class="src metric">metric</span></h2>
     <p class="note">Input tokens (left axis) and output tokens (right axis) per second the fleet serves, from the frontend's counters over a trailing 60 seconds. Input tokens are mostly cache hits when reuse is high, so a worker's real prefill load is lower. Two axes, so compare the shapes, not the heights.</p>
     <div class="legend" id="leg25"></div>
     <div class="chart" id="c25"></div>
   </div>
   <div class="card" id="card-wspread">
-    <h2>Slowest worker against the median worker</h2>
+    <h2>Slowest worker against the median worker<span class="src metric">metric</span></h2>
     <p class="note">The most recent time to first token (top chart) and inter-token latency (bottom chart) each worker reported: two different latencies, each shown for the slowest worker and the median worker. A wide gap means some workers are slower than others, which points at uneven load more than at the fleet being too small.</p>
     <div class="legend" id="leg27"></div>
     <div class="chart" id="c27"></div>
@@ -297,13 +301,13 @@
     <div class="chart" id="c28"></div>
   </div>
   <div class="card">
-    <h2>Queues</h2>
+    <h2>Queues<span class="src metric">metric</span></h2>
     <p class="note">Requests the router has booked on a worker and not yet marked prefill-complete (waiting for the prefill or running it), requests decoding, and requests held at the frontend or router queue before dispatch. A growing prefill count means the fleet is saturated.</p>
     <div class="legend" id="leg13"></div>
     <div class="chart" id="c13"></div>
   </div>
   <div class="card">
-    <h2>Estimated queue wait</h2>
+    <h2>Estimated queue wait<span class="src metric">metric: derived</span></h2>
     <p class="note">Prefill backlog (prompt tokens queued or being prefilled) divided by the input token rate over a trailing 30 seconds: how long the backlog takes to clear. Neither the frontend nor the mock workers export a queue-time histogram, so this is derived. A real engine exports one (vllm:request_queue_time_seconds) and it should replace this estimate.</p>
     <div class="legend" id="leg14"></div>
     <div class="chart" id="c14"></div>
