@@ -21,7 +21,7 @@ import time
 
 import aiohttp
 
-VOCAB = 150000
+VOCAB = 120000  # below the smallest vocabulary in use (DeepSeek V4: 129,280)
 
 
 def token_ids(trace_salt, hash_ids, block_size):
@@ -112,12 +112,14 @@ async def main():
     parser.add_argument("--idle-gap-cap-s", type=float, default=300.0)
     parser.add_argument("--anonymous-fraction", type=float, default=0.0,
                         help="share of sessions sent without session headers")
+    parser.add_argument("--repeat", type=int, default=1,
+                        help="replay the subset this many times as different sessions (distinct KV, same shapes)")
     parser.add_argument("--max-output", type=int, default=256)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--out", default="requests.jsonl")
     args = parser.parse_args()
     rng = random.Random(args.seed)
-    traces = json.load(open(args.subset))[: args.sessions]
+    traces = (json.load(open(args.subset)) * args.repeat)[: args.sessions]
 
     timeout = aiohttp.ClientTimeout(total=1800)
     connector = aiohttp.TCPConnector(limit=0)

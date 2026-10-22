@@ -437,11 +437,11 @@ Compare `session_resident_tokens` and demand with worker KV capacity from the en
 | `session_coverage_requests_total` | counter | `coverage` (`covered`, `uncovered`) | Routed requests by whether they carried a session ID. The covered share is the part of the traffic the session metrics describe. Requires `--enable-session-prefix-index`. |
 | `session_coverage_input_tokens_total` | counter | `coverage` (`covered`, `uncovered`) | Input tokens of those requests, so coverage can be read by traffic weight as well as by count. |
 | `session_covered_output_tokens_total` | counter | none | Output tokens of requests that carried a session ID. Subtract it from the frontend output-token total for the output of requests without one. |
-| `session_prior_prefix_tokens_total` | counter | none | Prefix tokens returning sessions could reuse if nothing had been evicted: the prior turn's input plus output, capped at this turn's input. Divide by input tokens for the cache hit the session history makes possible, and compare with the reuse the router and workers report. |
+| `session_prior_prefix_tokens_total` | counter | none | Prefix tokens returning sessions could reuse if nothing had been evicted: the prior turn's input, capped at this turn's input; its output is not counted. Divide by input tokens for the cache hit the session history makes possible, and compare with the reuse the router and workers report. |
 | `session_thrash_tokens_total` | counter | `outcome` (`recomputed`, `reloaded_host`, `reloaded_disk`) | Tokens of a returning session's prior prefix that were not on the GPU when the turn arrived. `recomputed` means no tier held them; the reloaded outcomes mean the named tier did. |
 | `session_return_turns_total` | counter | `gap` (`le_1m`, `le_5m`, `le_15m`, `gt_15m`), `outcome` (`gpu`, `host`, `disk`, `miss`) | Returning turns by time since the previous turn finished and where the prior prefix was found, to within a tenth of it. Gives the survival curve per tier. |
 
-The prior prefix is estimated as the previous turn's input plus output, capped at this turn's input, against what the session index holds at arrival. It assumes the harness resends its history. Treat it as an estimate: it carries up to one block of rounding per turn.
+The prior prefix is estimated as the previous turn's input, capped at this turn's input, against what the session index holds at arrival. The previous turn's output is not counted, to match the cache reuse funnel, which counts prompt tokens. It assumes the harness resends its history. Treat it as an estimate: it carries up to one block of rounding per turn.
 
 **Session shape.** Counters and histograms. Histograms are observed once per session, when it ends.
 

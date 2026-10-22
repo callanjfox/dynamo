@@ -126,7 +126,7 @@ pub struct ArrivalOutcome {
     /// The session had an earlier turn with a prefix to find.
     pub returning: bool,
     /// Prefix the turn was expected to reuse: the smaller of the prior turn's
-    /// input plus output and this turn's input.
+    /// input and this turn's input.
     pub prior_tokens: u64,
     /// Time since the session's previous turn finished.
     pub gap_ms: Option<u64>,
@@ -505,7 +505,10 @@ impl SessionStatsTracker {
         }
 
         let returning = stat.turns > 0 || stat.carried;
-        let prior = stat.demand.min(isl_tokens);
+        // The prefix a worker cached for the previous turn is that turn's input. Its
+        // output is not counted: it is generated, not part of the prompt a worker
+        // prefilled, so no reuse figure (the funnel included) counts it either.
+        let prior = stat.inflight_isl.min(isl_tokens);
         let gap_ms = returning.then(|| now_ms.saturating_sub(stat.last_activity_ms()));
 
         let device = resident.device * block;
@@ -816,10 +819,11 @@ mod tests {
         let tracker = tracker();
         tracker.on_arrival("s", None, 1_000, TierBlocks::default(), 0);
         tracker.on_complete("s", 200, 0, 5_000);
-        // Prior prefix is 1_200 tokens, 75 blocks, all on the device.
-        let outcome = tracker.on_arrival("s", None, 1_500, blocks(75, 0, 0), 9_000);
+        // The prior prefix is the previous turn's 1_000 input tokens (the 200 it generated
+        // are not counted), 62 blocks of 16 plus a partial one, all on the device.
+        let outcome = tracker.on_arrival("s", None, 1_500, blocks(63, 0, 0), 9_000);
         assert!(outcome.returning);
-        assert_eq!(outcome.prior_tokens, 1_200);
+        assert_eq!(outcome.prior_tokens, 1_000);
         assert_eq!(outcome.gap_ms, Some(4_000));
         assert_eq!(outcome.thrash.total(), 0);
         assert_eq!(outcome.outcome, Some(ReturnOutcome::HitDevice));

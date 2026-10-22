@@ -19,7 +19,7 @@ import time
 
 import aiohttp
 
-VOCAB = 150000
+VOCAB = 120000  # below the smallest vocabulary in use (DeepSeek V4: 129,280)
 
 
 def tokens(rng, count):

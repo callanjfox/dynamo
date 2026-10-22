@@ -332,7 +332,7 @@ impl SessionMetrics {
             worker_resident_tokens,
             prior_prefix_tokens_total: counter(
                 "session_prior_prefix_tokens_total",
-                "Prefix tokens returning sessions could reuse if nothing had been evicted: the prior turn's input and output, up to the new prompt length",
+                "Prefix tokens returning sessions could reuse if nothing had been evicted: the prior turn's input, up to the new prompt length",
             ),
             coverage_requests_total,
             coverage_input_tokens_total,

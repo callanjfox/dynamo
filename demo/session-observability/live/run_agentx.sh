@@ -22,6 +22,10 @@ MODEL=${MODEL:-Qwen/Qwen3-0.6B}
 PORT=${PORT:-8000}
 WPORT=${WPORT:-8081}   # the mocker's system status server: engine-style worker metrics
 ANON=${ANON:-0}
+MAXSEQS=${MAXSEQS:-64}
+FRONTEND_EXTRA=${FRONTEND_EXTRA:-}      # extra frontend flags, for example a router weight
+MOCKER_EXTRA=${MOCKER_EXTRA:-}          # extra mocker flags, for example the AISimulate perf model
+REPEAT=${REPEAT:-1}                     # replay the subset this many times as distinct sessions
 CHAT_RPS=${CHAT_RPS:-0}                 # background chat requests per second, no session headers
 CHAT_PROMPT=${CHAT_PROMPT:-1500}        # median chat prompt, tokens
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -38,19 +42,19 @@ export PYTHONPATH=/root/dynamo/components/src
 cat > "$OUT/meta.json" <<JSON
 {"workers": $WORKERS, "num_gpu_blocks": $BLOCKS, "num_host_blocks": $HOST_BLOCKS, "block_size": $BLOCK,
  "speedup": $SPEEDUP, "sessions": $SESSIONS, "duration_s": $DURATION_S, "time_scale": $TIME_SCALE,
- "active_window_s": ${WINDOW:-60}, "idle_ttl_s": ${TTL:-180}, "workload": "agentx", "anonymous_fraction": $ANON}
+ "active_window_s": ${WINDOW:-60}, "idle_ttl_s": ${TTL:-180}, "workload": "agentx", "anonymous_fraction": $ANON, "model": "$MODEL"}
 JSON
 
 HOST_ARGS=""
 [ "$HOST_BLOCKS" -gt 0 ] && HOST_ARGS="--num-host-blocks $HOST_BLOCKS"
 
 python -m dynamo.frontend --http-port $PORT --discovery-backend file --router-mode kv \
-  --router-kv-events --kv-cache-block-size "$BLOCK" --enable-session-prefix-index \
+  --router-kv-events --kv-cache-block-size "$BLOCK" --enable-session-prefix-index $FRONTEND_EXTRA \
   > "$OUT/frontend.log" 2>&1 &
 FRONTEND=$!
 python -m dynamo.mocker --model-path "$MODEL" --discovery-backend file \
   --num-workers "$WORKERS" --num-gpu-blocks-override "$BLOCKS" --block-size "$BLOCK" \
-  --max-num-seqs 64 --max-model-len 1100000 --speedup-ratio "$SPEEDUP" --enable-prefix-caching $HOST_ARGS \
+  --max-num-seqs "$MAXSEQS" --max-model-len 1100000 --speedup-ratio "$SPEEDUP" --enable-prefix-caching $HOST_ARGS $MOCKER_EXTRA \
   > "$OUT/mocker.log" 2>&1 &
 MOCKER=$!
 
@@ -70,7 +74,7 @@ if [ "$CHAT_RPS" != "0" ]; then
   CHAT=$!
 fi
 python "$HERE/agentx_drive.py" --subset "$SUBSET" --url http://localhost:$PORT --model "$MODEL" \
-  --sessions "$SESSIONS" --duration-s "$DURATION_S" --ramp-s "$RAMP_S" --time-scale "$TIME_SCALE" --anonymous-fraction "$ANON" \
+  --sessions "$SESSIONS" --repeat "$REPEAT" --duration-s "$DURATION_S" --ramp-s "$RAMP_S" --time-scale "$TIME_SCALE" --anonymous-fraction "$ANON" \
   --out "$OUT/requests.jsonl"
 [ -n "${CHAT:-}" ] && wait $CHAT
 # Let idle sessions expire and the sweep publish before stopping.

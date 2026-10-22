@@ -594,6 +594,7 @@ mod tests {
         // A returning turn adds the prior turn's prefix to the reusable total.
         runtime.on_complete("main", 20, 0, false);
         runtime.on_arrival("main", None, 10 * 16);
-        assert_eq!(metrics.prior_prefix_tokens_total.get(), 8 * 16 + 20);
+        // The 20 tokens the turn generated are not part of the prefix.
+        assert_eq!(metrics.prior_prefix_tokens_total.get(), 8 * 16);
     }
 }
