@@ -1,0 +1,3 @@
+{"workers": 4, "num_gpu_blocks": 7000, "num_host_blocks": 7000, "block_size": 64,
+ "speedup": 1, "sessions": 40, "duration_s": 1500, "time_scale": 3,
+ "active_window_s": 100, "idle_ttl_s": 240, "workload": "agentx", "anonymous_fraction": 0, "model": "deepseek-ai/DeepSeek-V4-Flash"}

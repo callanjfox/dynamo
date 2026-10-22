@@ -210,7 +210,7 @@
     const shrShare = median(tl.filter((r) => r.demand > 0 && r.shared != null).map((r) => (100 * r.shared) / r.demand));
     tiles("t-storage", [
       ["Copies of the cache", dupG.toFixed(2) + "x on GPU", meta.cap_host ? dupH.toFixed(2) + "x in host memory" : "no host tier"],
-      ovlShare != null ? ["Host memory that is a GPU copy", pct(ovlShare), "median over the run"] : ["Host and GPU overlap", "not reported", "this run predates the overlap metric"],
+      ovlShare != null ? ["Host memory that is a GPU copy", pct(ovlShare), "median over the run"] : ["Host and GPU overlap", meta.cap_host ? "not reported" : "no host tier", meta.cap_host ? "this run predates the overlap metric" : "GPU memory only in this scenario"],
       imb != null ? ["Busiest worker against average", imb.toFixed(2) + "x", "median distinct demand"] : null,
       ["Held for finished sessions", fmtTok(strPeak), pct((100 * strPeak) / meta.cap_gpu) + " of GPU at the peak"],
       shrShare != null ? ["Shared between sessions", pct(shrShare), "of distinct demand"] : null,
