@@ -149,7 +149,7 @@
     lenSel.parentElement.hidden = groups.length < 2;
     lenSel.replaceChildren(...groups.map((g) => { const o = document.createElement("option"); o.value = g; o.textContent = g; o.selected = g === LEN; return o; }));
     lenSel.onchange = () => { LEN = lenSel.value; SC = null; draw(); };
-    if (!SC || !metas.some((m) => m.scenario === SC)) SC = metas[0].scenario;
+    if (!SC || !metas.some((m) => m.scenario === SC)) SC = (metas.find((m) => m.scenario === "mirror") || metas[0]).scenario;
     const meta = metas.find((m) => m.scenario === SC);
     const mine = (rows) => (rows || []).filter((r) => r.scenario === SC);
     const tl = mine(allTl), sessions = mine(ok("sessions")), returns = mine(ok("returns")), routing = mine(ok("routing"));
@@ -158,6 +158,7 @@
       b.addEventListener("click", () => { SC = m.scenario; draw(); });
       return b;
     }));
+    $("setup").textContent = meta.setup || "";
     $("blurb").textContent = meta.blurb;
     const act = tl.filter((r) => (r.in_tps || 0) > 0);
     // The idle wait after the last request ends every session at once; leave that tail out of the charts it would distort.
@@ -416,7 +417,6 @@
     }
     rt2.append(rb); $("ref").replaceChildren(rt2);
 
-    $("lede").textContent = `${fmtInt(sessions.length)} agent sessions${meta.has_chat ? " plus background chat" : ""} over ${minutes} minutes on ${meta.workers} workers. Time to first token was ${fmtS(ttft50)} at the median and ${fmtS(ttft90)} at the 90th percentile in a typical minute, ${fmtS(ttft90w)} at worst. The session history says ${pot != null ? pct(pot) : "-"} of input could be reused; the highest-cache worker holds ${pct(f2)} and the chosen worker ${pct(f3)}.`;
     $("foot").textContent = `The workers are mock workers: the router, the session index and the workload are real, but latency, queues and KV behaviour come from the mocker's model, so read the response times as a demonstration. Demand counts each distinct prompt block once across active sessions. Thrash and the session-history line are estimates from the session index.`;
   }
 

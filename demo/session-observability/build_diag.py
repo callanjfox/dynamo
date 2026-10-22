@@ -122,13 +122,27 @@ def run_summary(key, label, directory, adjust=False):
 
 
 SCENARIOS = {
-    "busy": ("Busy, plenty of cache", "Two workers, each with GPU memory for twice the working set, so cache space is never the constraint. Compute is the limit, so the answer is more compute."),
-    "short": ("Not enough cache", "Four workers whose GPU memory holds about 80% of the working set and no host tier. Cache survives until requests are admitted, but the router sometimes leaves the worker holding the most cache for a less loaded one, and returning sessions recompute about a quarter of their input."),
-    "mirror": ("Cache not used well", "As the previous scenario with a host tier of equal size. Host memory mostly mirrors the GPU, so the extra memory adds little room and the results barely change."),
-    "route": ("Routing ignores the cache", "Ample cache, but the router is told to ignore cache overlap. Sessions scatter across workers, copies multiply, and returning sessions recompute a fifth of their input."),
-    "steady": ("Six hours, steady", "Four workers with 75,000 blocks each and 260 sessions arriving evenly over six hours at real think times, so about 40 run at once and demand stays near 0.4x the GPU cache. Used to see whether anything drifts over a long run: memory, hit rates, latency, active sessions."),
-    "overload": ("Six hours, overloaded", "The same fleet with 1,440 sessions arriving over six hours. Sessions last longer than they arrive, so about 1,100 run at once and demand reaches 7.8x the GPU cache. Requests queue for minutes, workers reuse under a tenth of what the router expected, and every session is cut short. A long sustained overload, kept as an example."),
-    "starved": ("Far too little cache", "Four workers whose GPU memory holds under half the working set. Cache is evicted while requests wait to be admitted, so workers reuse about a tenth of what the router expected. Both the router's view and the workers' reports say it is bad, and routing barely matters: the answer is more cache."),
+    "busy": ("Busy, plenty of cache",
+             "Two workers, each with GPU memory twice the working set size.",
+             "Cache is not the problem. Some requests are routed to a different worker, mostly early in the run, and that causes some recompute you can see in the metrics. Sessions are being moved around, and KVCR could help with that. For a better outcome beyond that, the fleet needs more compute, not more cache."),
+    "short": ("Not enough cache",
+              "Four workers, each with GPU memory for about 80% of the working set, and no host tier.",
+              "There is a big difference between the worker with the most cache and the worker the router chose. KVCR could help, or better routing decisions. Later in the run there is simply not enough cache: the GPUs are full, the system contends more, and prefix rebuilt and time to first token climb. This one needs more cache."),
+    "mirror": ("Cache not used well",
+               "Four workers, each with GPU memory for about 80% of the working set plus a host tier of the same size.",
+               "This shows why the metrics matter. Demand should fit in GPU plus host memory, but it does not: host memory is used as a write-through cache, so it mostly holds copies of what is already on the GPU, and there is some extra duplication between workers. The added memory buys almost no room, and the result looks as bad as having no host tier. Start with \"What the fleet holds\"."),
+    "route": ("Routing ignores the cache",
+              "Four workers with plenty of GPU memory, and the router told to ignore cache overlap.",
+              "A classic case of having enough cache but routing all over the place: sessions scatter across workers, copies multiply, and returning sessions recompute. Either fix the routing or use KVCR to close the gap."),
+    "steady": ("Six hours, steady",
+               "Four workers with 75,000 blocks each and 260 sessions arriving evenly over six hours at real think times, about 40 running at once and demand near 0.4x the GPU cache.",
+               "A long run to see whether anything drifts: memory, hit rates, latency and active sessions."),
+    "overload": ("Six hours, overloaded",
+                 "The same fleet with 1,440 sessions arriving over six hours.",
+                 "Sessions last longer than they arrive, so about 1,100 run at once and demand reaches 7.8x the GPU cache. Requests queue for minutes and workers reuse under a tenth of what the router expected. Kept as an example of a long sustained overload."),
+    "starved": ("Far too little cache",
+                "Four workers, each with GPU memory for under half the working set.",
+                "The cache is thrashed so hard that by the time a worker is picked and the request is admitted, the cache the router counted is already evicted. There is a huge gap between what the router expected and what the worker reused. At this point the router's view is not helping, and it can mislead. The answer is more cache."),
 }
 
 
@@ -147,14 +161,14 @@ def main():
         key, run = spec.split("=")
         adjust = run.endswith(":adjust")
         run = run.split(":")[0]
-        label, blurb = SCENARIOS.get(key, (key, ""))
+        label, setup, blurb = SCENARIOS.get(key, (key, "", ""))
         directory = HERE / "data" / "live" / run
         rows, sessions, meta, stats = bd.live_run(directory)
         cap_dev, cap_host = rows[0]["capacity_device_tokens"], rows[0]["capacity_host_tokens"]
         workers = meta["workers"]
         summary = run_summary(key, label, directory, adjust)
         metas.append({
-            "scenario": key, "label": label, "blurb": blurb,
+            "scenario": key, "label": label, "setup": setup, "blurb": blurb,
             "group": "6 hours" if (meta.get("duration_s") or 0) >= 7200 else "30 minutes", "model": meta.get("model", "Qwen/Qwen3-0.6B"),
             "workers": workers, "block_size": meta["block_size"],
             "cap_gpu": cap_dev, "cap_host": cap_host, "cap_all": cap_dev + cap_host,

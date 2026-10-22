@@ -52,6 +52,7 @@
   .dx .tabs { display: flex; flex-wrap: wrap; gap: var(--cds-gap-sm); margin: 0 0 var(--cds-gap-sm); }
   .dx .tab { appearance: none; cursor: pointer; text-align: left; background: var(--color-panel); color: var(--color-fg); border: 1px solid var(--color-border-line); border-radius: var(--cds-radius); padding: var(--cds-pad-sm) var(--cds-pad-md); font: inherit; font-size: var(--cds-font-size-caption); }
   .dx .tab[aria-pressed="true"] { border-color: var(--cds-chart-axis); box-shadow: inset 0 0 0 1px var(--cds-chart-axis); }
+  .dx .setup { font-weight: var(--cds-font-weight-medium); margin: 0 0 var(--cds-gap-sm); max-width: 80ch; }
   .dx .blurb { color: var(--color-fg-muted); margin: 0 0 var(--cds-gap-sm); max-width: 80ch; }
   .dx .newpill { display: inline-block; margin-left: 8px; padding: 0 7px; border-radius: 999px; background: var(--color-fg); color: var(--color-bg); font-size: 10px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; vertical-align: 1px; }
   .dx .reftable td:first-child { font-family: ui-monospace, Menlo, monospace; font-size: 12px; white-space: nowrap; text-align: left; }
@@ -68,8 +69,8 @@
   <p class="mock"><b>A mock example.</b> This shows why you would use these metrics. AgentX coding-agent sessions and synthetic chat traffic are replayed through the real Dynamo router and session index. The workers are mock workers: DeepSeek V4 Flash on B200 timing comes from AISimulate's perf model, and the cache tiers are set small on purpose to create each situation.</p>
   <label class="runlen" hidden>Run length <select id="runlen"></select></label>
   <div class="tabs" id="tabs" role="tablist"></div>
+  <p class="setup" id="setup"></p>
   <p class="blurb" id="blurb"></p>
-  <p class="lede" id="lede"></p>
   <nav>
     <a href="#s-workload">1 Workload and response</a>
     <a href="#s-mix">2 Chat and agents</a>
@@ -124,7 +125,7 @@
     <div class="grid">
       <div class="card"><h3>Demand over several timescales<span class="src metric">metric: new</span></h3><p class="note">Sessions active in the last few minutes, each block counted once, against GPU memory and GPU plus host memory. If workers hold copies of the same blocks the room needed is larger; the copies charts in section 5 show by how much. Only sessions inside the router's active window count (100 seconds in these replays, where think times are also shortened), so the 5 and 15 minute lines coincide here; with real think times and a 15 minute window they separate.</p><div class="legend" id="l-fit"></div><div class="chart" id="c-fit" data-source="timeline"></div></div>
       <div class="card"><h3>What the fleet holds<span class="src metric">metric: new</span></h3><p class="note" id="n-held">What is resident in GPU memory and in host memory, stacked, counting every worker's copy because each takes room, against the distinct demand and the capacity of each tier. Host memory is mostly a copy of what is already on the GPU, so the stack shows the host as a second full layer, but only the sliver labelled "host only" adds room beyond the GPU. The mock workers write host memory through, which exaggerates this; a real offload tier may differ.</p><div class="legend" id="l-held"></div><div class="chart" id="c-held" data-source="timeline"></div></div>
-      <div class="card"><h3>Prefix rebuilt by returning sessions<span class="src metric">metric: new</span></h3><p class="note">Share of agent input tokens each minute that a returning session had to recompute or reload because its earlier prefix was no longer in cache. An estimate from the session index, not a worker measurement. Smoothed over a few samples.</p><div class="legend" id="l-thr"></div><div class="chart" id="c-thr" data-source="timeline"></div></div>
+      <div class="card"><h3>Prefix rebuilt by returning sessions<span class="src metric">metric: new</span></h3><p class="note">Share of agent input tokens each minute that a returning session had to recompute or reload. That happens when its earlier prefix was evicted, and also when the session was sent to a different worker than the one holding it. An estimate from the session index, not a worker measurement. Smoothed over a few samples.</p><div class="legend" id="l-thr"></div><div class="chart" id="c-thr" data-source="timeline"></div></div>
     </div>
   </section>
 
