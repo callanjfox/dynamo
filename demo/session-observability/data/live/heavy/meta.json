@@ -1,0 +1,2 @@
+{"workers": 4, "num_gpu_blocks": 2500, "block_size": 16, "speedup": 4,
+ "sessions": 40, "active_window_s": 60, "idle_ttl_s": 120}

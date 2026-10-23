@@ -1,0 +1,941 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Session observability demo</title>
+<style>
+  :root {
+    color-scheme: light;
+    --page: #f6f5f2;
+    --surface: #fcfcfb;
+    --ink: #0b0b0b;
+    --ink-2: #52514e;
+    --ink-3: #75746f;
+    --grid: #e7e6e2;
+    --line: #d9d8d3;
+    --s1: #2a78d6;
+    --s2: #eb6834;
+    --s3: #1baf7a;
+    --s5: #e87ba4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --page: #121211;
+      --surface: #1a1a19;
+      --ink: #f0efec;
+      --ink-2: #c3c2b7;
+      --ink-3: #94938b;
+      --grid: #2b2b29;
+      --line: #3a3a37;
+      --s1: #3987e5;
+      --s2: #d95926;
+      --s3: #199e70;
+      --s5: #d55181;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #121211;
+    --surface: #1a1a19;
+    --ink: #f0efec;
+    --ink-2: #c3c2b7;
+    --ink-3: #94938b;
+    --grid: #2b2b29;
+    --line: #3a3a37;
+    --s1: #3987e5;
+    --s2: #d95926;
+    --s3: #199e70;
+    --s5: #d55181;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--ink);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 28px 16px 56px; }
+  h1 { font-size: 22px; margin: 0 0 4px; font-weight: 650; }
+  .sub { color: var(--ink-2); margin: 0 0 20px; max-width: 70ch; }
+  .tabs { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 8px; }
+  .tab {
+    appearance: none; cursor: pointer; text-align: left;
+    background: var(--surface); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px;
+    font: inherit;
+  }
+  .tab small { display: block; color: var(--ink-2); }
+  .tab[aria-pressed="true"] { border-color: var(--s1); box-shadow: inset 0 0 0 1px var(--s1); }
+  .blurb { color: var(--ink-2); margin: 0 0 18px; min-height: 2.9em; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-bottom: 18px; }
+  .tile { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .tile .k { color: var(--ink-2); font-size: 12px; }
+  .tile .v { font-size: 26px; font-weight: 650; line-height: 1.2; margin: 2px 0; font-variant-numeric: tabular-nums; }
+  .tile .d { color: var(--ink-2); font-size: 12px; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 14px 10px; margin-bottom: 14px; }
+  .card h2 { font-size: 15px; margin: 0 0 2px; font-weight: 650; }
+  .card p.note { color: var(--ink-2); font-size: 12.5px; margin: 0 0 8px; max-width: 80ch; }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; margin: 4px 0 6px; font-size: 12.5px; color: var(--ink-2); }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+  .legend i.dash { height: 0; width: 16px; border-top: 2px dashed var(--ink-3); border-radius: 0; vertical-align: 3px; }
+  .chart { position: relative; }
+  .chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .tip {
+    position: absolute; pointer-events: none; display: none; z-index: 5;
+    background: var(--surface); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 10px; font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,.18);
+    white-space: nowrap;
+  }
+  .tip b { display: block; margin-bottom: 3px; }
+  .tip div { display: flex; align-items: center; gap: 6px; font-variant-numeric: tabular-nums; }
+  .tip i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .gaprow { display: grid; grid-template-columns: 96px 1fr 78px; align-items: center; gap: 10px; margin: 5px 0; font-size: 12.5px; }
+  .gaprow .lab { color: var(--ink-2); text-align: right; font-variant-numeric: tabular-nums; }
+  .gaprow .n { color: var(--ink-2); font-variant-numeric: tabular-nums; }
+  .gapbar { display: flex; height: 16px; gap: 2px; background: transparent; }
+  .gapbar span { display: block; border-radius: 3px; min-width: 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--ink-2); font-weight: 600; }
+  .scroll { overflow-x: auto; }
+  .foot { color: var(--ink-3); font-size: 12px; margin-top: 18px; max-width: 90ch; }
+  .hists { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 8px 24px; }
+  .hist h3 { font-size: 13px; margin: 6px 0 2px; color: var(--ink-2); font-weight: 600; }
+  .hist .gaprow { grid-template-columns: 78px 1fr 34px; }
+  .newpill { display: inline-block; margin-left: 8px; padding: 1px 7px; border-radius: 999px; background: var(--s1); color: #fff; font-size: 10.5px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; vertical-align: 2px; }
+  .src { display: inline-block; margin-left: 8px; padding: 0 7px; border-radius: 999px; font-size: 10.5px; font-weight: 500; letter-spacing: .02em; vertical-align: 1px; white-space: nowrap; }
+  .src.metric { border: 1px solid var(--ink-3); color: var(--ink-2); }
+  .src.log { background: var(--ink); color: var(--surface); }
+  .nav { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 0 0 18px; font-size: 13px; }
+  .nav a { color: var(--s1); text-decoration: none; }
+  .nav a:hover { text-decoration: underline; }
+  h2.section { font-size: 17px; margin: 28px 0 4px; font-weight: 650; scroll-margin-top: 12px; }
+  p.section-note { color: var(--ink-2); font-size: 13px; margin: 0 0 12px; max-width: 80ch; }
+  .tiles.small .tile .v { font-size: 22px; }
+  .reftable td:first-child { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; white-space: nowrap; }
+  .reftable td, .reftable th { text-align: left; white-space: normal; vertical-align: top; }
+  .reftable td:nth-child(2) { white-space: nowrap; color: var(--ink-2); }
+  .axis text { fill: var(--ink-3); font-size: 11px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Session observability demo</h1>
+  <p class="sub" id="intro">A synthetic agent workload replayed through the Dynamo mocker. The router's session index tracks each session; a stats tracker turns that into the working set, thrash and per-session figures below.</p>
+
+  <div class="tabs" id="tabs"></div>
+  <p class="blurb" id="blurb"></p>
+
+  <p class="sub"><span class="src metric" style="margin-left:0">metric</span> a Prometheus metric the router or frontend exports. <span class="src log" style="margin-left:0">log</span> a structured log event (session_summary, session_worker_load, the router_selection trace).</p>
+  <div class="nav"><a href="#sec-sessions">Your sessions</a><a href="#sec-cache">Working set and cache</a><a href="#sec-compute">Compute health</a><a href="#sec-ref">Metric reference</a></div>
+
+  <h2 class="section" id="sec-sessions">Your sessions</h2>
+  <p class="section-note">What the workload looks like: how many turns a session runs, how large its prompts and outputs are, how fast its context grows, and how much it fans out into subagents.</p>
+  <div class="tiles small" id="stiles"></div>
+  <div class="card">
+    <h2>Shape of the sessions<span class="newpill" title="Metrics added in this work">new</span></h2>
+    <p class="note">Number of sessions in each range, including subagents: turns, input and output tokens per turn, and the mean time a primary session waits between turns.</p>
+    <div class="hists" id="hists"></div>
+  </div>
+  <div class="card" id="card-shape">
+    <h2>Request size over time<span class="src metric">metric</span></h2>
+    <p class="note">Mean input tokens (left axis) and output tokens (right axis) per request in each 60 second window. Input grows as sessions accumulate context; output stays small. Two axes, so compare the shapes, not the heights.</p>
+    <div class="legend" id="leg9"></div>
+    <div class="chart" id="c9"></div>
+  </div>
+
+  <h2 class="section" id="sec-cache">Working set and cache</h2>
+  <p class="section-note">Is the working set larger than the cache, and what does that cost? Demand against capacity first, then the thrash it causes.</p>
+  <div class="tiles" id="tiles"></div>
+
+  <div class="card">
+    <h2>Working set against capacity<span class="newpill" title="Metrics added in this work">new</span><span class="src metric">metric</span></h2>
+    <p class="note" id="note1">Demand is the distinct tokens the active sessions will present next. Resident is what each tier holds. A shared prefix is counted once in both.</p>
+    <div class="legend" id="leg1"></div>
+    <div class="chart" id="c1"></div>
+  </div>
+
+  <div class="card">
+    <h2>Thrash: prefix tokens a returning session had to rebuild<span class="newpill" title="Metrics added in this work">new</span><span class="src metric">metric</span></h2>
+    <p class="note">Tokens per 30 seconds. Recomputed means the prefix was in no tier. Reloaded means it was only in host memory. This is an estimate, not a worker measurement: when a returning turn arrives the router takes the previous turn's input plus output as the prefix the session should find, and subtracts what the session index says each tier still holds for that session. The worker-reported reuse (funnel step F4) would be the measured counterpart; the mock workers do not report it.</p>
+    <div class="legend" id="leg2"></div>
+    <div class="chart" id="c2"></div>
+  </div>
+
+  <div class="card">
+    <h2>Active sessions<span class="newpill" title="Metrics added in this work">new</span><span class="src metric">metric</span></h2>
+    <p class="note">Sessions active inside the window, split into primary sessions and the subagents they spawn.</p>
+    <div class="legend" id="leg3"></div>
+    <div class="chart" id="c3"></div>
+  </div>
+
+  <div class="card" id="card-role">
+    <h2>Primary sessions and subagents<span class="newpill" title="Metrics added in this work">new</span><span class="src metric">metric</span></h2>
+    <p class="note">The distinct working set split by role. A subagent counts only the blocks its primary sessions do not already hold, so its line is the capacity subagents add on top of the sessions that spawned them.</p>
+    <div class="legend" id="leg16"></div>
+    <div class="chart" id="c16"></div>
+  </div>
+
+  <div class="card" id="card-decay">
+    <h2>Demand if idle sessions decay<span class="newpill" title="Metrics added in this work">new</span><span class="src metric">metric</span></h2>
+    <p class="note">The same per-session demand counting only sessions active within each window, against the router's active window. A session quiet for minutes may or may not return; the gap between these lines is demand that depends on that bet. The return-gap panel below shows how often sessions do come back.</p>
+    <div class="legend" id="leg17"></div>
+    <div class="chart" id="c17"></div>
+  </div>
+
+  <div class="card">
+    <h2>KV held for idle or finished sessions<span class="newpill" title="Metrics added in this work">new</span><span class="src metric">metric</span></h2>
+    <p class="note">Distinct GPU tokens that only inactive sessions still reference. This is evictable, so it matters only when it crowds out active demand.</p>
+    <div class="legend" id="leg4"></div>
+    <div class="chart" id="c4"></div>
+  </div>
+
+  <div class="card" id="card-cov">
+    <h2>Agent traffic against the rest<span class="newpill" title="Metrics added in this work">new</span><span class="src metric">metric</span></h2>
+    <p class="note">Input and output tokens per second (60 second window) from requests that carried a session ID, stacked on those that did not. Everything else on this page describes only the session share. Requests without an ID are routed as usual but are not tracked. The partial coverage run sends 30% of its sessions without headers.</p>
+    <div class="legend" id="leg8"></div>
+    <div class="chart" id="c8"></div>
+    <div id="out8">
+      <div class="legend" id="leg30"></div>
+      <div class="chart" id="c30"></div>
+    </div>
+  </div>
+
+  <div class="card" id="card-repl">
+    <h2>Duplication factor<span class="newpill" title="Metrics added in this work">new</span><span class="src metric">metric</span></h2>
+    <p class="note">Copies of the cache across workers, within one tier. 1x means each prefix block is held on one worker; 1.2x on the GPU line means the GPUs together hold 20% more blocks than there are distinct blocks, because some blocks sit on more than one worker. The host line is the same for host memory. It says nothing about whether host memory repeats what is on the GPU: the stacked chart above separates that when the run reports the overlap.</p>
+    <div class="legend" id="leg6"></div>
+    <div class="chart" id="c6"></div>
+  </div>
+
+  <div class="card" id="card-shared">
+    <h2>Shared prefix across sessions<span class="newpill" title="Metrics added in this work">new</span><span class="src metric">metric</span></h2>
+    <p class="note">Prompt tokens that more than one active session presents, such as a system prompt, a repository summary, or a subagent starting from its parent's context. The per-session demand sum counts them each time; the distinct demand counts them once. In the AgentX corpus the sharing is small: sessions share nothing with each other, and a subagent's context is small next to its parent's, so the spikes are subagents starting. Traces with a common system prompt or repository would show much more.</p>
+    <div class="legend" id="leg18"></div>
+    <div class="chart" id="c18"></div>
+  </div>
+
+  <div class="card" id="card-worker">
+    <h2>Load across workers<span class="newpill" title="Metrics added in this work">new</span><span class="src log">log: session_worker_load</span></h2>
+    <p class="note">Distinct demand homed on the busiest, the least busy and the mean worker, against what one worker can hold. A shared block counts once per worker. Fleet totals can look fine while a few workers carry most sessions and spill past their own GPU and host memory. A session is homed on the worker that served its last turn.</p>
+    <div class="legend" id="leg19"></div>
+    <div class="chart" id="c19"></div>
+    <p class="note">What the busiest worker actually holds, GPU and host stacked (host memory may also hold copies of GPU blocks, which the fleet-level overlap shows). A worker at the top of the stack is full.</p>
+    <div class="legend" id="leg21"></div>
+    <div class="chart" id="c21"></div>
+    <div id="left-block">
+      <p class="note">Cache a worker still holds for active sessions whose last turn ran elsewhere: the cost of moving a session. It stays until evicted and is reusable if the session or another with the same prefix returns.</p>
+      <div class="legend" id="leg31"></div>
+      <div class="chart" id="c31"></div>
+    </div>
+  </div>
+
+  <div class="card" id="card-select">
+    <h2>Routing decisions<span class="newpill" title="Added in this work">new: candidate inputs</span><span class="src log">log: router_selection trace</span></h2>
+    <div id="sel-why">
+      <p class="note">Why the router picked the worker it did, from its per-candidate trace (router_selection records), per 60 second window. The router scores each worker on the cache it would reuse and on the load already there, and picks the lowest cost. The first chart splits decisions by how the pick related to cache; the second, for the decisions that left the worker with the most cached tokens, compares the cache given up with the load avoided. When the load avoided is as large as the cache given up, the router did what you would expect: it traded a cache hit for a less busy worker.</p>
+      <div class="legend" id="leg22"></div>
+      <div class="chart" id="c22"></div>
+      <div class="legend" id="leg23"></div>
+      <div class="chart" id="c23"></div>
+    </div>
+    <div id="sel-old">
+      <p class="note">From the router's per-candidate cost trace, per 60 second window. This run recorded costs only, not the cache and load behind them, so it shows ties and how concentrated the picks were; the newer runs explain each pick.</p>
+      <div class="legend" id="leg22b"></div>
+      <div class="chart" id="c22b"></div>
+    </div>
+  </div>
+
+  <div class="card" id="card-funnel">
+    <h2>Cache reuse funnel<span class="newpill" title="Added in this work">new session-history line</span><span class="src metric">metric</span></h2>
+    <p class="note">Share of prompt tokens at each step in each 60 second window. The session-history line is what the session index says a returning session could reuse if nothing had been evicted (covered traffic only, and only the part that is a returning session's own prior prefix). F2 is the prefix the router estimates is cached on the best eligible worker. F3 is the same on the worker it chose. F4 is what the worker reports reusing. The table has the cumulative totals.</p>
+    <div class="legend" id="leg7"></div>
+    <div class="chart" id="c7"></div>
+    <div class="scroll" id="funnel"></div>
+  </div>
+
+  <div class="card">
+    <h2>Where a returning session finds its prefix, by time since its last turn<span class="newpill" title="Metrics added in this work">new</span><span class="src metric">metric</span></h2>
+    <p class="note">Share of returning turns whose prior prefix was on the GPU, in host memory, or mostly missing (so recomputed), to within a tenth. A turn is counted when its request arrives, by the time since that session's previous turn finished: a session that waits ten minutes lands in "5 to 15 min" when it comes back, and one that never returns is never counted. The buckets (1, 5 and 15 minutes) are the same windows the decay chart uses. Long gaps lose the GPU.</p>
+    <div class="legend" id="leg5"></div>
+    <div id="gap"></div>
+  </div>
+
+  <div class="card">
+    <h2>What the sessions look like<span class="newpill" title="Metrics added in this work">new</span><span class="src log">log: session_summary</span></h2>
+    <p class="note">Distribution across all sessions in this run, including subagents. Context is the largest prefix a session presented.</p>
+    <div class="scroll" id="dist"></div>
+  </div>
+
+  <div id="compute">
+  <h2 class="section" id="sec-compute">Compute health</h2>
+  <p class="section-note">How the workers cope with that load. If the working set is too big the cost shows up here: longer time to first token as prefixes are recomputed, a queue building, the KV cache full. Latency and queue series come from the frontend and the router's per-worker load tracking. Workers are mockers, so absolute times are the simulation's.</p>
+  <div class="tiles small" id="ctiles"></div>
+  <div class="card">
+    <h2>Time to first token<span class="src metric">metric</span></h2>
+    <p class="note">Median and 90th percentile over a trailing 30 seconds. Prompts that recompute a large prefix wait longer for their first token.</p>
+    <div class="legend" id="leg11"></div>
+    <div class="chart" id="c11"></div>
+  </div>
+  <div class="card">
+    <h2>Inter-token latency<span class="src metric">metric</span></h2>
+    <p class="note">Median and 90th percentile over a trailing 30 seconds, in milliseconds. It rises with batch size and context length.</p>
+    <div class="legend" id="leg12"></div>
+    <div class="chart" id="c12"></div>
+  </div>
+  <div class="card">
+    <h2>Throughput<span class="src metric">metric</span></h2>
+    <p class="note">Input tokens (left axis) and output tokens (right axis) per second the fleet serves, from the frontend's counters over a trailing 60 seconds. Input tokens are mostly cache hits when reuse is high, so a worker's real prefill load is lower. Two axes, so compare the shapes, not the heights.</p>
+    <div class="legend" id="leg25"></div>
+    <div class="chart" id="c25"></div>
+  </div>
+  <div class="card" id="card-wspread">
+    <h2>Slowest worker against the median worker<span class="src metric">metric</span></h2>
+    <p class="note">The most recent time to first token (top chart) and inter-token latency (bottom chart) each worker reported: two different latencies, each shown for the slowest worker and the median worker. A wide gap means some workers are slower than others, which points at uneven load more than at the fleet being too small.</p>
+    <div class="legend" id="leg27"></div>
+    <div class="chart" id="c27"></div>
+    <div class="legend" id="leg28"></div>
+    <div class="chart" id="c28"></div>
+  </div>
+  <div class="card">
+    <h2>Queues<span class="src metric">metric</span></h2>
+    <p class="note">Requests the router has booked on a worker and not yet marked prefill-complete (waiting for the prefill or running it), requests decoding, and requests held at the frontend or router queue before dispatch. A growing prefill count means the fleet is saturated.</p>
+    <div class="legend" id="leg13"></div>
+    <div class="chart" id="c13"></div>
+  </div>
+  <div class="card">
+    <h2>Estimated queue wait<span class="src metric">metric: derived</span></h2>
+    <p class="note">Prefill backlog (prompt tokens queued or being prefilled) divided by the input token rate over a trailing 30 seconds: how long the backlog takes to clear. Neither the frontend nor the mock workers export a queue-time histogram, so this is derived. A real engine exports one (vllm:request_queue_time_seconds) and it should replace this estimate.</p>
+    <div class="legend" id="leg14"></div>
+    <div class="chart" id="c14"></div>
+  </div>
+  </div>
+
+  <h2 class="section" id="sec-ref">Metric reference</h2>
+  <p class="section-note">Every metric on this page. Session metrics are the ones added in this work. All carry the router_ prefix, are experimental, and use only bounded labels: no session or tenant ID is ever a label. Per-session detail goes to the dynamo_session_summary log.</p>
+  <div class="card"><div class="scroll" id="ref"></div></div>
+
+  <p class="foot" id="foot">Synthetic workload, not a customer trace. Time is simulated. Active means the session had activity within 5 minutes and has not ended. Thrash is estimated from the prior turn's input plus output against what the index holds, so it carries up to one block of rounding per turn.</p>
+</div>
+
+<script>
+const DATA = __DATA__;
+const MIN = 60000;
+const $ = (s) => document.querySelector(s);
+const css = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+const fmtTok = (n) => n >= 1e9 ? (n / 1e9).toFixed(2) + "B" : n >= 1e8 ? Math.round(n / 1e6) + "M" : n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n >= 1e3 ? Math.round(n / 1e3) + "k" : String(Math.round(n));
+const fmtNum = (n) => Math.round(n).toLocaleString("en-US");
+const fmtClock = (m) => { const s = Math.round(m * 60); return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); };
+const pct = (x) => (x * 100).toFixed(0) + "%";
+const windowStart = (rows, i, ms) => { let j = i; while (j > 0 && rows[i].now_ms - rows[j].now_ms < ms) j--; return j; };
+// Metrics added in this work; the funnel counters and the frontend and worker series already exist in Dynamo.
+const NEW_GROUPS = new Set(["Working set", "Load across workers", "Thrash and returns", "Coverage", "Per-session shape (observed when a session ends)"]);
+const NEW_ROWS = new Set(["router_selection trace record", "session_worker_load log", "session_summary log"]);
+const meta_workers = (run) => run.workers || 4;
+const median = (xs) => quantile(xs, 0.5);
+const REF = [
+  ["Working set", [
+    ["sessions_active_by_role{role}", "gauge", "Active sessions, primary and subagent."],
+    ["session_demand_by_role_tokens{role}", "gauge", "Distinct prompt tokens the active sessions will present next, each block counted once. A subagent counts only the blocks its primaries do not cover. The sum is the working set."],
+    ["session_demand_by_idle_tokens{idle}", "gauge", "Per-session demand of sessions that have not ended, by time since last activity (up to 1 m, 5 m, 15 m, over). Disjoint buckets, the same as the return gaps. Cumulative sums give demand over several timescales."],
+    ["session_shared_tokens", "gauge", "Prompt tokens referenced by more than one active session."],
+    ["session_resident_tokens{tier}", "gauge", "Distinct tokens the session index holds in each tier (device, host, disk)."],
+    ["session_stranded_tokens{tier}", "gauge", "Tokens held only for inactive sessions (device, host): cache held but not needed."],
+    ["session_replicated_tokens{tier}", "gauge", "Copies of session prefix beyond the first on other workers (device, host). The duplication factor is 1 + replicated / resident."],
+    ["session_tier_overlap_tokens", "gauge", "Tokens held in both the GPU and host tier of a worker, summed: how much host memory is a copy of GPU memory."],
+  ]],
+  ["Load across workers", [
+    ["session_left_behind_tokens{tier}", "gauge", "Tokens workers hold for active sessions whose last turn ran elsewhere: cache left behind when a session moves."],
+    ["session_worker_demand_imbalance_ratio", "gauge", "Distinct demand homed on the busiest worker over the mean worker's. 1.0 is even."],
+    ["session_worker_resident_imbalance_ratio{tier}", "gauge", "Distinct session tokens on the busiest worker over the mean worker's, per tier. 1.0 is even."],
+    ["session_worker_load log", "log", "One event per worker each minute: demand, resident and left-behind tokens and capacity. The busiest, least busy and mean worker on this page come from it. A worker identity is never a metric label."],
+  ]],
+  ["Thrash and returns", [
+    ["session_thrash_tokens_total{outcome}", "counter", "Prior-prefix tokens a returning session had to recompute, or reload from host or disk. Recomputed is the cost of running out of cache."],
+    ["session_return_turns_total{gap,outcome}", "counter", "Returning turns by time since the previous turn (up to 1 m, 5 m, 15 m, or over) and where the prior prefix was found (gpu, host, disk, miss). A count over the run."],
+    ["session_prior_prefix_tokens_total", "counter", "Prefix tokens returning sessions could reuse if nothing had been evicted: the prior turn's input, not its output. The session-history line in the funnel."],
+  ]],
+  ["Coverage", [
+    ["session_coverage_requests_total{coverage}", "counter", "Routed requests with (covered) or without (uncovered) a session ID."],
+    ["session_coverage_input_tokens_total{coverage}", "counter", "The same split in input tokens: how much of the traffic the session metrics describe."],
+    ["session_covered_output_tokens_total", "counter", "Output tokens of requests that carried a session ID. With the frontend output total it gives the output from requests without one."],
+  ]],
+  ["Per-session shape (observed when a session ends)", [
+    ["session_turns", "histogram", "Turns per session. Its _count is the number of sessions."],
+    ["session_peak_context_tokens", "histogram", "Largest context a session presented."],
+    ["session_cache_hit_ratio", "histogram", "Share of a session's input served from cache, 0 to 1."],
+    ["session_duration_seconds", "histogram", "First request to end."],
+    ["session_turn_gap_seconds", "histogram", "Mean time between a session's turns."],
+    ["session_subagents", "histogram", "Subagent sessions a session spawned."],
+    ["session_summary log", "log", "One event per ended session with its ID, parent, turns, input and output tokens, cache hit, duration, gaps, peak context, fan-out and thrash. The per-session figures on this page come from it."],
+  ]],
+  ["Cache reuse funnel (already in Dynamo)", [
+    ["input_sequence_tokens", "histogram", "F0: every prompt token. Its sum and count give mean input size per request."],
+    ["kv_best_eligible_cached_prefix_tokens_total", "counter", "F2: the prefix cached on the highest-cache eligible worker."],
+    ["kv_selected_cached_prefix_tokens_total", "counter", "F3: the same on the worker the router chose."],
+    ["kv_worker_reused_tokens_total", "counter", "F4: tokens the worker reports reusing."],
+    ["output_sequence_tokens", "histogram", "Output tokens per request."],
+  ]],
+  ["Routing decisions (already in Dynamo, #16395)", [
+    ["router_selection trace record", "trace", "One record per routed request with every candidate worker's cost, and (added in this work) its cached tokens, prefill backlog, decode load and active requests. A request-trace record, not a metric: DYN_REQUEST_TRACE_RECORDS=router_selection."],
+  ]],
+  ["Compute health (already in Dynamo)", [
+    ["frontend time_to_first_token_seconds", "histogram", "Request arrival to first token."],
+    ["frontend inter_token_latency_seconds", "histogram", "Time between streamed tokens."],
+    ["frontend queued_requests", "gauge", "Requests waiting in the HTTP queue before a first response."],
+    ["frontend inflight_requests", "gauge", "Requests being served."],
+    ["frontend router_queue_pending_requests", "gauge", "Requests held in the router's scheduler queue."],
+    ["frontend worker_active_requests{request_phase}", "gauge", "Requests booked per worker, split prefill (not yet prefill-complete) and decode."],
+    ["frontend worker_active_prefill_tokens", "gauge", "Prompt tokens queued or being prefilled per worker."],
+    ["frontend worker_active_decode_blocks", "gauge", "KV blocks booked by active requests per worker."],
+  ]],
+];
+const quantile = (xs, q) => { const a = [...xs].sort((x, y) => x - y); return a.length ? a[Math.min(a.length - 1, Math.floor(q * a.length))] : 0; };
+
+function niceStep(v) {
+  const p = Math.pow(10, Math.floor(Math.log10(v)));
+  for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= v) return m * p;
+  return 10 * p;
+}
+// Round tick spacing and a maximum on a whole number of ticks.
+function scale(v) {
+  if (v <= 0) return { max: 4, step: 1, n: 4 };
+  const step = niceStep(v / 4), n = Math.ceil(v / step - 1e-9);
+  return { max: step * n, step, n };
+}
+
+function legend(el, items) {
+  $(el).innerHTML = items.map((it) =>
+    `<span>${it.dash ? '<i class="dash"></i>' : `<i style="background:var(${it.color})"></i>`}${it.name}</span>`).join("");
+}
+
+function tipEl(host) {
+  let t = host.querySelector(".tip");
+  if (!t) { t = document.createElement("div"); t.className = "tip"; host.appendChild(t); }
+  return t;
+}
+
+function placeTip(host, tip, x, y, html) {
+  tip.innerHTML = html;
+  tip.style.display = "block";
+  const w = tip.offsetWidth, hw = host.clientWidth;
+  tip.style.left = Math.max(0, Math.min(hw - w, x + 12)) + "px";
+  tip.style.top = Math.max(0, y - tip.offsetHeight - 8) + "px";
+}
+
+const M = { l: 54, r: 14, t: 12, b: 26 };
+
+function axes(W, H, xMax, sc, fmtY, mr = M.r) {
+  const iw = W - M.l - mr, ih = H - M.t - M.b;
+  let out = '<g class="axis">';
+  for (let i = 0; i <= sc.n; i++) {
+    const v = sc.step * i, y = M.t + ih - (ih * v) / sc.max;
+    out += `<line x1="${M.l}" x2="${W - mr}" y1="${y}" y2="${y}" stroke="var(--grid)" stroke-width="1"/>`;
+    out += `<text x="${M.l - 8}" y="${y + 4}" text-anchor="end">${fmtY(v)}</text>`;
+  }
+  const step = xMax > 40 ? 10 : 5;
+  for (let m = 0; m <= xMax; m += step) {
+    const x = M.l + (iw * m) / xMax;
+    out += `<text x="${x}" y="${H - 6}" text-anchor="middle">${m}m</text>`;
+  }
+  return out + "</g>";
+}
+
+// Line chart with optional stacked areas (series with stack: true, drawn bottom to top in
+// order) and an optional secondary axis (series with axis: "right", scaled on their own).
+function lineChart(host, spec) {
+  host.innerHTML = "";
+  const hasRight = spec.series.some((s) => s.axis === "right");
+  const mr = hasRight ? 58 : M.r;
+  const W = Math.max(320, host.clientWidth), H = 240;
+  const iw = W - M.l - mr, ih = H - M.t - M.b;
+  const xMax = Math.max(...spec.x);
+  const n = spec.x.length;
+  // Cumulative tops for stacked series.
+  const stacked = spec.series.map((s) => !!s.stack);
+  const base = new Array(n).fill(0);
+  const tops = spec.series.map((s, k) => {
+    if (!stacked[k]) return s.values;
+    const lower = base.slice();
+    s.values.forEach((v, i) => (base[i] += v));
+    s.lower = lower;
+    return base.slice();
+  });
+  let top = 0, topR = 0;
+  spec.series.forEach((s, k) => {
+    const m = Math.max(...tops[k]);
+    if (s.axis === "right") topR = Math.max(topR, m); else top = Math.max(top, m);
+  });
+  for (const r of spec.refs || []) top = Math.max(top, r.y);
+  const sc = scale(spec.max || Math.max(top * 1.04, spec.min1 ? 2 : 0)), yMax = sc.max;
+  const sc2 = scale(topR * 1.04), yMax2 = sc2.max;
+  const X = (v) => M.l + (iw * v) / xMax;
+  const Y = (v) => M.t + ih - (ih * v) / yMax;
+  const Y2 = (v) => M.t + ih - (ih * v) / yMax2;
+  const YS = (s) => (s.axis === "right" ? Y2 : Y);
+  let svg = axes(W, H, xMax, sc, spec.fmtY, mr);
+  if (hasRight) {
+    for (let i = 0; i <= sc2.n; i++) {
+      const v = sc2.step * i;
+      svg += `<g class="axis"><text x="${W - mr + 8}" y="${Y2(v) + 4}" text-anchor="start">${(spec.fmtY2 || spec.fmtY)(v)}</text></g>`;
+    }
+  }
+  for (const r of spec.refs || []) {
+    svg += `<line x1="${M.l}" x2="${W - mr}" y1="${Y(r.y)}" y2="${Y(r.y)}" stroke="var(--ink-3)" stroke-width="1.5" stroke-dasharray="6 4"/>`;
+    svg += `<text x="${W - mr - 4}" y="${Y(r.y) - 5}" text-anchor="end" style="fill:var(--ink-2);font-size:11px">${r.label}</text>`;
+  }
+  spec.series.forEach((s, k) => {
+    const Ys = YS(s);
+    if (stacked[k]) {
+      const upper = tops[k].map((v, i) => `${i ? "L" : "M"}${X(spec.x[i]).toFixed(1)},${Ys(v).toFixed(1)}`).join("");
+      const lower = s.lower.map((v, i) => `L${X(spec.x[n - 1 - i]).toFixed(1)},${Ys(s.lower[n - 1 - i]).toFixed(1)}`).join("");
+      svg += `<path d="${upper}${lower}Z" fill="var(${s.color})" fill-opacity="0.55" stroke="var(${s.color})" stroke-width="1.5" stroke-linejoin="round"/>`;
+    } else {
+      const d = s.values.map((v, i) => `${i ? "L" : "M"}${X(spec.x[i]).toFixed(1)},${Ys(v).toFixed(1)}`).join("");
+      svg += `<path d="${d}" fill="none" stroke="var(${s.color})" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"${s.dashed ? ' stroke-dasharray="5 4"' : ""}/>`;
+    }
+  });
+  svg += `<line id="cx" y1="${M.t}" y2="${M.t + ih}" stroke="var(--ink-3)" stroke-width="1" style="display:none"/>`;
+  for (const s of spec.series) svg += `<circle class="dot" r="4" fill="var(${s.color})" stroke="var(--surface)" stroke-width="2" style="display:none"/>`;
+  svg += `<rect x="${M.l}" y="${M.t}" width="${iw}" height="${ih}" fill="transparent" id="hit"/>`;
+  host.insertAdjacentHTML("afterbegin", `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${spec.label}">${svg}</svg>`);
+  const el = host.querySelector("svg"), tip = tipEl(host);
+  const cx = el.querySelector("#cx"), dots = [...el.querySelectorAll(".dot")];
+  const move = (ev) => {
+    const box = el.getBoundingClientRect();
+    const px = ((ev.clientX - box.left) / box.width) * W;
+    const t = ((px - M.l) / iw) * xMax;
+    let lo = 0, hi = n - 1;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (spec.x[mid] < t) lo = mid + 1; else hi = mid; }
+    const i = lo > 0 && Math.abs(spec.x[lo - 1] - t) < Math.abs(spec.x[lo] - t) ? lo - 1 : lo;
+    const x = X(spec.x[i]);
+    cx.setAttribute("x1", x); cx.setAttribute("x2", x); cx.style.display = "";
+    spec.series.forEach((s, k) => { dots[k].setAttribute("cx", x); dots[k].setAttribute("cy", YS(s)(tops[k][i])); dots[k].style.display = ""; });
+    const fmtOf = (s) => (s.axis === "right" && spec.fmtTip2 ? spec.fmtTip2 : spec.fmtTip);
+    const rows = spec.series.map((s) => `<div><i style="background:var(${s.color})"></i>${s.name}: ${fmtOf(s)(s.values[i])}</div>`).join("");
+    const refs = (spec.refs || []).map((r) => `<div><i style="background:var(--ink-3)"></i>${r.label}: ${spec.fmtTip(r.y)}</div>`).join("");
+    const ys = spec.series.map((s, k) => YS(s)(tops[k][i]));
+    placeTip(host, tip, (x / W) * host.clientWidth, (Math.min(...ys) / H) * el.getBoundingClientRect().height, `<b>${fmtClock(spec.x[i])} into the run</b>${rows}${refs}`);
+  };
+  const leave = () => { cx.style.display = "none"; dots.forEach((d) => (d.style.display = "none")); tip.style.display = "none"; };
+  el.querySelector("#hit").addEventListener("pointermove", move);
+  el.querySelector("#hit").addEventListener("pointerleave", leave);
+}
+
+function barChart(host, spec) {
+  host.innerHTML = "";
+  const W = Math.max(320, host.clientWidth), H = 220;
+  const iw = W - M.l - M.r, ih = H - M.t - M.b;
+  const n = spec.bins.length;
+  const xMax = spec.xMax;
+  let top = 0;
+  spec.bins.forEach((b) => (top = Math.max(top, b.a + b.b)));
+  const sc = scale(top * 1.04), yMax = sc.max;
+  const Y = (v) => M.t + ih - (ih * v) / yMax;
+  const bw = iw / n;
+  let svg = axes(W, H, xMax, sc, spec.fmtY);
+  spec.bins.forEach((b, i) => {
+    const x = M.l + i * bw + 1;
+    const w = Math.max(1, bw - 2);
+    const yb = Y(b.b), ya = Y(b.a + b.b);
+    if (b.b > 0) svg += `<rect x="${x}" y="${yb}" width="${w}" height="${Math.max(0, M.t + ih - yb)}" fill="var(${spec.colors[1]})" rx="1.5"/>`;
+    if (b.a > 0) svg += `<rect x="${x}" y="${ya}" width="${w}" height="${Math.max(0, yb - ya - (b.b > 0 ? 1 : 0))}" fill="var(${spec.colors[0]})" rx="1.5"/>`;
+  });
+  svg += `<rect x="${M.l}" y="${M.t}" width="${iw}" height="${ih}" fill="transparent" id="hit"/>`;
+  host.insertAdjacentHTML("afterbegin", `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${spec.label}">${svg}</svg>`);
+  const el = host.querySelector("svg"), tip = tipEl(host);
+  const hit = el.querySelector("#hit");
+  hit.addEventListener("pointermove", (ev) => {
+    const box = el.getBoundingClientRect();
+    const px = ((ev.clientX - box.left) / box.width) * W;
+    const i = Math.max(0, Math.min(n - 1, Math.floor((px - M.l) / bw)));
+    const b = spec.bins[i];
+    placeTip(host, tip, (px / W) * host.clientWidth, (Y(b.a + b.b) / H) * box.height,
+      `<b>${fmtClock(b.t0)} to ${fmtClock(b.t1)}</b><div><i style="background:var(${spec.colors[0]})"></i>${spec.names[0]}: ${fmtNum(b.a)}</div><div><i style="background:var(${spec.colors[1]})"></i>${spec.names[1]}: ${fmtNum(b.b)}</div>`);
+  });
+  hit.addEventListener("pointerleave", () => (tip.style.display = "none"));
+}
+
+function render(idx) {
+  const run = DATA[idx];
+  const rows = run.rows;
+  const t = rows.map((r) => r.now_ms / MIN);
+  const capDev = rows[0].capacity_device_tokens, capHost = rows[0].capacity_host_tokens;
+  const demand = rows.map((r) => r.demand_distinct_tokens);
+  const gpu = rows.map((r) => r.distinct_device_tokens);
+  const host = rows.map((r) => r.distinct_host_tokens);
+  const last = rows[rows.length - 1];
+  const sess = run.sessions;
+
+  document.querySelectorAll(".tab").forEach((b, i) => b.setAttribute("aria-pressed", String(i === idx)));
+  $("#blurb").textContent = run.blurb;
+  if (!window.DEFAULT_FOOT) window.DEFAULT_FOOT = $("#foot").textContent;
+  $("#foot").textContent = run.foot || window.DEFAULT_FOOT;
+  if (!window.DEFAULT_INTRO) { window.DEFAULT_INTRO = $("#intro").textContent; window.DEFAULT_NOTE1 = $("#note1").textContent; }
+  $("#intro").textContent = run.intro || window.DEFAULT_INTRO;
+  $("#note1").textContent = run.note1 || window.DEFAULT_NOTE1;
+  const demandName = run.demandIsSum ? "Demand (sum over active sessions)" : "Demand (active sessions)";
+
+  const peak = Math.max(...demand);
+  const th = last.thrash, thTotal = th.recomputed + th.reloaded_host + th.reloaded_disk;
+  const isl = sess.reduce((a, s) => a + s.isl_tokens, 0), cached = sess.reduce((a, s) => a + s.cached_tokens, 0);
+  const subs = sess.filter((s) => s.parent_session_id).length;
+  const tile = (k, v, d) => `<div class="tile"><div class="k">${k}</div><div class="v">${v}</div><div class="d">${d}</div></div>`;
+  $("#tiles").innerHTML =
+    tile(run.demandIsSum ? "Peak demand (sum) vs GPU capacity" : "Peak working set vs GPU capacity", (peak / capDev).toFixed(2) + "×", `${fmtTok(peak)} needed, ${fmtTok(capDev)} of GPU cache`) +
+    tile("Thrash (tokens)", fmtTok(thTotal), `${fmtTok(th.recomputed)} recomputed, ${fmtTok(th.reloaded_host + th.reloaded_disk)} reloaded`) +
+    tile("Prefix reuse", pct(isl ? cached / isl : 0), last.prior_prefix > 0 && isl ? `${fmtTok(cached)} of ${fmtTok(isl)} input tokens from cache; session history says up to ${pct(Math.min(1, last.prior_prefix / isl))} was possible` : `${fmtTok(cached)} of ${fmtTok(isl)} input tokens served from cache`) +
+    tile("Sessions", String(sess.length), `${subs} are subagents`) +
+    ((lc) => lc && lc.requests_covered + lc.requests_uncovered > 0 ? tile("Session coverage", pct(lc.requests_covered / (lc.requests_covered + lc.requests_uncovered)), `of requests carry a session ID, ${pct(lc.tokens_covered / (lc.tokens_covered + lc.tokens_uncovered || 1))} of input tokens`) : "")(last.coverage) +
+    (run.requests && run.requests.chat ? tile("Chat requests", fmtNum(run.requests.chat.sent), `${pct(run.requests.chat.sent / (run.requests.chat.sent + run.requests.sent))} of all requests, median prompt ${fmtTok(run.requests.chat.prompt_p50)}, p50 ${run.requests.chat.p50_s.toFixed(2)}s`) : "") +
+    (run.requests ? tile("Requests", fmtNum(run.requests.sent), `${fmtNum(run.requests.failed)} failed, p50 ${run.requests.p50_s.toFixed(1)}s, p90 ${run.requests.p90_s.toFixed(1)}s`) : "");
+
+  // 1. working set vs capacity
+  const hasDistinct = rows.some((r) => r.distinct_demand);
+  const hasOverlap = rows.some((r) => r.tier_overlap_tokens > 0);
+  // Held memory is stacked: GPU resident, then the host-resident tokens that are not also on the GPU.
+  const hostOnly = rows.map((r) => Math.max(0, r.distinct_host_tokens - (r.tier_overlap_tokens || 0)));
+  const s1 = [{ name: "GPU resident", color: "--s2", stack: true, values: gpu }];
+  if (capHost > 0) s1.push({ name: hasOverlap ? "Host resident (not also on GPU)" : "Host resident (may include copies of GPU blocks)", color: "--s3", stack: true, values: hostOnly });
+  s1.push({ name: hasDistinct ? "Demand (distinct blocks)" : demandName, color: "--s1", values: demand });
+  const refs = [{ y: capDev, label: "GPU capacity " + fmtTok(capDev) }];
+  if (capHost > 0) refs.push({ y: capDev + capHost, label: "GPU + host capacity " + fmtTok(capDev + capHost) });
+  legend("#leg1", [...s1, { name: "Capacity", dash: true }]);
+  lineChart($("#c1"), { x: t, series: s1, refs, fmtY: fmtTok, fmtTip: fmtTok, label: "Working set against capacity" });
+
+  // 2. thrash per 30s
+  const binMin = 0.5, xMax = Math.max(...t);
+  const nb = Math.ceil(xMax / binMin);
+  const bins = Array.from({ length: nb }, (_, i) => ({ t0: i * binMin, t1: (i + 1) * binMin, a: 0, b: 0 }));
+  let prev = { recomputed: 0, reloaded_host: 0, reloaded_disk: 0 };
+  rows.forEach((r, i) => {
+    const bi = Math.min(nb - 1, Math.floor(t[i] / binMin));
+    bins[bi].a += r.thrash.recomputed - prev.recomputed;
+    bins[bi].b += r.thrash.reloaded_host + r.thrash.reloaded_disk - prev.reloaded_host - prev.reloaded_disk;
+    prev = r.thrash;
+  });
+  legend("#leg2", [{ name: "Recomputed", color: "--s2" }, { name: "Reloaded from host", color: "--s3" }]);
+  barChart($("#c2"), { bins, xMax, colors: ["--s2", "--s3"], names: ["Recomputed", "Reloaded from host"], fmtY: fmtTok, label: "Thrash per 30 seconds" });
+
+  // 3. sessions by role
+  const hasRole = rows.some((r) => r.active_primary !== undefined && (r.active_primary + r.active_subagent) > 0);
+  const roleSeries = hasRole
+    ? [{ name: "Primary sessions", color: "--s1", stack: true, values: rows.map((r) => r.active_primary) }, { name: "Subagent sessions", color: "--s3", stack: true, values: rows.map((r) => r.active_subagent) }]
+    : [{ name: "Active sessions", color: "--s1", values: rows.map((r) => r.active_sessions) }];
+  legend("#leg3", roleSeries);
+  lineChart($("#c3"), { x: t, series: roleSeries, fmtY: (v) => String(Math.round(v)), fmtTip: (v) => String(Math.round(v)), label: "Active sessions by role" });
+  // 3b. demand by role (distinct blocks): how much of the working set is primaries and how much subagents add
+  $("#card-role").style.display = hasRole && hasDistinct ? "" : "none";
+  if (hasRole && hasDistinct) {
+    const rd = [{ name: "Primary sessions", color: "--s1", stack: true, values: rows.map((r) => r.demand_primary_tokens) }, { name: "Subagents (blocks the primaries do not cover)", color: "--s3", stack: true, values: rows.map((r) => r.demand_subagent_tokens) }];
+    legend("#leg16", rd);
+    lineChart($("#c16"), { x: t, series: rd, fmtY: fmtTok, fmtTip: fmtTok, label: "Demand by role" });
+  }
+  // 3c. demand with idle sessions decayed
+  const hasWin = rows.some((r) => r.demand_windows && r.demand_windows[2] > 0);
+  $("#card-decay").style.display = hasWin ? "" : "none";
+  if (hasWin) {
+    const words = { "30s": "30 seconds", "1m": "1 minute", "5m": "5 minutes", "30m": "30 minutes" };
+    const labels = run.window_labels || ["30s", "1m", "5m"];
+    const wd = [
+      ...labels.map((w, k) => ({ name: "Active in the last " + words[w], color: ["--s2", "--s3", "--s1"][k], values: rows.map((r) => r.demand_windows[k]) })),
+      { name: "Active window (" + (run.meta_window || "100") + " s)", color: "--s5", dashed: true, values: rows.map((r) => r.demand_tokens) },
+    ];
+    legend("#leg17", wd);
+    lineChart($("#c17"), { x: t, series: wd, refs: [{ y: capDev, label: "GPU capacity " + fmtTok(capDev) }], fmtY: fmtTok, fmtTip: fmtTok, label: "Demand with idle sessions decayed" });
+  }
+
+  // 4. stranded
+  legend("#leg4", [{ name: "Held for inactive sessions", color: "--s2" }, { name: "Capacity", dash: true }]);
+  lineChart($("#c4"), {
+    x: t,
+    series: [{ name: "Held for inactive sessions", color: "--s2", values: rows.map((r) => r.stranded_device_tokens) }],
+    refs: [{ y: capDev, label: "GPU capacity " + fmtTok(capDev) }],
+    fmtY: fmtTok, fmtTip: fmtTok, label: "KV held for inactive sessions",
+  });
+
+  // 5. gap outcomes, in the same 1, 5 and 15 minute windows as the demand gauges
+  const groups = [["up to 1 min", [0]], ["1 to 5 min", [1]], ["5 to 15 min", [2]], ["over 15 min", [3]]];
+  legend("#leg5", [{ name: "Prefix on GPU", color: "--s1" }, ...(capHost > 0 ? [{ name: "Prefix in host memory", color: "--s3" }] : []), { name: "Mostly recomputed", color: "--s2" }]);
+  $("#gap").innerHTML = groups.map(([label, idxs]) => {
+    const g = [0, 1, 2, 3].map((k) => idxs.reduce((a, i) => a + last.gap_outcomes[i][k], 0));
+    const n = g[0] + g[1] + g[2] + g[3];
+    if (!n) return "";
+    const seg = (v, c, name) => v ? `<span title="${name}: ${v} of ${n}" style="width:${(v / n) * 100}%;background:var(${c})"></span>` : "";
+    return `<div class="gaprow"><div class="lab">${label}</div><div class="gapbar">${seg(g[0], "--s1", "GPU")}${seg(g[1] + g[2], "--s3", "Host or disk")}${seg(g[3], "--s2", "Mostly recomputed")}</div><div class="n">${fmtNum(n)} turns</div></div>`;
+  }).join("");
+
+  // 8. coverage: agent (session) traffic against the rest, as token rates
+  const covRows = rows.filter((r) => r.coverage && r.coverage.requests_covered + r.coverage.requests_uncovered > 0);
+  $("#card-cov").style.display = covRows.length ? "" : "none";
+  if (covRows.length) {
+    const ct8 = covRows.map((r) => r.now_ms / MIN);
+    const rate8 = (get) => covRows.map((r, i) => {
+      const j = windowStart(covRows, i, 60000), dt = (r.now_ms - covRows[j].now_ms) / 1000;
+      return dt > 0 ? Math.max(0, (get(r) - get(covRows[j])) / dt) : 0;
+    });
+    const sIn = [
+      { name: "Input tokens from sessions", color: "--s1", stack: true, values: rate8((r) => r.coverage.tokens_covered) },
+      { name: "Input tokens without a session ID", color: "--s2", stack: true, values: rate8((r) => r.coverage.tokens_uncovered) },
+    ];
+    legend("#leg8", sIn);
+    lineChart($("#c8"), { x: ct8, series: sIn, fmtY: fmtTok, fmtTip: fmtTok, label: "Input tokens per second, sessions and the rest" });
+    const hasOut = covRows.some((r) => r.covered_output_tokens > 0);
+    $("#out8").style.display = hasOut ? "" : "none";
+    if (hasOut) {
+      const outCov = rate8((r) => r.covered_output_tokens), outAll = rate8((r) => r.output_seq.sum);
+      const sOut = [
+        { name: "Output tokens from sessions", color: "--s1", stack: true, values: outCov },
+        { name: "Output tokens without a session ID", color: "--s2", stack: true, values: outAll.map((v, i) => Math.max(0, v - outCov[i])) },
+      ];
+      legend("#leg30", sOut);
+      lineChart($("#c30"), { x: ct8, series: sOut, fmtY: fmtTok, fmtTip: fmtTok, label: "Output tokens per second, sessions and the rest" });
+    }
+  }
+
+  // 6. duplication factor
+  const hasRepl = rows.some((r) => r.replicated_device_tokens !== undefined);
+  $("#card-repl").style.display = hasRepl ? "" : "none";
+  if (hasRepl) {
+    const factor = (rep, res) => rows.map((r) => (r[res] > 0 ? 1 + r[rep] / r[res] : 1));
+    const sr = [{ name: "GPU copies", color: "--s5", values: factor("replicated_device_tokens", "distinct_device_tokens") }];
+    if (capHost > 0) sr.push({ name: "Host copies", color: "--s3", values: factor("replicated_host_tokens", "distinct_host_tokens") });
+    legend("#leg6", sr);
+    lineChart($("#c6"), { x: t, series: sr, fmtY: (v) => v.toFixed(1) + "x", fmtTip: (v) => v.toFixed(2) + "x", label: "Duplication factor", min1: true, refs: [{ y: 1, label: "1x: one copy of everything" }] });
+  }
+  // 6b. shared prefix across sessions
+  const hasShared = rows.some((r) => r.shared_tokens > 0);
+  $("#card-shared").style.display = hasShared ? "" : "none";
+  if (hasShared) {
+    const ss = [
+      { name: "Prompt tokens shared by more than one session", color: "--s3", values: rows.map((r) => r.shared_tokens) },
+      { name: "Distinct demand", color: "--s1", values: demand },
+    ];
+    legend("#leg18", ss);
+    lineChart($("#c18"), { x: t, series: ss, fmtY: fmtTok, fmtTip: fmtTok, label: "Shared prefix" });
+  }
+  // 6c. load across workers
+  const hasWorker = rows.some((r) => r.worker);
+  $("#card-worker").style.display = hasWorker ? "" : "none";
+  if (hasWorker) {
+    const wr = rows.map((r) => r.worker || {});
+    const v = (w, k) => w[k] || 0;
+    const perGpu = capDev / meta_workers(run), perAll = (capDev + capHost) / meta_workers(run);
+    const sw = [
+      { name: "Busiest worker", color: "--s2", values: wr.map((w) => v(w, "demand_max")) },
+      { name: "Mean worker", color: "--s1", values: wr.map((w) => v(w, "demand_mean")) },
+    ];
+    if (wr.some((w) => w.demand_min != null)) sw.push({ name: "Least busy worker", color: "--s3", values: wr.map((w) => v(w, "demand_min")) });
+    const wrefs = [{ y: perGpu, label: "one worker's GPU " + fmtTok(perGpu) }];
+    if (capHost > 0) wrefs.push({ y: perAll, label: "one worker's GPU + host " + fmtTok(perAll) });
+    legend("#leg19", [...sw, { name: "Per-worker capacity", dash: true }]);
+    lineChart($("#c19"), { x: t, series: sw, refs: wrefs, fmtY: fmtTok, fmtTip: fmtTok, label: "Distinct demand per worker" });
+    const sres = [{ name: "Busiest worker, GPU resident", color: "--s2", stack: true, values: wr.map((w) => v(w, "resident_max_device")) }];
+    if (capHost > 0) sres.push({ name: "Busiest worker, host resident", color: "--s3", stack: true, values: wr.map((w) => v(w, "resident_max_host")) });
+    legend("#leg21", sres);
+    lineChart($("#c21"), { x: t, series: sres, refs: wrefs, fmtY: fmtTok, fmtTip: fmtTok, label: "Resident on the busiest worker" });
+    const hasLeft = wr.some((w) => v(w, "left_max_device") > 0 || v(w, "left_max_host") > 0);
+    $("#left-block").style.display = hasLeft ? "" : "none";
+    if (hasLeft) {
+      const sl = [{ name: "Left behind on a worker, GPU (busiest)", color: "--s2", values: wr.map((w) => v(w, "left_max_device")) }, { name: "Mean worker, GPU", color: "--s1", values: wr.map((w) => v(w, "left_mean_device")) }];
+      if (capHost > 0) sl.push({ name: "Left behind on a worker, host (busiest)", color: "--s3", values: wr.map((w) => v(w, "left_max_host")) });
+      legend("#leg31", sl);
+      lineChart($("#c31"), { x: t, series: sl, fmtY: fmtTok, fmtTip: fmtTok, label: "Cache left behind by sessions that moved" });
+    }
+  }
+
+  // 7a. routing decisions
+  const sel = run.selection || [];
+  $("#card-select").style.display = sel.length ? "" : "none";
+  if (sel.length) {
+    const st = sel.map((r) => r.now_ms / MIN);
+    const why = sel.some((r) => r.differ !== undefined);
+    $("#sel-why").style.display = why ? "" : "none";
+    $("#sel-old").style.display = why ? "none" : "";
+    if (why) {
+      const share = (f) => sel.map((r) => (r.decisions ? (100 * f(r)) / r.decisions : 0));
+      const s22 = [
+        { name: "Picked the worker with the most cached tokens", color: "--s1", stack: true, values: share((r) => r.best_cache) },
+        { name: "Picked another worker that had less load", color: "--s3", stack: true, values: share((r) => r.left_cache - r.no_load_advantage) },
+        { name: "Picked another worker for no load reason in the inputs", color: "--s2", stack: true, values: share((r) => r.no_load_advantage) },
+        { name: "No cache difference between workers, or a tie", color: "--s5", stack: true, values: share((r) => r.decisions - r.differ) },
+      ];
+      legend("#leg22", s22);
+      lineChart($("#c22"), { x: st, series: s22, max: 100, fmtY: (v) => Math.round(v) + "%", fmtTip: (v) => v.toFixed(0) + "%", label: "How routing decisions related to cache" });
+      const block = run.block_size || 64;
+      const s23 = [
+        { name: "Cached tokens given up", color: "--s1", values: sel.map((r) => r.gave_up_tokens) },
+        { name: "Prefill backlog avoided (tokens)", color: "--s2", values: sel.map((r) => r.prefill_saved_tokens) },
+        { name: "Decode load avoided (blocks x block size)", color: "--s3", values: sel.map((r) => r.decode_saved_blocks * block) },
+      ];
+      legend("#leg23", s23);
+      lineChart($("#c23"), { x: st, series: s23, fmtY: fmtTok, fmtTip: fmtTok, label: "What a decision away from the best cache traded" });
+    } else {
+      const s22 = [{ name: "Decisions that were ties", color: "--s2", values: sel.map((r) => 100 * r.tie_share) }, { name: "Busiest worker's share of the other decisions", color: "--s1", values: sel.map((r) => (r.top_worker_share == null ? 0 : 100 * r.top_worker_share)) }];
+      legend("#leg22b", s22);
+      lineChart($("#c22b"), { x: st, series: s22, max: 100, fmtY: (v) => Math.round(v) + "%", fmtTip: (v) => v.toFixed(0) + "%", label: "Routing decisions" });
+    }
+  }
+
+  // 7. funnel
+  const hasFunnel = rows.some((r) => r.funnel && r.funnel.f0 > 0);
+  $("#card-funnel").style.display = hasFunnel ? "" : "none";
+  if (hasFunnel) {
+    const windowShare = (key) => rows.map((r, i) => {
+      const j = windowStart(rows, i, 60000), d0 = r.funnel.f0 - rows[j].funnel.f0;
+      return d0 > 0 ? (100 * (r.funnel[key] - rows[j].funnel[key])) / d0 : 0;
+    });
+    const potential = rows.map((r, i) => {
+      const j = windowStart(rows, i, 60000), d0 = r.funnel.f0 - rows[j].funnel.f0;
+      return d0 > 0 ? Math.min(100, (100 * ((r.prior_prefix || 0) - (rows[j].prior_prefix || 0))) / d0) : 0;
+    });
+    const sf = [
+      { name: "Session history: prefix a returning session could reuse", color: "--s1", values: potential },
+      { name: "F2 best eligible worker's cache", color: "--s2", values: windowShare("f2") },
+      { name: "F3 chosen worker's cache", color: "--s3", values: windowShare("f3") },
+      { name: "F4 worker-reported reuse", color: "--s5", values: windowShare("f4") },
+    ].filter((x) => x.values.some((v) => v > 0));
+    // A window with almost no prompt tokens (under 2M) has no meaningful share; leave it out rather than draw a spike.
+    const busy = rows.map((r, i) => r.funnel.f0 - rows[windowStart(rows, i, 60000)].funnel.f0 > 2e6);
+    const tb = t.filter((_, i) => busy[i]);
+    sf.forEach((x) => (x.values = x.values.filter((_, i) => busy[i])));
+    legend("#leg7", sf);
+    lineChart($("#c7"), { x: tb, series: sf, fmtY: (v) => Math.round(v) + "%", fmtTip: (v) => v.toFixed(1) + "%", label: "Cache reuse funnel, share of prompt tokens", max: 100 });
+    const f = last.funnel, of = (v) => (f.f0 ? pct(v / f.f0) : "-");
+    $("#funnel").innerHTML = `<table><thead><tr><th>Step</th><th>Tokens</th><th>Share of prompt</th></tr></thead><tbody>` +
+      [["F0 prompt", f.f0], ["F2 best eligible worker", f.f2], ["F3 chosen worker", f.f3], ["F4 worker-reported reuse", f.f4]]
+        .map(([k, v]) => v === 0 && k.startsWith("F4") ? `<tr><td>${k}</td><td colspan="2">not reported: mock workers do not publish reuse</td></tr>` : `<tr><td>${k}</td><td>${fmtNum(v)}</td><td>${of(v)}</td></tr>`).join("") + `</tbody></table>`;
+  }
+
+  // distribution + table
+  const dur = sess.map((s) => s.duration_ms / MIN);
+  const dist = [
+    ["Turns", sess.map((s) => s.turns), (v) => String(Math.round(v))],
+    ["Input tokens (ISL), total", sess.map((s) => s.isl_tokens), fmtTok],
+    ["Input tokens (ISL) per turn", sess.map((s) => s.isl_tokens / Math.max(1, s.turns)), fmtTok],
+    ["Output tokens (OSL) per turn", sess.map((s) => s.osl_tokens / Math.max(1, s.turns)), (v) => String(Math.round(v))],
+    ["Context growth per turn (tokens)", sess.map((s) => s.growth_per_turn || 0), (v) => String(Math.round(v))],
+    ["Output (tokens)", sess.map((s) => s.osl_tokens), fmtTok],
+    ["Cache hit rate", sess.map((s) => s.hit_rate), pct],
+    ["Duration (min)", dur, (v) => v.toFixed(1)],
+    ["Mean gap between turns (s)", sess.map((s) => s.mean_turn_gap_ms / 1000), (v) => v.toFixed(1)],
+    ["Subagents spawned", sess.map((s) => s.children), (v) => String(Math.round(v))],
+  ];
+  $("#dist").innerHTML = `<table><thead><tr><th>Per session</th><th>p50</th><th>p90</th><th>max</th></tr></thead><tbody>` +
+    dist.map(([k, xs, f]) => `<tr><td>${k}</td><td>${f(quantile(xs, 0.5))}</td><td>${f(quantile(xs, 0.9))}</td><td>${f(Math.max(...xs))}</td></tr>`).join("") + `</tbody></table>`;
+
+  // ---- your sessions: tiles and shape
+  const islTurn = sess.map((x) => x.isl_tokens / Math.max(1, x.turns)), osl = sess.map((x) => x.osl_tokens / Math.max(1, x.turns));
+  const rs = run.requests;
+  const withKids = sess.filter((x) => x.children > 0).length;
+  const prim = sess.filter((x) => !x.parent_session_id), subag = sess.filter((x) => x.parent_session_id);
+  $("#stiles").innerHTML =
+    tile("Sessions", String(sess.length), `${subs} subagents, ${withKids} sessions spawned subagents`) +
+    tile("Turns per session", `${Math.round(median(sess.map((x) => x.turns)))} median`, `p90 ${Math.round(quantile(sess.map((x) => x.turns), 0.9))}, max ${Math.max(...sess.map((x) => x.turns))}`) +
+    tile("Input tokens (ISL) per request", fmtTok(rs && rs.isl ? rs.isl.p50 : median(islTurn)) + " median", rs && rs.isl ? `p90 ${fmtTok(rs.isl.p90)}, max ${fmtTok(rs.isl.max)}` : `p90 ${fmtTok(quantile(islTurn, 0.9))} (mean per turn, per session)`) +
+    tile("Output tokens (OSL) per request", Math.round(rs && rs.osl ? rs.osl.p50 : median(osl)) + " median", rs && rs.osl ? `p90 ${fmtNum(rs.osl.p90)}, max ${fmtNum(rs.osl.max)}` : `p90 ${Math.round(quantile(osl, 0.9))}`) +
+    tile("Context growth per turn", fmtTok(median(sess.map((x) => x.growth_per_turn || 0))) + " median", `p90 ${fmtTok(quantile(sess.map((x) => x.growth_per_turn || 0), 0.9))}`) +
+    tile("Think time between turns", `${median(prim.map((x) => x.mean_turn_gap_ms / 1000)).toFixed(1)} s primary`, `${median(subag.map((x) => x.mean_turn_gap_ms / 1000)).toFixed(1)} s for subagents, which run back to back; the replay divides recorded think time by ${run.time_scale || 1}`);
+
+  const histRows = (title, xs, edges, fmt) => {
+    const counts = edges.map(() => 0).concat([0]);
+    xs.forEach((v) => { let k = edges.findIndex((e) => v <= e); counts[k < 0 ? edges.length : k]++; });
+    const top = Math.max(...counts, 1);
+    return `<div class="hist"><h3>${title}</h3>` + counts.map((c, k) =>
+      `<div class="gaprow"><div class="lab">${k < edges.length ? "up to " + fmt(edges[k]) : "over " + fmt(edges[edges.length - 1])}</div><div class="gapbar"><span title="${c} sessions" style="width:${(c / top) * 100}%;background:var(--s1)"></span></div><div class="n">${c}</div></div>`).join("") + `</div>`;
+  };
+  $("#hists").innerHTML =
+    histRows("Turns per session", sess.map((x) => x.turns), [1, 2, 4, 8, 16, 32, 64, 128], String) +
+    histRows("Input tokens per turn", islTurn, [1000, 4000, 16000, 32000, 64000, 128000, 256000], fmtTok) +
+    histRows("Output tokens per turn", osl, [32, 64, 128, 192, 256, 512], (v) => String(v)) +
+    histRows("Think time between turns, primary sessions (s)", prim.map((x) => x.mean_turn_gap_ms / 1000), [0.5, 1, 2, 5, 10, 20, 40, 80], (v) => String(v));
+
+  const meanWindow = (key) => rows.map((r, i) => {
+    const j = windowStart(rows, i, 60000), dc = r[key].count - rows[j][key].count;
+    return dc > 0 ? (r[key].sum - rows[j][key].sum) / dc : 0;
+  });
+  const hasShape = rows.some((r) => r.input_seq && r.input_seq.count > 0);
+  $("#card-shape").style.display = hasShape ? "" : "none";
+  if (hasShape) {
+    const sz = [{ name: "Mean input tokens per request (left axis)", color: "--s1", values: meanWindow("input_seq") }, { name: "Mean output tokens per request (right axis)", color: "--s3", axis: "right", values: meanWindow("output_seq") }];
+    legend("#leg9", sz);
+    lineChart($("#c9"), { x: t, series: sz, fmtY: fmtTok, fmtTip: fmtTok, fmtY2: (v) => String(Math.round(v)), fmtTip2: (v) => String(Math.round(v)), label: "Mean input and output tokens per request" });
+  }
+
+  // ---- compute health
+  const crow = rows.filter((r) => r.compute);
+  $("#compute").style.display = crow.length ? "" : "none";
+  if (crow.length) {
+    const ct = crow.map((r) => r.now_ms / MIN);
+    const fill = (xs) => { let last = 0; return xs.map((v) => (last = v == null ? last : v)); };
+    const lat = (name, k, scale) => fill(crow.map((r) => (r.compute[name] ? r.compute[name][k] : null))).map((v) => v * scale);
+    const ttft50 = lat("ttft", "p50", 1), ttft90 = lat("ttft", "p90", 1), itl50 = lat("itl", "p50", 1000), itl90 = lat("itl", "p90", 1000);
+    const fmtS = (v) => (v < 1 ? Math.round(v * 1000) + " ms" : (v >= 10 ? v.toFixed(0) : v.toFixed(1)) + " s"), fmtMs = (v) => Math.round(v) + " ms";
+    const demandOver = [], demandUnder = [];
+    crow.forEach((r, i) => (r.demand_tokens > r.capacity_device_tokens ? demandOver : demandUnder).push(ttft90[i]));
+    const waiting = crow.map((r) => r.compute.prefilling), queued = crow.map((r) => r.compute.queued), running = crow.map((r) => r.compute.decoding);
+    const backlog = crow.map((r) => r.compute.prefill_tokens);
+    const kvPct = (r) => r.compute.decode_blocks.map((b) => (100 * b) / r.compute.block_capacity);
+    const kvMean = crow.map((r) => { const x = kvPct(r); return x.length ? x.reduce((a, b) => a + b, 0) / x.length : 0; });
+    $("#ctiles").innerHTML =
+      tile("Time to first token", fmtS(median(ttft50)) + " median", `p90 ${fmtS(quantile(ttft90, 0.5))} typical, ${fmtS(Math.max(...ttft90))} worst window`) +
+      (demandOver.length && demandUnder.length ? tile("p90 TTFT, demand over vs under capacity", `${fmtS(median(demandOver))} vs ${fmtS(median(demandUnder))}`, `windows where demand passed GPU capacity (${demandOver.length}) vs did not (${demandUnder.length})`) : "") +
+      tile("Inter-token latency", fmtMs(median(itl50)) + " median", `p90 ${fmtMs(quantile(itl90, 0.5))} typical`) +
+      tile("Peak requests in prefill", String(Math.max(...waiting)), `peak decoding ${Math.max(...running)}, frontend queue peak ${Math.max(...queued)}`) +
+      tile("Peak prefill backlog", fmtTok(Math.max(...backlog)), "prompt tokens queued or being prefilled, all workers") ;
+    legend("#leg11", [{ name: "p50", color: "--s1" }, { name: "p90", color: "--s2" }]);
+    lineChart($("#c11"), { x: ct, series: [{ name: "p50", color: "--s1", values: ttft50 }, { name: "p90", color: "--s2", values: ttft90 }], fmtY: fmtS, fmtTip: fmtS, label: "Time to first token" });
+    legend("#leg12", [{ name: "p50", color: "--s1" }, { name: "p90", color: "--s2" }]);
+    lineChart($("#c12"), { x: ct, series: [{ name: "p50", color: "--s1", values: itl50 }, { name: "p90", color: "--s2", values: itl90 }], fmtY: fmtMs, fmtTip: fmtMs, label: "Inter-token latency" });
+    const rate = (key, field) => crow.map((r, i) => {
+      const j = windowStart(crow, i, 60000), dt = (r.now_ms - crow[j].now_ms) / 1000;
+      return dt > 0 ? (r[key][field] - crow[j][key][field]) / dt : 0;
+    });
+    const s25 = [{ name: "Input tokens per second (left axis)", color: "--s2", values: rate("input_seq", "sum") }, { name: "Output tokens per second (right axis)", color: "--s3", axis: "right", values: rate("output_seq", "sum") }];
+    legend("#leg25", s25);
+    lineChart($("#c25"), { x: ct, series: s25, fmtY: fmtTok, fmtTip: fmtTok, fmtY2: fmtTok, fmtTip2: fmtTok, label: "Input and output tokens per second" });
+    const hasW = crow.some((r) => r.compute.worker_ttft && r.compute.worker_ttft.length);
+    $("#card-wspread").style.display = hasW ? "" : "none";
+    if (hasW) {
+      const spread = (field, scale) => [
+        crow.map((r) => { const x = r.compute[field] || []; return x.length ? x[x.length - 1] * scale : 0; }),
+        crow.map((r) => { const x = r.compute[field] || []; return x.length ? x[x.length >> 1] * scale : 0; }),
+      ];
+      const [tMax, tMed] = spread("worker_ttft", 1), [iMax, iMed] = spread("worker_itl", 1000);
+      const s27 = [{ name: "Slowest worker", color: "--s2", values: tMax }, { name: "Median worker", color: "--s1", values: tMed }];
+      legend("#leg27", s27);
+      lineChart($("#c27"), { x: ct, series: s27, fmtY: fmtS, fmtTip: fmtS, label: "Last time to first token per worker" });
+      const s28 = [{ name: "Slowest worker", color: "--s2", values: iMax }, { name: "Median worker", color: "--s1", values: iMed }];
+      legend("#leg28", s28);
+      lineChart($("#c28"), { x: ct, series: s28, fmtY: fmtMs, fmtTip: fmtMs, label: "Last inter-token latency per worker" });
+    }
+    const sq = [{ name: "In prefill (queued or prefilling)", color: "--s2", values: waiting }, { name: "Decoding", color: "--s1", values: running }, { name: "Queued at frontend or router", color: "--s5", values: queued }];
+    legend("#leg13", sq);
+    lineChart($("#c13"), { x: ct, series: sq, fmtY: (v) => String(Math.round(v)), fmtTip: (v) => String(Math.round(v)), label: "Queues" });
+    const wait = crow.map((r, i) => {
+      const k = windowStart(crow, i, 30000), dt = (r.now_ms - crow[k].now_ms) / 1000, dn = r.input_seq.sum - crow[k].input_seq.sum;
+      const b = backlog.slice(k, i + 1).reduce((a, c) => a + c, 0) / (i - k + 1);
+      return dn > 0 && dt > 0 ? b / (dn / dt) : 0;
+    });
+    legend("#leg14", [{ name: "Estimated wait to finish prefill backlog", color: "--s2" }]);
+    lineChart($("#c14"), { x: ct, series: [{ name: "Estimated wait to finish prefill backlog", color: "--s2", values: wait }], fmtY: fmtS, fmtTip: fmtS, label: "Estimated queue wait" });
+  }
+
+  $("#ref").innerHTML = `<table class="reftable"><thead><tr><th>Metric</th><th>Type</th><th>What it tells you</th></tr></thead><tbody>` +
+    REF.map(([group, ms]) => `<tr><td colspan="3"><b>${group}</b>${NEW_GROUPS.has(group) ? '<span class="newpill">new</span>' : ""}</td></tr>` + ms.map(([n, ty, d]) => `<tr><td>${n}${NEW_GROUPS.has(group) || NEW_ROWS.has(n) ? '<span class="newpill">new</span>' : ""}</td><td>${ty}</td><td>${d}</td></tr>`).join("")).join("") + `</tbody></table>`;
+}
+
+let current = Number(new URLSearchParams(location.search).get("run") ?? DATA.findIndex((d) => d.key === "__DEFAULT__"));
+if (!(current >= 0)) current = 1;
+$("#tabs").innerHTML = DATA.map((d, i) => `<button class="tab" data-i="${i}" aria-pressed="false">${d.label}<small>${d.detail}</small></button>`).join("");
+$("#tabs").addEventListener("click", (e) => { const b = e.target.closest(".tab"); if (b) { current = Number(b.dataset.i); render(current); } });
+let timer;
+addEventListener("resize", () => { clearTimeout(timer); timer = setTimeout(() => render(current), 120); });
+render(current);
+</script>
+</body>
+</html>

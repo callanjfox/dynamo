@@ -10,7 +10,7 @@ use parking_lot::RwLock;
 use rustc_hash::{FxHashMap, FxHashSet};
 use slotmap::{SlotMap, new_key_type};
 
-use crate::protocols::{ExternalSequenceBlockHash, WorkerId, WorkerWithDpRank};
+use crate::protocols::{ExternalSequenceBlockHash, StorageTier, WorkerId, WorkerWithDpRank};
 
 /// Logical session identity as owned by this index.
 pub type SessionId = String;
@@ -71,15 +71,73 @@ pub enum SessionPrefixIndexError {
     CyclicParent { block: ExternalSequenceBlockHash },
 }
 
+/// Block counts for the tiers a session prefix can be resident in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct TierBlocks {
+    pub device: u64,
+    pub host: u64,
+    pub disk: u64,
+}
+
+impl TierBlocks {
+    fn slot_mut(&mut self, tier: StorageTier) -> Option<&mut u64> {
+        match tier {
+            StorageTier::Device => Some(&mut self.device),
+            StorageTier::HostPinned => Some(&mut self.host),
+            StorageTier::Disk => Some(&mut self.disk),
+            StorageTier::External => None,
+        }
+    }
+
+    fn raise(&mut self, tier: StorageTier, blocks: u64) {
+        if let Some(slot) = self.slot_mut(tier) {
+            *slot = (*slot).max(blocks);
+        }
+    }
+}
+
+/// Fleet-wide view of where session prefixes are resident.
+#[derive(Clone, Debug, Default)]
+pub struct ResidencySnapshot {
+    /// Deepest prefix each session holds per tier, across all workers.
+    pub per_session: HashMap<SessionId, TierBlocks>,
+    /// Sum of `per_session`: what the tiers hold if no prefix were shared.
+    pub summed: TierBlocks,
+    /// Distinct logical blocks the sessions' prefixes cover per tier, counting a
+    /// shared prefix once.
+    pub distinct: TierBlocks,
+    /// Distinct blocks per tier held only for sessions the caller marked inactive.
+    pub stranded: TierBlocks,
+    /// Blocks held by more than one worker per tier: the sum over workers of the
+    /// distinct blocks each holds, minus the distinct blocks fleet-wide. Capacity
+    /// spent on copies of the same prefix.
+    pub replicated: TierBlocks,
+    /// Sessions the caller did not mark inactive whose device-tier frontier sits on
+    /// more than one worker.
+    pub split_sessions: u64,
+    /// Distinct blocks each worker holds per tier for the sessions' prefixes. Set
+    /// against that worker's own capacity, it shows whether load is even.
+    pub workers: HashMap<WorkerWithDpRank, TierBlocks>,
+    /// Blocks each worker holds only for active sessions whose last turn ran on another
+    /// worker: cache left behind when a session moved, not needed by anyone homed here.
+    pub left_behind: HashMap<WorkerWithDpRank, TierBlocks>,
+    /// Blocks held in both the device and host tiers of one worker, summed over
+    /// workers: how much of host memory is a copy of GPU memory.
+    pub device_host_overlap: u64,
+}
+
 /// Thread-safe session-aware logical prefix index.
 #[derive(Debug, Default)]
 pub struct SessionPrefixIndexer {
     state: RwLock<IndexState>,
 }
 
+/// Worker rank and storage tier that hold one session frontier.
+type FrontierKey = (WorkerWithDpRank, StorageTier);
+
 #[derive(Debug, Default)]
 struct SessionEntry {
-    worker_frontiers: FxHashMap<WorkerWithDpRank, FxHashSet<NodeId>>,
+    worker_frontiers: FxHashMap<FrontierKey, FxHashSet<NodeId>>,
     last_touch: Option<u64>,
 }
 
@@ -88,7 +146,7 @@ struct IndexState {
     nodes: SlotMap<NodeId, LogicalNode>,
     hash_to_node: FxHashMap<ExternalSequenceBlockHash, NodeId>,
     session_to_worker_frontiers: HashMap<SessionId, SessionEntry>,
-    worker_frontier_to_sessions: FxHashMap<WorkerWithDpRank, FxHashMap<NodeId, HashSet<SessionId>>>,
+    worker_frontier_to_sessions: FxHashMap<FrontierKey, FxHashMap<NodeId, HashSet<SessionId>>>,
     lru: BTreeMap<u64, SessionId>,
     next_touch: u64,
     max_sessions: usize,
@@ -135,8 +193,23 @@ impl SessionPrefixIndexer {
         self.state.read().nodes.get(node_id).copied()
     }
 
-    /// Returns unordered worker-qualified frontier nodes.
+    /// Returns unordered worker-qualified device-tier frontier nodes.
     pub fn get_session_frontiers(&self, session_id: &str) -> Vec<(WorkerWithDpRank, NodeId)> {
+        self.get_session_residency(session_id)
+            .into_iter()
+            .filter(|(_, tier, _)| tier.is_gpu())
+            .map(|(worker, _, frontier)| (worker, frontier))
+            .collect()
+    }
+
+    /// Returns unordered frontier nodes for every worker rank and storage tier that
+    /// holds part of the session. A tier's frontier is the deepest session block that
+    /// tier reported; the index assumes, as it does on device, that its ancestors are
+    /// resident in the same tier.
+    pub fn get_session_residency(
+        &self,
+        session_id: &str,
+    ) -> Vec<(WorkerWithDpRank, StorageTier, NodeId)> {
         self.state
             .read()
             .session_to_worker_frontiers
@@ -145,19 +218,32 @@ impl SessionPrefixIndexer {
                 entry
                     .worker_frontiers
                     .iter()
-                    .flat_map(|(&worker, frontiers)| {
-                        frontiers.iter().map(move |&frontier| (worker, frontier))
+                    .flat_map(|(&(worker, tier), frontiers)| {
+                        frontiers
+                            .iter()
+                            .map(move |&frontier| (worker, tier, frontier))
                     })
                     .collect()
             })
             .unwrap_or_default()
     }
 
-    /// Returns root-first chains for one worker, optionally truncated at an anchor.
+    /// Returns root-first device-tier chains for one worker, optionally truncated at an anchor.
     pub fn get_session_block_lineage(
         &self,
         session_id: &str,
         worker: WorkerWithDpRank,
+        anchor_hash: Option<ExternalSequenceBlockHash>,
+    ) -> Result<Vec<Vec<ExternalSequenceBlockHash>>, SessionPrefixIndexError> {
+        self.get_session_block_lineage_in_tier(session_id, worker, StorageTier::Device, anchor_hash)
+    }
+
+    /// Returns root-first chains held by one worker tier, optionally truncated at an anchor.
+    pub fn get_session_block_lineage_in_tier(
+        &self,
+        session_id: &str,
+        worker: WorkerWithDpRank,
+        tier: StorageTier,
         anchor_hash: Option<ExternalSequenceBlockHash>,
     ) -> Result<Vec<Vec<ExternalSequenceBlockHash>>, SessionPrefixIndexError> {
         let state = self.state.read();
@@ -176,7 +262,7 @@ impl SessionPrefixIndexer {
         let Some(frontiers) = state
             .session_to_worker_frontiers
             .get(session_id)
-            .and_then(|entry| entry.worker_frontiers.get(&worker))
+            .and_then(|entry| entry.worker_frontiers.get(&(worker, tier)))
         else {
             return Ok(Vec::new());
         };
@@ -213,16 +299,35 @@ impl SessionPrefixIndexer {
         }
         let mut state = self.state.write();
         let node = state.resolve_or_insert_root(matched_hash);
-        let updated = state.advance_frontier(session_id, worker, node);
+        let updated = state.advance_frontier(session_id, (worker, StorageTier::Device), node);
         state.maybe_cleanup();
         Ok(updated)
     }
 
-    /// Records a stored block chain and reports whether the frontier advanced.
+    /// Records a device-tier stored block chain and reports whether the frontier advanced.
     pub fn update_session_from_stored_blocks(
         &self,
         session_id: &str,
         worker: WorkerWithDpRank,
+        parent_hash: Option<ExternalSequenceBlockHash>,
+        block_hashes: &[ExternalSequenceBlockHash],
+    ) -> Result<bool, SessionPrefixIndexError> {
+        self.update_session_from_stored_blocks_in_tier(
+            session_id,
+            worker,
+            StorageTier::Device,
+            parent_hash,
+            block_hashes,
+        )
+    }
+
+    /// Records a block chain stored in one worker tier and reports whether that
+    /// tier's frontier advanced.
+    pub fn update_session_from_stored_blocks_in_tier(
+        &self,
+        session_id: &str,
+        worker: WorkerWithDpRank,
+        tier: StorageTier,
         parent_hash: Option<ExternalSequenceBlockHash>,
         block_hashes: &[ExternalSequenceBlockHash],
     ) -> Result<bool, SessionPrefixIndexError> {
@@ -254,15 +359,19 @@ impl SessionPrefixIndexer {
         }
 
         let leaf = parent.expect("non-empty block chain always yields a node");
-        let updated = state.advance_frontier(session_id, worker, leaf);
+        let updated = state.advance_frontier(session_id, (worker, tier), leaf);
         state.maybe_cleanup();
         Ok(updated)
     }
 
-    /// Recedes worker-local session frontiers affected by removed blocks.
-    pub fn update_session_from_removed_blocks(
+    /// Attributes blocks that a worker tier stored without a session to every session
+    /// whose frontier in another tier of the same worker already covers them, such as
+    /// device blocks offloaded to host memory or host blocks loaded back to the device.
+    /// Returns the number of frontiers advanced.
+    pub fn inherit_stored_blocks(
         &self,
         worker: WorkerWithDpRank,
+        tier: StorageTier,
         block_hashes: &[ExternalSequenceBlockHash],
     ) -> usize {
         if block_hashes.is_empty() {
@@ -270,12 +379,38 @@ impl SessionPrefixIndexer {
         }
 
         let mut state = self.state.write();
-        let updated = state.recede_removed_frontiers(worker, block_hashes);
+        let updated = state.inherit_stored_blocks((worker, tier), block_hashes);
         state.maybe_cleanup();
         updated
     }
 
-    /// Removes every session frontier associated with one worker rank.
+    /// Recedes worker-local device-tier session frontiers affected by removed blocks.
+    pub fn update_session_from_removed_blocks(
+        &self,
+        worker: WorkerWithDpRank,
+        block_hashes: &[ExternalSequenceBlockHash],
+    ) -> usize {
+        self.update_session_from_removed_blocks_in_tier(worker, StorageTier::Device, block_hashes)
+    }
+
+    /// Recedes session frontiers in one worker tier affected by removed blocks.
+    pub fn update_session_from_removed_blocks_in_tier(
+        &self,
+        worker: WorkerWithDpRank,
+        tier: StorageTier,
+        block_hashes: &[ExternalSequenceBlockHash],
+    ) -> usize {
+        if block_hashes.is_empty() {
+            return 0;
+        }
+
+        let mut state = self.state.write();
+        let updated = state.recede_removed_frontiers((worker, tier), block_hashes);
+        state.maybe_cleanup();
+        updated
+    }
+
+    /// Removes every session frontier associated with one worker rank, in every tier.
     pub fn clear_worker_frontiers(&self, worker: WorkerWithDpRank) -> usize {
         let mut state = self.state.write();
         let updated = state.clear_worker_frontiers(worker);
@@ -297,6 +432,172 @@ impl SessionPrefixIndexer {
 
     pub fn session_count(&self) -> usize {
         self.state.read().session_to_worker_frontiers.len()
+    }
+
+    /// Deepest prefix one session holds per tier, in blocks.
+    pub fn session_resident_blocks(&self, session_id: &str) -> TierBlocks {
+        let state = self.state.read();
+        let Some(entry) = state.session_to_worker_frontiers.get(session_id) else {
+            return TierBlocks::default();
+        };
+        let mut memo = FxHashMap::default();
+        let mut blocks = TierBlocks::default();
+        for (&(_, tier), frontiers) in &entry.worker_frontiers {
+            for &frontier in frontiers {
+                blocks.raise(tier, state.node_depth(frontier, &mut memo));
+            }
+        }
+        blocks
+    }
+
+    /// Summarize residency for every session. Walks each frontier once, memoizing
+    /// depths, so cost is bounded by the distinct nodes the frontiers cover; call it
+    /// on a timer, not per request.
+    pub fn residency_snapshot(&self) -> ResidencySnapshot {
+        self.residency_snapshot_with(|_| false)
+    }
+
+    /// As [`Self::residency_snapshot`], also reporting the distinct blocks held only
+    /// for sessions `is_inactive` accepts: capacity spent on sessions nobody is
+    /// waiting on.
+    pub fn residency_snapshot_with(&self, is_inactive: impl Fn(&str) -> bool) -> ResidencySnapshot {
+        self.residency_snapshot_with_homes(is_inactive, |_| None)
+    }
+
+    /// As [`Self::residency_snapshot_with`], also reporting the cache each worker holds
+    /// for active sessions whose home (`home`) is another worker.
+    pub fn residency_snapshot_with_homes(
+        &self,
+        is_inactive: impl Fn(&str) -> bool,
+        home: impl Fn(&str) -> Option<WorkerWithDpRank>,
+    ) -> ResidencySnapshot {
+        let state = self.state.read();
+        let mut memo = FxHashMap::default();
+        let mut active_covered: [FxHashSet<NodeId>; 3] = Default::default();
+        let mut inactive_covered: [FxHashSet<NodeId>; 3] = Default::default();
+        let mut per_worker: FxHashMap<(WorkerWithDpRank, usize), FxHashSet<NodeId>> =
+            FxHashMap::default();
+        let mut on_home: FxHashMap<(WorkerWithDpRank, usize), FxHashSet<NodeId>> =
+            FxHashMap::default();
+        let mut off_home: FxHashMap<(WorkerWithDpRank, usize), FxHashSet<NodeId>> =
+            FxHashMap::default();
+        let mut snapshot = ResidencySnapshot::default();
+        for (session_id, entry) in &state.session_to_worker_frontiers {
+            let covered = if is_inactive(session_id) {
+                &mut inactive_covered
+            } else {
+                &mut active_covered
+            };
+            let mut blocks = TierBlocks::default();
+            let mut device_workers: FxHashSet<WorkerWithDpRank> = FxHashSet::default();
+            let session_home = home(session_id);
+            let inactive = is_inactive(session_id);
+            for (&(worker, tier), frontiers) in &entry.worker_frontiers {
+                let (tier_index, set) = match tier {
+                    StorageTier::Device => (0, &mut covered[0]),
+                    StorageTier::HostPinned => (1, &mut covered[1]),
+                    StorageTier::Disk => (2, &mut covered[2]),
+                    StorageTier::External => continue,
+                };
+                let held = per_worker.entry((worker, tier_index)).or_default();
+                // An unknown home counts as on-home; inactive sessions are the stranded set.
+                let side = (!inactive).then(|| match session_home {
+                    Some(h) if h != worker => off_home.entry((worker, tier_index)).or_default(),
+                    _ => on_home.entry((worker, tier_index)).or_default(),
+                });
+                let mut side = side;
+                for &frontier in frontiers {
+                    blocks.raise(tier, state.node_depth(frontier, &mut memo));
+                    let mut current = Some(frontier);
+                    while let Some(node) = current {
+                        if !held.insert(node) {
+                            break;
+                        }
+                        current = state.nodes[node].parent;
+                    }
+                    if let Some(side) = side.as_deref_mut() {
+                        let mut current = Some(frontier);
+                        while let Some(node) = current {
+                            if !side.insert(node) {
+                                break;
+                            }
+                            current = state.nodes[node].parent;
+                        }
+                    }
+                    let mut current = Some(frontier);
+                    while let Some(node) = current {
+                        if !set.insert(node) {
+                            break;
+                        }
+                        current = state.nodes[node].parent;
+                    }
+                }
+                if tier == StorageTier::Device && !frontiers.is_empty() {
+                    device_workers.insert(worker);
+                }
+            }
+            if device_workers.len() > 1 && !is_inactive(session_id) {
+                snapshot.split_sessions += 1;
+            }
+            snapshot.summed.device += blocks.device;
+            snapshot.summed.host += blocks.host;
+            snapshot.summed.disk += blocks.disk;
+            snapshot.per_session.insert(session_id.clone(), blocks);
+        }
+        let stranded = |tier: usize| {
+            inactive_covered[tier]
+                .iter()
+                .filter(|node| !active_covered[tier].contains(*node))
+                .count() as u64
+        };
+        snapshot.stranded = TierBlocks {
+            device: stranded(0),
+            host: stranded(1),
+            disk: stranded(2),
+        };
+        snapshot.distinct = TierBlocks {
+            device: active_covered[0].len() as u64 + snapshot.stranded.device,
+            host: active_covered[1].len() as u64 + snapshot.stranded.host,
+            disk: active_covered[2].len() as u64 + snapshot.stranded.disk,
+        };
+        let mut worker_sum = [0u64; 3];
+        for (&(worker, tier_index), nodes) in &per_worker {
+            worker_sum[tier_index] += nodes.len() as u64;
+            let held = snapshot.workers.entry(worker).or_default();
+            let slot = match tier_index {
+                0 => &mut held.device,
+                1 => &mut held.host,
+                _ => &mut held.disk,
+            };
+            *slot = nodes.len() as u64;
+        }
+        for (&(worker, tier_index), nodes) in &off_home {
+            let kept = on_home.get(&(worker, tier_index));
+            let left = nodes
+                .iter()
+                .filter(|node| kept.is_none_or(|set| !set.contains(*node)))
+                .count() as u64;
+            let slot = snapshot.left_behind.entry(worker).or_default();
+            match tier_index {
+                0 => slot.device = left,
+                1 => slot.host = left,
+                _ => slot.disk = left,
+            }
+        }
+        for (&(worker, tier_index), device) in &per_worker {
+            if tier_index == 0
+                && let Some(host) = per_worker.get(&(worker, 1))
+            {
+                snapshot.device_host_overlap +=
+                    device.iter().filter(|node| host.contains(*node)).count() as u64;
+            }
+        }
+        snapshot.replicated = TierBlocks {
+            device: worker_sum[0] - snapshot.distinct.device,
+            host: worker_sum[1] - snapshot.distinct.host,
+            disk: worker_sum[2] - snapshot.distinct.disk,
+        };
+        snapshot
     }
 }
 
@@ -428,10 +729,10 @@ impl IndexState {
         if let Some(last_touch) = entry.last_touch {
             self.lru.remove(&last_touch);
         }
-        for (worker, frontiers) in entry.worker_frontiers {
+        for (key, frontiers) in entry.worker_frontiers {
             for node in frontiers {
                 self.nodes[node].frontier_refs -= 1;
-                self.remove_reverse_frontier(worker, node, session_id);
+                self.remove_reverse_frontier(key, node, session_id);
                 self.queue_prune_candidate(node);
             }
         }
@@ -489,6 +790,31 @@ impl IndexState {
     }
 
     // Bound parent walks so corrupted cycles cannot hang while holding the lock.
+    /// Blocks from the root to `node` inclusive, memoized across calls.
+    fn node_depth(&self, node: NodeId, memo: &mut FxHashMap<NodeId, u64>) -> u64 {
+        let limit = self.nodes.len();
+        let mut pending = Vec::new();
+        let mut current = Some(node);
+        let mut depth = 0;
+        while let Some(candidate) = current {
+            if let Some(&known) = memo.get(&candidate) {
+                depth = known;
+                break;
+            }
+            if pending.len() >= limit {
+                debug_assert!(false, "parent cycle in session prefix index forest");
+                break;
+            }
+            pending.push(candidate);
+            current = self.nodes[candidate].parent;
+        }
+        for candidate in pending.into_iter().rev() {
+            depth += 1;
+            memo.insert(candidate, depth);
+        }
+        depth
+    }
+
     fn path_to_root(&self, tail: NodeId) -> Vec<NodeId> {
         let limit = self.nodes.len();
         let mut path = Vec::new();
@@ -525,17 +851,12 @@ impl IndexState {
         false
     }
 
-    // Keep only the deepest frontier on each worker-local chain.
-    fn advance_frontier(
-        &mut self,
-        session_id: &str,
-        worker: WorkerWithDpRank,
-        node: NodeId,
-    ) -> bool {
+    // Keep only the deepest frontier on each worker-tier chain.
+    fn advance_frontier(&mut self, session_id: &str, key: FrontierKey, node: NodeId) -> bool {
         let already_reached = self
             .session_to_worker_frontiers
             .get(session_id)
-            .and_then(|entry| entry.worker_frontiers.get(&worker))
+            .and_then(|entry| entry.worker_frontiers.get(&key))
             .is_some_and(|frontiers| {
                 frontiers.contains(&node)
                     || frontiers
@@ -550,7 +871,7 @@ impl IndexState {
         let subsumed: Vec<NodeId> = self
             .session_to_worker_frontiers
             .get(session_id)
-            .and_then(|entry| entry.worker_frontiers.get(&worker))
+            .and_then(|entry| entry.worker_frontiers.get(&key))
             .map(|frontiers| {
                 frontiers
                     .iter()
@@ -561,21 +882,21 @@ impl IndexState {
             .unwrap_or_default();
 
         for &frontier in &subsumed {
-            self.remove_frontier_binding(session_id, worker, frontier);
+            self.remove_frontier_binding(session_id, key, frontier);
         }
-        self.add_frontier_binding(session_id, worker, node);
+        self.add_frontier_binding(session_id, key, node);
         self.touch_session(session_id);
         self.enforce_session_cap();
         true
     }
 
-    fn add_frontier_binding(&mut self, session_id: &str, worker: WorkerWithDpRank, node: NodeId) {
+    fn add_frontier_binding(&mut self, session_id: &str, key: FrontierKey, node: NodeId) {
         let inserted = self
             .session_to_worker_frontiers
             .entry(session_id.to_string())
             .or_default()
             .worker_frontiers
-            .entry(worker)
+            .entry(key)
             .or_default()
             .insert(node);
         if !inserted {
@@ -584,7 +905,7 @@ impl IndexState {
 
         self.nodes[node].frontier_refs += 1;
         self.worker_frontier_to_sessions
-            .entry(worker)
+            .entry(key)
             .or_default()
             .entry(node)
             .or_default()
@@ -594,29 +915,29 @@ impl IndexState {
     fn remove_frontier_binding(
         &mut self,
         session_id: &str,
-        worker: WorkerWithDpRank,
+        key: FrontierKey,
         node: NodeId,
     ) -> bool {
         let removed = self
             .session_to_worker_frontiers
             .get_mut(session_id)
-            .and_then(|entry| entry.worker_frontiers.get_mut(&worker))
+            .and_then(|entry| entry.worker_frontiers.get_mut(&key))
             .is_some_and(|frontiers| frontiers.remove(&node));
         if !removed {
             return false;
         }
 
         self.nodes[node].frontier_refs -= 1;
-        self.remove_reverse_frontier(worker, node, session_id);
+        self.remove_reverse_frontier(key, node, session_id);
         self.queue_prune_candidate(node);
 
-        let remove_worker = self
+        let remove_key = self
             .session_to_worker_frontiers
             .get(session_id)
-            .and_then(|entry| entry.worker_frontiers.get(&worker))
+            .and_then(|entry| entry.worker_frontiers.get(&key))
             .is_some_and(FxHashSet::is_empty);
-        if remove_worker && let Some(entry) = self.session_to_worker_frontiers.get_mut(session_id) {
-            entry.worker_frontiers.remove(&worker);
+        if remove_key && let Some(entry) = self.session_to_worker_frontiers.get_mut(session_id) {
+            entry.worker_frontiers.remove(&key);
         }
         let remove_session_entry = self
             .session_to_worker_frontiers
@@ -631,35 +952,30 @@ impl IndexState {
         true
     }
 
-    fn remove_reverse_frontier(
-        &mut self,
-        worker: WorkerWithDpRank,
-        node: NodeId,
-        session_id: &str,
-    ) {
+    fn remove_reverse_frontier(&mut self, key: FrontierKey, node: NodeId, session_id: &str) {
         let remove_node = self
             .worker_frontier_to_sessions
-            .get_mut(&worker)
+            .get_mut(&key)
             .and_then(|frontiers| frontiers.get_mut(&node))
             .is_some_and(|sessions| {
                 sessions.remove(session_id);
                 sessions.is_empty()
             });
-        if remove_node && let Some(frontiers) = self.worker_frontier_to_sessions.get_mut(&worker) {
+        if remove_node && let Some(frontiers) = self.worker_frontier_to_sessions.get_mut(&key) {
             frontiers.remove(&node);
         }
-        let remove_worker = self
+        let remove_key = self
             .worker_frontier_to_sessions
-            .get(&worker)
+            .get(&key)
             .is_some_and(FxHashMap::is_empty);
-        if remove_worker {
-            self.worker_frontier_to_sessions.remove(&worker);
+        if remove_key {
+            self.worker_frontier_to_sessions.remove(&key);
         }
     }
 
     fn recede_removed_frontiers(
         &mut self,
-        worker: WorkerWithDpRank,
+        key: FrontierKey,
         block_hashes: &[ExternalSequenceBlockHash],
     ) -> usize {
         let removed_nodes: FxHashSet<NodeId> = block_hashes
@@ -673,7 +989,7 @@ impl IndexState {
         // Examine each frontier path; recede past the removed block and its descendants.
         let affected: Vec<(SessionId, NodeId, Option<NodeId>)> = self
             .worker_frontier_to_sessions
-            .get(&worker)
+            .get(&key)
             .map(|frontiers| {
                 frontiers
                     .iter()
@@ -695,18 +1011,62 @@ impl IndexState {
             .unwrap_or_default();
 
         for (session_id, old_frontier, replacement) in &affected {
-            self.remove_frontier_binding(session_id, worker, *old_frontier);
+            self.remove_frontier_binding(session_id, key, *old_frontier);
             if let Some(replacement) = *replacement {
-                self.advance_frontier(session_id, worker, replacement);
+                self.advance_frontier(session_id, key, replacement);
             }
         }
         affected.len()
     }
 
-    fn clear_worker_frontiers(&mut self, worker: WorkerWithDpRank) -> usize {
+    fn inherit_stored_blocks(
+        &mut self,
+        key: FrontierKey,
+        block_hashes: &[ExternalSequenceBlockHash],
+    ) -> usize {
+        let stored_nodes: FxHashSet<NodeId> = block_hashes
+            .iter()
+            .filter_map(|block_hash| self.hash_to_node.get(block_hash).copied())
+            .collect();
+        if stored_nodes.is_empty() {
+            return 0;
+        }
+
+        // Each frontier in another tier of this worker passes on its deepest stored block.
+        let (worker, tier) = key;
+        let inherited: Vec<(SessionId, NodeId)> = self
+            .worker_frontier_to_sessions
+            .iter()
+            .filter(|((frontier_worker, frontier_tier), _)| {
+                *frontier_worker == worker && *frontier_tier != tier
+            })
+            .flat_map(|(_, frontiers)| frontiers.iter())
+            .filter_map(|(&frontier, sessions)| {
+                let path = self.path_to_root(frontier);
+                let deepest_stored = path
+                    .into_iter()
+                    .rev()
+                    .find(|node| stored_nodes.contains(node))?;
+                Some(
+                    sessions
+                        .iter()
+                        .cloned()
+                        .map(move |session_id| (session_id, deepest_stored)),
+                )
+            })
+            .flatten()
+            .collect();
+
+        inherited
+            .into_iter()
+            .filter(|(session_id, node)| self.advance_frontier(session_id, key, *node))
+            .count()
+    }
+
+    fn clear_frontiers(&mut self, key: FrontierKey) -> usize {
         let affected: Vec<(SessionId, NodeId)> = self
             .worker_frontier_to_sessions
-            .get(&worker)
+            .get(&key)
             .map(|frontiers| {
                 frontiers
                     .iter()
@@ -720,22 +1080,27 @@ impl IndexState {
             })
             .unwrap_or_default();
         for (session_id, node) in &affected {
-            self.remove_frontier_binding(session_id, worker, *node);
+            self.remove_frontier_binding(session_id, key, *node);
         }
         affected.len()
     }
 
-    fn clear_worker_id_frontiers(&mut self, worker_id: WorkerId) -> usize {
-        let workers: Vec<_> = self
+    fn clear_matching_frontiers(&mut self, matches: impl Fn(WorkerWithDpRank) -> bool) -> usize {
+        let keys: Vec<_> = self
             .worker_frontier_to_sessions
             .keys()
             .copied()
-            .filter(|worker| worker.worker_id == worker_id)
+            .filter(|&(worker, _)| matches(worker))
             .collect();
-        workers
-            .into_iter()
-            .map(|worker| self.clear_worker_frontiers(worker))
-            .sum()
+        keys.into_iter().map(|key| self.clear_frontiers(key)).sum()
+    }
+
+    fn clear_worker_frontiers(&mut self, worker: WorkerWithDpRank) -> usize {
+        self.clear_matching_frontiers(|frontier_worker| frontier_worker == worker)
+    }
+
+    fn clear_worker_id_frontiers(&mut self, worker_id: WorkerId) -> usize {
+        self.clear_matching_frontiers(|frontier_worker| frontier_worker.worker_id == worker_id)
     }
 }
 
@@ -1045,7 +1410,7 @@ mod tests {
         );
         let state = indexer.state.read();
         let node = state.hash_to_node[&chain[0]];
-        let sessions = &state.worker_frontier_to_sessions[&worker(1)][&node];
+        let sessions = &state.worker_frontier_to_sessions[&(worker(1), StorageTier::Device)][&node];
         assert_eq!(sessions.len(), 2);
         assert!(!sessions.contains("s2"));
     }
@@ -1207,6 +1572,247 @@ mod tests {
         assert_eq!(
             lineage_on_worker(&indexer, "s1", retained_worker),
             vec![chain]
+        );
+    }
+
+    fn residency_of(
+        indexer: &SessionPrefixIndexer,
+        session: &str,
+    ) -> Vec<(WorkerWithDpRank, StorageTier, ExternalSequenceBlockHash)> {
+        indexer
+            .get_session_residency(session)
+            .into_iter()
+            .map(|(worker, tier, node)| {
+                (worker, tier, indexer.get_node(node).unwrap().block_hash())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn offloaded_blocks_keep_session_residency_after_device_eviction() {
+        let chain = hashes(vec![1, 2, 3]);
+        let indexer = SessionPrefixIndexer::new();
+        indexer
+            .update_session_from_stored_blocks("s1", worker(1), None, &chain)
+            .unwrap();
+
+        // The device offloads its first two blocks to host memory, then evicts the last two.
+        assert_eq!(
+            indexer.inherit_stored_blocks(worker(1), StorageTier::HostPinned, &chain[..2]),
+            1
+        );
+        indexer.update_session_from_removed_blocks(worker(1), &chain[1..]);
+
+        assert_eq!(lineage_of(&indexer, "s1"), vec![vec![chain[0]]]);
+        assert_eq!(
+            indexer
+                .get_session_block_lineage_in_tier("s1", worker(1), StorageTier::HostPinned, None)
+                .unwrap(),
+            vec![chain[..2].to_vec()]
+        );
+        let residency = residency_of(&indexer, "s1");
+        assert_eq!(residency.len(), 2);
+        assert!(residency.contains(&(worker(1), StorageTier::Device, chain[0])));
+        assert!(residency.contains(&(worker(1), StorageTier::HostPinned, chain[1])));
+        assert_eq!(
+            indexer.get_session_frontiers("s1").len(),
+            1,
+            "device frontier queries ignore lower tiers"
+        );
+    }
+
+    #[test]
+    fn resident_blocks_report_the_deepest_prefix_per_tier() {
+        let chain = hashes(vec![1, 2, 3, 4]);
+        let indexer = SessionPrefixIndexer::new();
+        indexer
+            .update_session_from_stored_blocks("s1", worker(1), None, &chain)
+            .unwrap();
+        indexer.inherit_stored_blocks(worker(1), StorageTier::HostPinned, &chain[..3]);
+        indexer.update_session_from_removed_blocks(worker(1), &chain[2..]);
+
+        assert_eq!(
+            indexer.session_resident_blocks("s1"),
+            TierBlocks {
+                device: 2,
+                host: 3,
+                disk: 0
+            }
+        );
+        assert_eq!(
+            indexer.session_resident_blocks("unknown"),
+            TierBlocks::default()
+        );
+    }
+
+    #[test]
+    fn residency_snapshot_counts_a_shared_prefix_once() {
+        let shared = hashes(vec![1, 2, 3]);
+        let a_tail = hashes(vec![10, 11]);
+        let b_tail = hashes(vec![20]);
+        let indexer = SessionPrefixIndexer::new();
+        indexer
+            .update_session_from_stored_blocks("a", worker(1), None, &shared)
+            .unwrap();
+        indexer
+            .update_session_from_stored_blocks("a", worker(1), Some(shared[2]), &a_tail)
+            .unwrap();
+        indexer
+            .update_session_from_stored_blocks("b", worker(1), None, &shared)
+            .unwrap();
+        indexer
+            .update_session_from_stored_blocks("b", worker(1), Some(shared[2]), &b_tail)
+            .unwrap();
+
+        let snapshot = indexer.residency_snapshot();
+        assert_eq!(snapshot.per_session["a"].device, 5);
+        assert_eq!(snapshot.per_session["b"].device, 4);
+        assert_eq!(snapshot.summed.device, 9);
+        // Three shared blocks plus two tails of a and one of b.
+        assert_eq!(snapshot.distinct.device, 6);
+        assert_eq!(snapshot.split_sessions, 0);
+    }
+
+    #[test]
+    fn residency_snapshot_flags_sessions_split_across_workers() {
+        let chain = hashes(vec![1, 2]);
+        let indexer = SessionPrefixIndexer::new();
+        indexer
+            .update_session_from_stored_blocks("s", worker(1), None, &chain)
+            .unwrap();
+        indexer
+            .update_session_from_stored_blocks("s", worker(2), None, &chain)
+            .unwrap();
+        indexer
+            .update_session_from_stored_blocks("t", worker(1), None, &chain)
+            .unwrap();
+
+        let snapshot = indexer.residency_snapshot();
+        assert_eq!(snapshot.split_sessions, 1);
+        assert_eq!(snapshot.per_session["s"].device, 2);
+        // Both workers hold blocks 1 and 2: two copies beyond the first.
+        assert_eq!(snapshot.distinct.device, 2);
+        assert_eq!(snapshot.replicated.device, 2);
+        // Worker 1 holds both blocks for s and t together; worker 2 holds the same two.
+        assert_eq!(snapshot.workers[&worker(1)].device, 2);
+        assert_eq!(snapshot.workers[&worker(2)].device, 2);
+    }
+
+    #[test]
+    fn left_behind_cache_and_device_host_overlap() {
+        let chain = hashes(vec![1, 2, 3]);
+        let indexer = SessionPrefixIndexer::new();
+        // Session s ran on worker 1, then moved to worker 2; blocks stay on both.
+        for worker_id in [1, 2] {
+            indexer
+                .update_session_from_stored_blocks("s", worker(worker_id), None, &chain)
+                .unwrap();
+        }
+        // The first two blocks are also held in worker 1's host tier.
+        indexer.inherit_stored_blocks(worker(1), StorageTier::HostPinned, &chain[..2]);
+
+        let snapshot = indexer.residency_snapshot_with_homes(|_| false, |_| Some(worker(2)));
+        // Worker 1 holds three blocks for a session homed on worker 2.
+        assert_eq!(snapshot.left_behind[&worker(1)].device, 3);
+        assert!(!snapshot.left_behind.contains_key(&worker(2)));
+        // Two of worker 1's blocks are held in both its device and host tiers.
+        assert_eq!(snapshot.device_host_overlap, 2);
+        // With no known home nothing is left behind.
+        assert!(indexer.residency_snapshot().left_behind.is_empty());
+    }
+
+    #[test]
+    fn inactive_sessions_are_not_counted_as_split() {
+        let chain = hashes(vec![1, 2]);
+        let indexer = SessionPrefixIndexer::new();
+        for worker_id in [1, 2] {
+            indexer
+                .update_session_from_stored_blocks("s", worker(worker_id), None, &chain)
+                .unwrap();
+        }
+        assert_eq!(indexer.residency_snapshot().split_sessions, 1);
+        assert_eq!(
+            indexer
+                .residency_snapshot_with(|session| session == "s")
+                .split_sessions,
+            0
+        );
+    }
+
+    #[test]
+    fn residency_snapshot_reports_blocks_held_only_for_inactive_sessions() {
+        let shared = hashes(vec![1, 2, 3]);
+        let indexer = SessionPrefixIndexer::new();
+        for (session, tail) in [("live", 10), ("gone", 20)] {
+            indexer
+                .update_session_from_stored_blocks(session, worker(1), None, &shared)
+                .unwrap();
+            indexer
+                .update_session_from_stored_blocks(
+                    session,
+                    worker(1),
+                    Some(shared[2]),
+                    &hashes(vec![tail]),
+                )
+                .unwrap();
+        }
+
+        let snapshot = indexer.residency_snapshot_with(|session| session == "gone");
+        // The shared prefix is still held for the live session, so only the tail is stranded.
+        assert_eq!(snapshot.stranded.device, 1);
+        assert_eq!(snapshot.distinct.device, 5);
+        assert_eq!(indexer.residency_snapshot().stranded, TierBlocks::default());
+    }
+
+    #[test]
+    fn lower_tiers_inherit_only_within_a_worker_and_follow_tier_hops() {
+        let chain = hashes(vec![1, 2]);
+        let indexer = SessionPrefixIndexer::new();
+        indexer
+            .update_session_from_stored_blocks("s1", worker(2), None, &chain)
+            .unwrap();
+        assert_eq!(
+            indexer.inherit_stored_blocks(worker(1), StorageTier::HostPinned, &chain),
+            0,
+            "another worker's frontier does not attribute blocks"
+        );
+
+        indexer
+            .update_session_from_stored_blocks("s1", worker(1), None, &chain)
+            .unwrap();
+        assert_eq!(
+            indexer.inherit_stored_blocks(worker(1), StorageTier::HostPinned, &chain),
+            1
+        );
+        indexer.update_session_from_removed_blocks(worker(1), &chain);
+        assert_eq!(
+            indexer.inherit_stored_blocks(worker(1), StorageTier::Disk, &chain[..1]),
+            1,
+            "disk inherits from host after the device copy is gone"
+        );
+        assert_eq!(
+            indexer.update_session_from_removed_blocks_in_tier(
+                worker(1),
+                StorageTier::HostPinned,
+                &chain[1..]
+            ),
+            1
+        );
+
+        let residency = residency_of(&indexer, "s1");
+        assert_eq!(residency.len(), 3);
+        assert!(residency.contains(&(worker(1), StorageTier::HostPinned, chain[0])));
+        assert!(residency.contains(&(worker(1), StorageTier::Disk, chain[0])));
+        assert!(residency.contains(&(worker(2), StorageTier::Device, chain[1])));
+
+        assert_eq!(
+            indexer.clear_worker_frontiers(worker(1)),
+            2,
+            "a rank clear covers every tier"
+        );
+        assert_eq!(
+            residency_of(&indexer, "s1"),
+            vec![(worker(2), StorageTier::Device, chain[1])]
         );
     }
 
