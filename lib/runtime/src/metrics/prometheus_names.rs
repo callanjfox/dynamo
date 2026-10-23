@@ -626,6 +626,61 @@ pub mod router_request {
     pub const METRIC_PREFIX: &str = "router_";
 }
 
+/// Session telemetry exported by the KV router when `--enable-session-prefix-index` is set.
+///
+/// Experimental. Full metric names, including the `router_` prefix, as exported under
+/// `dynamo_component_`. Defined in `lib/llm/src/kv_router/metrics/session.rs`; none carries a
+/// session, tenant or worker identity (per-session and per-worker detail are log events).
+pub mod router_session {
+    /// Active sessions by role (`primary`, `subagent`)
+    pub const SESSIONS_ACTIVE_BY_ROLE: &str = "router_sessions_active_by_role";
+    /// Distinct prompt tokens active sessions will present next, by role
+    pub const DEMAND_BY_ROLE_TOKENS: &str = "router_session_demand_by_role_tokens";
+    /// Per-session demand of non-ended sessions by time since their last activity
+    pub const DEMAND_BY_IDLE_TOKENS: &str = "router_session_demand_by_idle_tokens";
+    /// Prompt tokens referenced by more than one active session
+    pub const SHARED_TOKENS: &str = "router_session_shared_tokens";
+    /// Distinct tokens the session index holds, by storage tier
+    pub const RESIDENT_TOKENS: &str = "router_session_resident_tokens";
+    /// Distinct tokens held only for inactive sessions, by storage tier
+    pub const STRANDED_TOKENS: &str = "router_session_stranded_tokens";
+    /// Tokens held by more than one worker (copies beyond the first), by storage tier
+    pub const REPLICATED_TOKENS: &str = "router_session_replicated_tokens";
+    /// Tokens held in both the device and host tier of a worker, summed over workers
+    pub const TIER_OVERLAP_TOKENS: &str = "router_session_tier_overlap_tokens";
+    /// Busiest worker's homed demand over the mean worker's
+    pub const WORKER_DEMAND_IMBALANCE_RATIO: &str = "router_session_worker_demand_imbalance_ratio";
+    /// Busiest worker's resident tokens over the mean worker's, by storage tier
+    pub const WORKER_RESIDENT_IMBALANCE_RATIO: &str =
+        "router_session_worker_resident_imbalance_ratio";
+    /// Tokens workers hold for active sessions whose last turn ran elsewhere, by storage tier
+    pub const LEFT_BEHIND_TOKENS: &str = "router_session_left_behind_tokens";
+    /// Prefix tokens returning sessions had to recompute or reload
+    pub const THRASH_TOKENS_TOTAL: &str = "router_session_thrash_tokens_total";
+    /// Returning turns by time since the previous turn and where the prior prefix was found
+    pub const RETURN_TURNS_TOTAL: &str = "router_session_return_turns_total";
+    /// Routed requests by whether they carried a session ID
+    pub const COVERAGE_REQUESTS_TOTAL: &str = "router_session_coverage_requests_total";
+    /// Input tokens of routed requests by whether they carried a session ID
+    pub const COVERAGE_INPUT_TOKENS_TOTAL: &str = "router_session_coverage_input_tokens_total";
+    /// Output tokens of requests that carried a session ID
+    pub const COVERED_OUTPUT_TOKENS_TOTAL: &str = "router_session_covered_output_tokens_total";
+    /// Prefix tokens returning sessions could reuse if nothing had been evicted
+    pub const PRIOR_PREFIX_TOKENS_TOTAL: &str = "router_session_prior_prefix_tokens_total";
+    /// Turns per session, observed when it ends
+    pub const TURNS: &str = "router_session_turns";
+    /// Largest context a session presented, observed when it ends
+    pub const PEAK_CONTEXT_TOKENS: &str = "router_session_peak_context_tokens";
+    /// Share of a session's input served from cache (0 to 1), observed when it ends
+    pub const CACHE_HIT_RATIO: &str = "router_session_cache_hit_ratio";
+    /// Time from a session's first request to its end
+    pub const DURATION_SECONDS: &str = "router_session_duration_seconds";
+    /// Mean time between a session's turns, observed when it ends
+    pub const TURN_GAP_SECONDS: &str = "router_session_turn_gap_seconds";
+    /// Subagent sessions a session spawned, observed when it ends
+    pub const SUBAGENTS: &str = "router_session_subagents";
+}
+
 /// Routing overhead phase latency histogram suffixes.
 ///
 /// Combined with `name_prefix::ROUTER` ("dynamo_router") in `RoutingOverheadMetrics::register()`,

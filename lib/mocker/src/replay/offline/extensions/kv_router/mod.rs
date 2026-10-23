@@ -54,6 +54,7 @@ use aisimulate_core::replay::{
 
 mod composition;
 pub(in crate::replay) use composition::{KvReplayComposition, RoundRobinReplayComposition};
+mod session_stats;
 
 #[derive(Clone, Copy)]
 enum KvEventSummary {
@@ -312,6 +313,9 @@ impl SyncReplayIndexer {
                 }
                 continue;
             }
+            if self.session_prefix_index.is_some() {
+                self.apply_lower_tier_session_event(&event);
+            }
             let block_size = self.block_size;
             let indexer = self
                 .lower_tier
@@ -342,6 +346,50 @@ impl SyncReplayIndexer {
             for indexer in lower_tier.all() {
                 block_on(indexer.remove_worker(worker_id));
             }
+        }
+    }
+
+    /// Record host and disk residency in the session index, as the live router does:
+    /// an attributed store names its session, an unattributed one (an offload or a
+    /// load back) inherits from the sessions that cover its blocks in another tier.
+    fn apply_lower_tier_session_event(&self, event: &RouterEvent) {
+        let Some(index) = &self.session_prefix_index else {
+            return;
+        };
+        let worker = WorkerWithDpRank::new(event.worker_id, event.event.dp_rank);
+        let tier = event.storage_tier;
+        match &event.event.data {
+            KvCacheEventData::Stored(stored) => {
+                let hashes = stored
+                    .blocks
+                    .iter()
+                    .map(|block| block.block_hash)
+                    .collect::<Vec<_>>();
+                match &event.session_id {
+                    Some(session_id) => {
+                        if let Err(error) = index.update_session_from_stored_blocks_in_tier(
+                            session_id,
+                            worker,
+                            tier,
+                            stored.parent_hash,
+                            &hashes,
+                        ) {
+                            tracing::warn!(%error, %session_id, ?worker, ?tier, "failed to record stored session blocks");
+                        }
+                    }
+                    None => {
+                        index.inherit_stored_blocks(worker, tier, &hashes);
+                    }
+                }
+            }
+            KvCacheEventData::Removed(removed) => {
+                index.update_session_from_removed_blocks_in_tier(
+                    worker,
+                    tier,
+                    &removed.block_hashes,
+                );
+            }
+            KvCacheEventData::Cleared => {}
         }
     }
 
@@ -474,6 +522,8 @@ pub(crate) struct OfflineReplayRouter {
     kv_event_lag_ms: f64,
     /// Lagged KV event batches in arrival order, keyed by the replay time they become visible.
     lagged_kv_events: VecDeque<(f64, Vec<RouterEvent>)>,
+    /// Passive per-session workload and working-set recorder; present with the session index.
+    session_stats: Option<session_stats::SessionStatsRecorder>,
 }
 
 pub(in crate::replay) struct KvRouterPlacement {
@@ -703,6 +753,19 @@ impl OfflineReplayRouter {
         let profile = config
             .configured_policy_profile()
             .map_err(anyhow::Error::from)?;
+        let session_stats = config.enable_session_prefix_index.then(|| {
+            let block_size = u64::from(args.block_size as u32);
+            let ranks = (num_workers as u64).saturating_mul(u64::from(args.dp_size.max(1)));
+            let host_blocks = args
+                .native_host_offload
+                .as_ref()
+                .map_or(0, |offload| offload.num_host_blocks as u64);
+            session_stats::SessionStatsRecorder::new(
+                args.block_size as u32,
+                (args.num_gpu_blocks as u64) * block_size * ranks,
+                host_blocks * block_size * ranks,
+            )
+        });
 
         Ok(Self {
             config,
@@ -723,6 +786,7 @@ impl OfflineReplayRouter {
             tracking_hash,
             kv_event_lag_ms: 0.0,
             lagged_kv_events: VecDeque::new(),
+            session_stats,
         })
     }
 
@@ -786,6 +850,23 @@ impl OfflineReplayRouter {
         self.apply_due_kv_events(now_ms)?;
         let pending =
             self.build_pending_request(request, max_output_tokens, replay_hashes, session_id)?;
+        if let (Some(stats), Some(index), Some(session_id)) = (
+            self.session_stats.as_mut(),
+            self.indexer.session_prefix_index.as_ref(),
+            pending.session_id.as_deref(),
+        ) {
+            stats.on_arrival(
+                index,
+                session_stats::ArrivingRequest {
+                    uuid: pending.uuid,
+                    session_id,
+                    isl_tokens: pending.isl_tokens,
+                    osl_tokens: max_output_tokens,
+                    prompt_hashes: pending.session_block_hashes.as_deref(),
+                },
+                now_ms,
+            );
+        }
         let decay_now = self.decay_now(now_ms);
         let (class_index, snapshot) = match self
             .profile
@@ -888,6 +969,12 @@ impl OfflineReplayRouter {
         self.slots
             .free(&uuid.to_string(), decay_now)
             .map_err(anyhow::Error::from)?;
+        if let (Some(stats), Some(index)) = (
+            self.session_stats.as_mut(),
+            self.indexer.session_prefix_index.as_ref(),
+        ) {
+            stats.on_completed(index, uuid, now_ms);
+        }
         Ok(RouterEffects {
             admissions: self.drain_pending(decay_now)?,
         })
@@ -1173,6 +1260,9 @@ impl OfflineReplayRouter {
         let isl_blocks = u32::try_from(request.isl_tokens.div_ceil(self.block_size as usize))
             .unwrap_or(u32::MAX);
         let overlap_blocks = selection.effective_overlap_blocks.round() as u32;
+        if let Some(stats) = self.session_stats.as_mut() {
+            stats.on_admitted(request.uuid, request.isl_tokens, overlap_blocks);
+        }
 
         self.slots
             .add_request(
@@ -2629,7 +2719,7 @@ policy_classes:
     }
 
     #[test]
-    fn session_prefix_ignores_unattributed_and_lower_tier_stores() {
+    fn session_prefix_tracks_lower_tier_stores_apart_from_the_device_tier() {
         let mut router =
             OfflineReplayRouter::new(&replay_args(), Some(session_router_config()), None, 1)
                 .unwrap();
@@ -2638,15 +2728,13 @@ policy_classes:
         router
             .on_kv_events(vec![store_event(0, 11, 1, StorageTier::Device), host])
             .unwrap();
-        assert_eq!(
-            router
-                .indexer
-                .session_prefix_index
-                .as_ref()
-                .unwrap()
-                .session_count(),
-            0
-        );
+        // The unattributed device store makes no session. The attributed host store
+        // records host residency for its session, and only there.
+        let index = router.indexer.session_prefix_index.as_ref().unwrap();
+        assert_eq!(index.session_count(), 1);
+        let residency = index.get_session_residency("a");
+        assert_eq!(residency.len(), 1);
+        assert_eq!(residency[0].1, StorageTier::HostPinned);
         // A host-only match must not create a G1 session frontier.
         let hashes = ReplayRequestHashes {
             local_block_hashes: vec![2],

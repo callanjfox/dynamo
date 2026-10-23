@@ -1,0 +1,168 @@
+<style>
+  .dx { max-width: 1100px; margin-inline: auto; font-family: var(--font-anthropic-sans); color: var(--color-fg); }
+  .dx h1 { font-family: var(--font-anthropic-serif); font-weight: 400; font-size: var(--cds-font-size-title); margin: 0 0 var(--cds-gap-xs); }
+  .dx .lede { color: var(--color-fg-muted); margin: 0 0 var(--cds-gap-md); max-width: 75ch; }
+  .dx nav { display: flex; flex-wrap: wrap; gap: var(--cds-gap-xs) var(--cds-gap-md); margin: 0 0 var(--cds-gap-lg); font-size: var(--cds-font-size-caption); }
+  .dx nav a { color: var(--color-fg-muted); text-decoration: none; }
+  .dx nav a:hover { color: var(--color-fg); text-decoration: underline; }
+  .dx section { margin: 0 0 var(--cds-gap-xl); scroll-margin-top: var(--cds-gap-md); }
+  .dx h2 { font-weight: var(--cds-font-weight-medium); font-size: var(--cds-font-size-heading); margin: 0 0 2px; }
+  .dx .ask { color: var(--color-fg-muted); margin: 0 0 var(--cds-gap-md); max-width: 80ch; }
+  .dx .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 11rem), 1fr)); gap: var(--cds-gap-md); margin: 0 0 var(--cds-gap-md); }
+  .dx .tile { background: var(--color-panel); border: 1px solid var(--color-border-line); border-radius: var(--cds-radius); padding: var(--cds-pad-md) var(--cds-pad-lg); }
+  .dx .tile .k { font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); }
+  .dx .tile .v { font-family: var(--font-anthropic-serif); font-size: var(--cds-font-size-title); line-height: 1.2; font-variant-numeric: tabular-nums; }
+  .dx .tile .d { font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); }
+  .dx .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 30rem), 1fr)); gap: var(--cds-gap-md); }
+  .dx .card { background: var(--color-panel); border: 1px solid var(--color-border-line); border-radius: var(--cds-radius); padding: var(--cds-pad-lg); min-width: 0; }
+  .dx .card h3 { font-weight: var(--cds-font-weight-medium); font-size: var(--cds-font-size-body); margin: 0 0 2px; }
+  .dx .card .note { color: var(--color-fg-muted); font-size: var(--cds-font-size-caption); margin: 0 0 var(--cds-gap-sm); max-width: 75ch; }
+  .dx .legend { display: flex; flex-wrap: wrap; gap: 2px var(--cds-gap-md); font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); margin: 0 0 4px; }
+  .dx .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+  .dx .legend i.dash { height: 0; width: 16px; border-top: 2px dashed var(--cds-chart-reference); border-radius: 0; vertical-align: 3px; }
+  .dx .chart { position: relative; min-height: 220px; }
+  .dx .chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .dx .chart text { fill: var(--color-fg-muted); font-size: 11px; }
+  .dx .tip { position: absolute; pointer-events: none; display: none; z-index: 5; background: var(--cds-surface-popover); border: 1px solid var(--cds-border); border-radius: var(--cds-radius); box-shadow: var(--cds-shadow-popover); padding: var(--cds-pad-xs) var(--cds-pad-sm); font-size: var(--cds-font-size-caption); white-space: nowrap; }
+  .dx .tip b { display: block; color: var(--cds-text-secondary); font-weight: 400; margin-bottom: 2px; }
+  .dx .tip div { display: flex; align-items: center; gap: 6px; font-variant-numeric: tabular-nums; }
+  .dx .tip i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .dx .bars .row { display: grid; grid-template-columns: 8.5rem 1fr 6rem; gap: var(--cds-gap-sm); align-items: center; margin: 6px 0; font-size: var(--cds-font-size-caption); }
+  .dx .bars .lab { color: var(--color-fg-muted); text-align: right; }
+  .dx .bars .n { color: var(--color-fg-muted); font-variant-numeric: tabular-nums; }
+  .dx .bar { display: flex; height: 16px; gap: 2px; }
+  .dx .bar span { display: block; border-radius: 3px; min-width: 0; }
+  .dx .hist .row { grid-template-columns: 5.5rem 1fr 2.2rem; }
+  .dx table { width: 100%; border-collapse: collapse; font-size: var(--cds-font-size-caption); font-variant-numeric: tabular-nums; }
+  .dx th, .dx td { text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--color-border-line); }
+  .dx th:first-child, .dx td:first-child { text-align: left; }
+  .dx th { color: var(--color-fg-muted); font-weight: var(--cds-font-weight-medium); }
+  .dx td.ev { text-align: left; color: var(--color-fg-muted); }
+  .dx #tb-lev th:nth-child(2), .dx #tb-lev td:nth-child(2) { text-align: left; }
+  .dx #tb-lev td:nth-child(3), .dx #tb-lev th:nth-child(3) { text-align: right; }
+  .dx .scroll { overflow-x: auto; }
+  .dx .foot { color: var(--color-fg-muted); font-size: var(--cds-font-size-caption); max-width: 90ch; }
+  .dx .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: var(--cds-font-size-caption); border: 1px solid var(--color-border-line); color: var(--color-fg-muted); }
+  .dx .pill.hot { color: var(--color-bad); border-color: var(--color-bad); }
+  .dx .mock { background: var(--color-panel); border: 1px solid var(--color-border-line); border-radius: var(--cds-radius); padding: var(--cds-pad-md) var(--cds-pad-lg); margin: 0 0 var(--cds-gap-md); max-width: 90ch; color: var(--color-fg-muted); }
+  .dx .mock b { color: var(--color-fg); }
+  .dx .runlen { display: inline-block; margin: 0 0 var(--cds-gap-sm); font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); }
+  .dx .runlen[hidden] { display: none; }
+  .dx .runlen select { margin-left: var(--cds-gap-sm); font: inherit; color: var(--color-fg); background: var(--color-panel); border: 1px solid var(--color-border-line); border-radius: var(--cds-radius); padding: 2px var(--cds-pad-sm); }
+  .dx .tabs { display: flex; flex-wrap: wrap; gap: var(--cds-gap-sm); margin: 0 0 var(--cds-gap-sm); }
+  .dx .tab { appearance: none; cursor: pointer; text-align: left; background: var(--color-panel); color: var(--color-fg); border: 1px solid var(--color-border-line); border-radius: var(--cds-radius); padding: var(--cds-pad-sm) var(--cds-pad-md); font: inherit; font-size: var(--cds-font-size-caption); }
+  .dx .tab[aria-pressed="true"] { border-color: var(--cds-chart-axis); box-shadow: inset 0 0 0 1px var(--cds-chart-axis); }
+  .dx .setup { font-weight: var(--cds-font-weight-medium); margin: 0 0 var(--cds-gap-sm); max-width: 80ch; }
+  .dx .blurb { color: var(--color-fg-muted); margin: 0 0 var(--cds-gap-sm); max-width: 80ch; }
+  .dx .newpill { display: inline-block; margin-left: 8px; padding: 0 7px; border-radius: 999px; background: var(--color-fg); color: var(--color-bg); font-size: 10px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; vertical-align: 1px; }
+  .dx .reftable td:first-child { font-family: ui-monospace, Menlo, monospace; font-size: 12px; white-space: nowrap; text-align: left; }
+  .dx .reftable td, .dx .reftable th { text-align: left; vertical-align: top; }
+  .dx .reftable td:nth-child(2) { color: var(--color-fg-muted); white-space: nowrap; }
+  .dx .src { display: inline-block; margin-left: 8px; padding: 0 7px; border-radius: 999px; font-size: 10.5px; font-weight: 500; letter-spacing: .02em; vertical-align: 1px; white-space: nowrap; }
+  .dx .src.metric { border: 1px solid var(--cds-chart-axis); color: var(--color-fg-muted); }
+  .dx .src.log { background: var(--color-fg); color: var(--color-bg); }
+    .dx .sub { margin: var(--cds-gap-lg) 0 var(--cds-gap-sm); font-weight: var(--cds-font-weight-medium); }
+</style>
+
+<div class="dx">
+  <h1>Customer performance diagnosis</h1>
+  <p class="mock"><b>A mock example.</b> This shows why you would use these metrics. AgentX coding-agent sessions and synthetic chat traffic are replayed through the real Dynamo router and session index. The workers are mock workers: DeepSeek V4 Flash on B200 timing comes from AISimulate's perf model, and the cache tiers are set small on purpose to create each situation.</p>
+  <label class="runlen" hidden>Run length <select id="runlen"></select></label>
+  <div class="tabs" id="tabs" role="tablist"></div>
+  <p class="setup" id="setup"></p>
+  <p class="blurb" id="blurb"></p>
+  <nav>
+    <a href="#s-workload">1 Workload and response</a>
+    <a href="#s-mix">2 Chat and agents</a>
+    <a href="#s-cache">3 Cache hit rate</a>
+    <a href="#s-fit">4 Does it fit</a>
+    <a href="#s-storage">5 How it is stored</a>
+    <a href="#s-returns">6 Returning sessions</a>
+    <a href="#s-sessions">7 The sessions</a>
+    <a href="#s-ref">8 Metrics used</a>
+  </nav>
+
+  <section id="s-workload">
+    <h2>1. What is running, and how is it responding?</h2>
+    <p class="ask">Throughput first, then the response time it gets. If time to first token and inter-token latency are low, there is little to fix.</p>
+    <div class="tiles" id="t-workload"></div>
+    <div class="grid">
+      <div class="card"><h3>Throughput<span class="src metric">metric: existing</span></h3><p class="note">Input tokens (left axis) and output tokens (right axis) per second the fleet served, over a trailing minute.</p><div class="legend" id="l-thru"></div><div class="chart" id="c-thru" data-source="timeline"></div></div>
+      <div class="card"><h3>Time to first token<span class="src metric">metric: existing</span></h3><p class="note">Median and 90th percentile over a trailing 30 seconds.</p><div class="legend" id="l-ttft"></div><div class="chart" id="c-ttft" data-source="timeline"></div></div>
+      <div class="card"><h3>Inter-token latency<span class="src metric">metric: existing</span></h3><p class="note">Median and 90th percentile over a trailing 30 seconds.</p><div class="legend" id="l-itl"></div><div class="chart" id="c-itl" data-source="timeline"></div></div>
+      <div class="card"><h3>Queues<span class="src metric">metric: existing</span></h3><p class="note">Requests booked on a worker and still prefilling, requests decoding, and requests held before dispatch.</p><div class="legend" id="l-queue"></div><div class="chart" id="c-queue" data-source="timeline"></div></div>
+    </div>
+  </section>
+
+  <section id="s-mix">
+    <h2>2. What is the workload made of?</h2>
+    <p class="ask">How much is ordinary chat and how much is agents. Agents are the requests that carry a session ID.</p>
+    <div class="tiles" id="t-mix"></div>
+    <div class="grid">
+      <div class="card"><h3>Input tokens per second<span class="src metric">metric: new</span></h3><p class="note">Agent traffic stacked on chat traffic.</p><div class="legend" id="l-mixin"></div><div class="chart" id="c-mixin" data-source="timeline"></div></div>
+      <div class="card"><h3>Output tokens per second<span class="src metric">metric: new</span></h3><p class="note">The same split for output.</p><div class="legend" id="l-mixout"></div><div class="chart" id="c-mixout" data-source="timeline"></div></div>
+    </div>
+  </section>
+
+  <section id="s-cache">
+    <h2>3. How much of the cache could we be hitting?</h2>
+    <p class="ask">The funnel branches in two places. The first gap is cache no worker holds, which points at capacity. The second is cache a worker holds that the request did not use, which points at routing.</p>
+    <div class="tiles" id="t-cache"></div>
+    <div class="card"><h3>Cache reuse funnel<span class="src metric">metric: existing</span></h3><p class="note">Share of input tokens at each step, per minute. The top line is the prefix a returning session could reuse if nothing had been evicted. Agent histories only grow, so it sits near 100% except on first turns. The highest-cache worker is the one holding the most of this request's prefix; it is not necessarily chosen, because the router also weighs load. The chosen worker is the one it picked. Worker-reported reuse is what the worker says it served from cache when it admitted the request; it falls below the chosen worker's line when cache the router counted was evicted while the request waited.</p><div class="legend" id="l-fun"></div><div class="chart" id="c-fun" data-source="timeline"></div></div>
+    <h3 class="sub">Why the router passed over the highest-cache worker</h3>
+    <p class="ask">From the router's per-request decision log (the router_selection trace), not from a metric. Each request records every candidate worker's cache and load. This explains the gap between the highest-cache worker and the chosen one.</p>
+    <div class="grid" id="g-route">
+      <div class="card"><h3>How decisions related to cache<span class="src log">log: router_selection trace</span></h3><p class="note">Among the decisions where the workers held different amounts of this request's prefix. Decisions where every candidate held the same amount are left out and counted in the note below. Smoothed over five points.</p><div class="legend" id="l-rsplit"></div><div class="chart" id="c-rsplit" data-source="routing"></div></div>
+      <div class="card"><h3>Why it left the highest-cache worker<span class="src log">log: router_selection trace</span></h3><p class="note">Of the decisions that left the highest-cache worker, the share where the chosen worker had less load. A decision can count in more than one line; when none does, the pick came from other cost terms. Smoothed over five points.</p><div class="legend" id="l-rtrade"></div><div class="chart" id="c-rtrade" data-source="routing"></div></div>
+    </div>
+    <p class="note" id="n-route"></p>
+  </section>
+
+  <section id="s-fit">
+    <h2>4. Does the working set fit the fleet?</h2>
+    <p class="ask">Demand is the distinct prefix the active sessions will present next, counting a shared block once. It is shown over several timescales against what the fleet can hold. A working set that fits on paper can still miss the cache, which is why the next section looks at how it is stored.</p>
+    <div class="tiles" id="t-fit"></div>
+    <div class="grid">
+      <div class="card"><h3>Demand over several timescales<span class="src metric">metric: new</span></h3><p class="note">Sessions active in the last few minutes, each block counted once, against GPU memory and GPU plus host memory. If workers hold copies of the same blocks the room needed is larger; the copies charts in section 5 show by how much. Only sessions inside the router's active window count (100 seconds in these replays, where think times are also shortened), so the 5 and 15 minute lines coincide here; with real think times and a 15 minute window they separate.</p><div class="legend" id="l-fit"></div><div class="chart" id="c-fit" data-source="timeline"></div></div>
+      <div class="card"><h3>What the fleet holds<span class="src metric">metric: new</span></h3><p class="note" id="n-held">What is resident in GPU memory and in host memory, stacked, counting every worker's copy because each takes room, against the distinct demand and the capacity of each tier. Host memory is mostly a copy of what is already on the GPU, so the stack shows the host as a second full layer, but only the sliver labelled "host only" adds room beyond the GPU. The mock workers write host memory through, which exaggerates this; a real offload tier may differ.</p><div class="legend" id="l-held"></div><div class="chart" id="c-held" data-source="timeline"></div></div>
+      <div class="card"><h3>Prefix rebuilt by returning sessions<span class="src metric">metric: new</span></h3><p class="note">Share of agent input tokens each minute that a returning session had to recompute or reload. That happens when its earlier prefix was evicted, and also when the session was sent to a different worker than the one holding it. An estimate from the session index, not a worker measurement. Smoothed over a few samples.</p><div class="legend" id="l-thr"></div><div class="chart" id="c-thr" data-source="timeline"></div></div>
+    </div>
+  </section>
+
+  <section id="s-storage">
+    <h2>5. How is the cache stored?</h2>
+    <p class="ask">Redundant copies, overlap between GPU and host memory, uneven workers, state kept for sessions that are finished, and prefixes shared between sessions.</p>
+    <div class="tiles" id="t-storage"></div>
+    <div class="grid">
+      <div class="card"><h3>Redundant copies<span class="src metric">metric: new</span></h3><p class="note">Copies of the cache across workers within one tier. 1x means each block is on one worker; it cannot go lower. A high value early in a run is sessions moving between workers while caches are cold, and it falls as the caches fill with different sessions.</p><div class="legend" id="l-dup"></div><div class="chart" id="c-dup" data-source="timeline"></div></div>
+      <div class="card"><h3>Is one worker holding more cache?<span class="src log">log: session_worker_load</span></h3><p class="note">Distinct session tokens in the GPU of the busiest, the average and the least busy worker, against what one worker can hold. A busiest worker at its limit while the others have room means the cache is uneven, not short. Per-worker figures come from the per-worker log.</p><div class="legend" id="l-wrk"></div><div class="chart" id="c-wrk" data-source="timeline"></div><p class="note" style="margin-top: var(--cds-gap-sm)"><span class="src metric">metric: new</span> The same thing as a ratio, from the router's imbalance metrics: the busiest worker over the average worker, so 1.0 is even and a sustained value above about 1.5 is worth an alert.</p><div class="legend" id="l-imb"></div><div class="chart" id="c-imb" data-source="timeline"></div></div>
+      <div class="card"><h3>What is in GPU memory<span class="src metric">metric: new</span></h3><p class="note">Tokens the active sessions need, tokens left behind on a worker by sessions whose last turn ran on another, and tokens held for finished sessions. The last two are capacity the active sessions cannot use.</p><div class="legend" id="l-left"></div><div class="chart" id="c-left" data-source="timeline"></div></div>
+      <div class="card"><h3>State kept for finished sessions<span class="src metric">metric: new</span></h3><p class="note">Distinct tokens held only for sessions that are no longer active. They are evictable, but they take room the active sessions may need.</p><div class="legend" id="l-str"></div><div class="chart" id="c-str" data-source="timeline"></div></div>
+      <div class="card"><h3>Prefix shared between sessions<span class="src metric">metric: new</span></h3><p class="note">Prompt tokens that more than one active session presents, against the distinct demand. A large share would be worth keeping on every worker.</p><div class="legend" id="l-shr"></div><div class="chart" id="c-shr" data-source="timeline"></div></div>
+    </div>
+  </section>
+
+  <section id="s-returns">
+    <h2>6. Where does a returning session find its prefix?</h2>
+    <p class="ask">By the time since the session's previous turn finished. Sessions that run over days will mostly return after a long gap.</p>
+    <div class="card"><h3>Returning turns by gap<span class="src metric">metric: new</span></h3><p class="note" id="n-ret"></p><div class="legend" id="l-ret"></div><div class="bars" id="b-ret" data-source="returns"></div></div>
+  </section>
+
+  <section id="s-sessions">
+    <h2>7. What do the sessions look like?<span class="src log">log: session_summary</span></h2>
+    <p class="ask">Turns, input and output tokens, duration and the time between turns, across every session including subagents.</p>
+    <div class="tiles" id="t-sess"></div>
+    <div class="grid">
+      <div class="card"><h3>Shape of the sessions<span class="src log">log: session_summary</span></h3><p class="note">Number of sessions in each range.</p><div id="h-sess" data-source="sessions"></div></div>
+      <div class="card"><h3>Per session<span class="src log">log: session_summary</span></h3><p class="note">Median, 90th percentile and largest across sessions.</p><div class="scroll" id="tb-sess" data-source="sessions"></div></div>
+    </div>
+  </section>
+
+  <section id="s-ref">
+    <h2>8. Metrics used</h2>
+    <p class="ask">Every metric behind this page. Ones marked new are added in this work; the rest already exist in Dynamo.</p>
+    <div class="card"><div class="scroll" id="ref"></div></div>
+    <p class="foot" id="foot"></p>
+  </section>
+</div>
+<script src="app.js"></script>

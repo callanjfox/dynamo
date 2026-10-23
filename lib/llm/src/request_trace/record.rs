@@ -149,10 +149,26 @@ pub(crate) fn emit_router_selection(
     let SelectionTrace {
         candidate_count,
         pinned,
+        prompt_tokens,
         mut rows,
     } = trace;
     // Sort on the routing task; the scheduler actor hands the rows over unordered.
     rows.sort_unstable_by(|a, b| a.cost.total_cmp(&b.cost));
+    let inputs = if rows.iter().all(|row| row.inputs.is_some()) {
+        rows.iter()
+            .filter_map(|row| row.inputs)
+            .map(|inputs| {
+                [
+                    inputs.cached_tokens as f64,
+                    inputs.active_prefill_tokens as f64,
+                    inputs.decode_blocks,
+                    inputs.active_requests as f64,
+                ]
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let candidates = rows
         .into_iter()
         .map(|row| (row.worker.worker_id, row.worker.dp_rank, row.cost))
@@ -172,6 +188,8 @@ pub(crate) fn emit_router_selection(
             pinned,
             candidate_count: candidate_count as u64,
             candidates,
+            prompt_tokens: Some(prompt_tokens),
+            inputs,
         }),
     });
 }

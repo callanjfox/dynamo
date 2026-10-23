@@ -123,8 +123,13 @@ cost. By default each row keeps the 16 lowest-cost candidates plus the dispatche
 `candidate_count` is the number of workers scored before truncation. The dispatched worker is always
 among the candidates; locate it by joining the `request_end` row's worker id on `request_id`. Costs
 are in the policy's units (scheduler-tracked KV blocks for the builtin policy) at full precision.
-The record does not include the cost formula's inputs; custom policies own their formula, so the
-host only knows the final cost. For ad-hoc inspection without tracing,
+The record also carries `prompt_tokens` and, for policies that score through the composed
+scorer path (the builtin policy does), an `inputs` array aligned with `candidates`. Each entry is
+`[cached_tokens, active_prefill_tokens, decode_blocks, active_requests]`: the cache the router
+expected the request to reuse on that worker and the load already booked there. Together with the
+cost they show why a worker with less cached prefix won. The arrays are absent when a policy does
+not expose them; custom policies own their formula, so the host only knows the final cost. For
+ad-hoc inspection without tracing,
 `DYN_LOG='info,dynamo_kv_router::scheduling::selector=trace'` logs the same per-candidate costs as
 `Scored worker candidate` lines, each stamped with `request_id`, `worker_type`, and `selected`.
 

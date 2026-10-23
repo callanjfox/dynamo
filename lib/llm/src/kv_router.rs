@@ -68,6 +68,7 @@ mod request_lease;
 mod routing_host;
 pub(crate) mod routing_load;
 pub mod sequence;
+pub(crate) mod session_stats;
 pub mod shared_cache;
 
 pub use dynamo_kv_router::scheduling::OverlapScoresResponse;
@@ -606,6 +607,8 @@ pub struct KvRouter {
     teardown_task_guard: Option<dynamo_runtime::engine::EngineContextGuard>,
     /// Optional session-aware logical prefix index.
     session_prefix_index: Option<Arc<SessionPrefixIndexer>>,
+    /// Per-session telemetry; present exactly when `session_prefix_index` is.
+    session_stats: Option<Arc<session_stats::SessionStatsRuntime>>,
 }
 
 fn resolve_tracking_model_name(
@@ -891,6 +894,16 @@ impl KvRouter {
         // release bookings.
         replica_ingress.start().await;
         tracing::info!("KV Routing initialized");
+        let session_stats = session_prefix_index.as_ref().map(|index| {
+            let runtime = session_stats::SessionStatsRuntime::new(
+                Arc::clone(index),
+                metrics::SessionMetrics::from_component(component),
+                block_size,
+                Some(workers_with_configs.clone()),
+            );
+            runtime.spawn_sweeper(cancellation_token.clone());
+            runtime
+        });
         let cancellation_token = cancellation_guard.disarm();
         Ok(Self {
             indexer,
@@ -911,6 +924,7 @@ impl KvRouter {
             shared_cache,
             teardown_task_guard: None,
             session_prefix_index,
+            session_stats,
         })
     }
 
@@ -979,6 +993,10 @@ impl KvRouter {
 
     pub fn indexer(&self) -> &Indexer {
         &self.indexer
+    }
+
+    pub(crate) fn session_stats(&self) -> Option<&Arc<session_stats::SessionStatsRuntime>> {
+        self.session_stats.as_ref()
     }
 
     pub fn kv_router_config(&self) -> &KvRouterConfig {
@@ -1331,6 +1349,17 @@ impl KvRouter {
         } else {
             None
         };
+        // Count only routed attempts that take a booking, not probes.
+        let session_arrival = (is_admitted_routing && update_states)
+            .then(|| {
+                session_context.as_ref().map(|session| {
+                    (
+                        session.session_id().to_owned(),
+                        session.parent_session_id().map(str::to_owned),
+                    )
+                })
+            })
+            .flatten();
         let core_admission = match admission {
             FindBestMatchAdmission::WithAdmission if update_states => SelectionAdmission::Lease {
                 request_id: context_id.expect("validated above").to_string(),
@@ -1411,6 +1440,26 @@ impl KvRouter {
         } = selected;
         if update_states && is_admitted_routing && booking.is_none() {
             anyhow::bail!("booked selection returned no booking handle");
+        }
+        if let Some(stats) = &self.session_stats
+            && is_admitted_routing
+            && update_states
+        {
+            match &session_arrival {
+                Some((session_id, parent)) => {
+                    stats.on_arrival_with(
+                        session_id,
+                        parent.as_deref(),
+                        isl_tokens as u64,
+                        response.best_worker,
+                        context_id,
+                    );
+                    if let Some(hashes) = routing_hashes.as_deref() {
+                        stats.on_routed(session_id, response.best_worker, hashes);
+                    }
+                }
+                None => stats.on_uncovered(isl_tokens as u64, context_id),
+            }
         }
         // Publish the selection trace here, on the routing task and before any
         // awaited bookkeeping (the session prefix refresh below can be cancelled),
@@ -2783,6 +2832,11 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(session_index.session_count(), 3);
+        // Only the booked attempt is a real arrival; advisory and query probes are not.
+        let stats = router
+            .session_stats()
+            .expect("session stats follow the session index");
+        assert_eq!(stats.tracked_sessions(), 1);
     }
 
     /// Advisory best-match query with default routing arguments.
