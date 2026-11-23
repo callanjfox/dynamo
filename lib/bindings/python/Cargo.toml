@@ -28,6 +28,8 @@ default = ["custom-policy"]
 # router-policy YAML without rebuilding. A private image replaces only the catalog dependency, so
 # its policies are added alongside the shipped ones rather than displacing them.
 custom-policy = ["dep:dynamo-worker-selection-policy-catalog"]
+# The session scheduler request classifier (router plugin), for the router and offline replay.
+session-scheduler = ["custom-policy", "dep:dynamo-session-scheduler"]
 media-ffmpeg = ["dynamo-llm/media-ffmpeg"]
 kv-indexer = ["dep:clap", "dep:tracing-subscriber", "dynamo-kv-router/http", "dynamo-kv-router/ingest-zmq", "dynamo-kv-router/peer-recovery"]
 kv-indexer-metrics = ["kv-indexer", "dynamo-kv-router/metrics"]
@@ -111,6 +113,7 @@ dynamo-scheduler = { path = "../../router/scheduler" }
 dynamo-worker-selection = { path = "../../router/worker-selection" }
 dynamo-router-policies = { path = "../../router-plugins/builtin" }
 dynamo-worker-selection-policy-catalog = { path = "../../router-plugins/catalog", optional = true }
+dynamo-session-scheduler = { path = "../../router-plugins/session-scheduler", optional = true }
 # The replaceable /generate format catalog; custom images point this name at their own.
 dynamo-generate-format-catalog = { path = "../../generate-format-catalog" }
 clap = { version = "4.5", features = ["derive"], optional = true }
@@ -152,3 +155,7 @@ tracing-subscriber = { version = "0.3", features = ["registry"] }
 inherits = "release"
 debug = true
 strip = false
+
+# Replay gate: AISimulate with PlacementPolicy::next_wakeup_ms (see the root Cargo.toml).
+[patch.crates-io]
+aisimulate-core = { path = "../../../../aisimulate/crates/core" }

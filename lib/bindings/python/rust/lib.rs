@@ -502,6 +502,9 @@ fn register_core_with_router_plugins(m: &Bound<'_, PyModule>) -> PyResult<()> {
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
     dynamo_worker_selection_policy_catalog::register(&mut registry)
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    #[cfg(feature = "session-scheduler")]
+    dynamo_session_scheduler::register(&mut registry)
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
 
     if !dynamo_llm::kv_router::plugins::install_router_plugin_registry(registry) {
         return Err(PyRuntimeError::new_err(

@@ -32,21 +32,61 @@ pub type WorkerSelectionPolicyProvider = Arc<
         + Sync,
 >;
 
-/// YAML parameters passed to a linked worker-selection policy provider.
-#[derive(Debug, Clone)]
-pub struct WorkerSelectionPolicyParameters(serde_yaml::Value);
+/// Builds the routing host's default worker-selection policy with extra scorers added to its cost,
+/// on an optional shared random stream for tie-breaks: how a plugin that only shifts the default's
+/// choice keeps the default's cache and load terms without depending on the crate that implements
+/// them. The host supplies it with its default factory ([`RouterPluginRegistry::with_default_policy_with_scorers`]);
+/// a provider reads it from its parameters.
+pub type DefaultPolicyWithScorers = Arc<
+    dyn Fn(
+            super::worker_selection::SelectionConfig,
+            &'static str,
+            Option<Arc<parking_lot::Mutex<fastrand::Rng>>>,
+            Vec<Box<dyn super::worker_selection::WorkerScorer>>,
+        ) -> super::worker_selection::WorkerSelectionPolicy
+        + Send
+        + Sync,
+>;
+
+/// YAML parameters passed to a linked worker-selection policy provider, and what the host offers
+/// policies to build on.
+#[derive(Clone)]
+pub struct WorkerSelectionPolicyParameters {
+    value: serde_yaml::Value,
+    default_with_scorers: Option<DefaultPolicyWithScorers>,
+}
+
+impl std::fmt::Debug for WorkerSelectionPolicyParameters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerSelectionPolicyParameters")
+            .field("value", &self.value)
+            .field("default_with_scorers", &self.default_with_scorers.is_some())
+            .finish()
+    }
+}
 
 impl WorkerSelectionPolicyParameters {
-    fn new(value: serde_yaml::Value) -> Self {
-        Self(value)
+    fn new(
+        value: serde_yaml::Value,
+        default_with_scorers: Option<DefaultPolicyWithScorers>,
+    ) -> Self {
+        Self {
+            value,
+            default_with_scorers,
+        }
     }
 
     /// Deserialize this policy instance's parameter mapping into a policy-owned type.
     pub fn deserialize<T: DeserializeOwned>(
         &self,
     ) -> Result<T, WorkerSelectionPolicyProviderError> {
-        serde_yaml::from_value(self.0.clone())
+        serde_yaml::from_value(self.value.clone())
             .map_err(|source| WorkerSelectionPolicyProviderError::new(source.to_string()))
+    }
+
+    /// The host's default policy with extra scorers, when the host supplied it.
+    pub fn default_with_scorers(&self) -> Option<&DefaultPolicyWithScorers> {
+        self.default_with_scorers.as_ref()
     }
 }
 
@@ -72,6 +112,7 @@ pub struct RouterPluginRegistry {
     providers: HashMap<String, WorkerSelectionPolicyProvider>,
     request_classifiers: RequestClassifierRegistry,
     default_factory: Option<WorkerSelectionPolicyFactory>,
+    default_with_scorers: Option<DefaultPolicyWithScorers>,
 }
 
 /// An error from policy registration or startup resolution.
@@ -101,6 +142,12 @@ impl RouterPluginRegistry {
     /// Supply the host default while preserving registered custom plugin types.
     pub fn with_default_factory(mut self, factory: WorkerSelectionPolicyFactory) -> Self {
         self.default_factory = Some(factory);
+        self
+    }
+
+    /// Supply the host default with extra scorers, which providers receive in their parameters.
+    pub fn with_default_policy_with_scorers(mut self, builder: DefaultPolicyWithScorers) -> Self {
+        self.default_with_scorers = Some(builder);
         self
     }
 
@@ -305,12 +352,15 @@ impl RouterPluginRegistry {
                 available: self.available_policy_types(),
             }
         })?;
-        provider(&WorkerSelectionPolicyParameters::new(parameters))
-            .map(Some)
-            .map_err(|source| WorkerSelectionPolicyRegistryError::Provider {
-                policy_type: policy_type.to_owned(),
-                source,
-            })
+        provider(&WorkerSelectionPolicyParameters::new(
+            parameters,
+            self.default_with_scorers.clone(),
+        ))
+        .map(Some)
+        .map_err(|source| WorkerSelectionPolicyRegistryError::Provider {
+            policy_type: policy_type.to_owned(),
+            source,
+        })
     }
 
     /// Everything a bare selection string may name: registered types, then deprecated instances.
@@ -343,6 +393,7 @@ impl RouterPluginRegistry {
         })?;
         provider(&WorkerSelectionPolicyParameters::new(
             serde_yaml::Value::Mapping(Default::default()),
+            self.default_with_scorers.clone(),
         ))
         .map_err(|source| WorkerSelectionPolicyRegistryError::Provider {
             policy_type: policy_type.to_owned(),

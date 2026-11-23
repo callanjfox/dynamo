@@ -531,9 +531,14 @@ impl RoutingHost {
         }
         self.warn_if_output_replay_annotation_ignored(&request, &selection);
 
+        let engine_priority = request
+            .metadata()
+            .get("policy-class")
+            .and_then(|class| self.kv_router().engine_priority_for(class));
         let (mut backend_input, context) = request.into_parts();
         backend_input.routing_mut().dp_rank = Some(selection.worker.dp_rank);
         backend_input.kv_hint = selection.kv_hint;
+        apply_engine_priority(&mut backend_input, engine_priority);
         let updated_request = context.map(|_| backend_input);
         guard.begin_dispatch(&phase_label, updated_request.content());
 
@@ -680,5 +685,50 @@ impl RoutingHost {
             stream,
             booking,
         })
+    }
+}
+
+/// Write the policy class's engine priority (`engine_priority` in the router policy file, ledger
+/// L53) into the request's `routing.priority`, which the backend forwards to the engine's
+/// generate call, unless the client set one.
+fn apply_engine_priority(backend_input: &mut PreprocessedRequest, engine_priority: Option<i32>) {
+    let Some(priority) = engine_priority else {
+        return;
+    };
+    let routing = backend_input.routing_mut();
+    if routing.priority.is_none() {
+        routing.priority = Some(priority);
+    }
+}
+
+#[cfg(test)]
+mod engine_priority_tests {
+    use super::*;
+
+    fn request() -> PreprocessedRequest {
+        PreprocessedRequest::builder()
+            .model("test".to_string())
+            .token_ids(vec![1])
+            .stop_conditions(Default::default())
+            .sampling_options(Default::default())
+            .output_options(Default::default())
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn the_class_priority_fills_routing_priority_unless_the_client_set_one() {
+        let mut plain = request();
+        apply_engine_priority(&mut plain, None);
+        assert_eq!(plain.routing.as_ref().and_then(|r| r.priority), None);
+
+        let mut mapped = request();
+        apply_engine_priority(&mut mapped, Some(2));
+        assert_eq!(mapped.routing.as_ref().and_then(|r| r.priority), Some(2));
+
+        let mut client = request();
+        client.routing_mut().priority = Some(-1);
+        apply_engine_priority(&mut client, Some(2));
+        assert_eq!(client.routing.as_ref().and_then(|r| r.priority), Some(-1));
     }
 }

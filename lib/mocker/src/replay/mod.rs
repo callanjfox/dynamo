@@ -155,6 +155,10 @@ pub use entrypoints::{
     simulate_trace_workload_with_router_mode,
     simulate_trace_workload_with_router_mode_and_options_and_runtime_observers,
 };
+pub use offline::extensions::kv_router::{
+    ReplayGateRecheck, ReplayGateStats, ReplayRequestAnnotations, ReplayRequestFields,
+    load_request_annotations,
+};
 #[doc(hidden)]
 pub use offline::run_offline_handoff_conformance;
 pub use router_controls::{
@@ -221,6 +225,47 @@ pub struct ReplayScope {
     /// request IDs and seeds every KV-router selector, so two replays of the same input and
     /// configuration produce the same report.
     pub determinism: ReplayDeterminism,
+    /// The request classifier (and its dispatch gate) offline KV-router replay runs, as the live
+    /// router runs the one its `request_classifier` config resolves to. Replay cannot link router
+    /// plugins itself, so the host resolves the factory and passes it here (see
+    /// `lib/router-plugins/session-scheduler/REPLAY-GATE.md`). `None` with a classifier
+    /// configured is an error, as before.
+    pub request_classifier: Option<ReplayClassifierPlugin>,
+    /// Per-request fields a production frontend would attach (session end, parent session,
+    /// policy class, agent headers), by authored request id. Offline KV-router replay only.
+    pub request_fields: Option<std::sync::Arc<ReplayRequestAnnotations>>,
+    /// The worker-selection policy offline KV-router replay runs in place of the default, as the
+    /// live router runs the one its `worker_selection` config resolves to. As with the
+    /// classifier, the host resolves the factory and passes it here. `None` with a custom
+    /// worker-selection instance configured is an error, as before.
+    pub worker_selection: Option<ReplayWorkerSelectionPlugin>,
+    /// How offline KV-router replay asks the dispatch gate about held heads again. `None` reads
+    /// `DYNAMO_REPLAY_GATE_RECHECK` (`notify`, `keyed`; unset: every held head at every drain).
+    pub gate_recheck: Option<ReplayGateRecheck>,
+}
+
+/// A worker-selection policy factory for offline replay.
+#[derive(Clone)]
+pub struct ReplayWorkerSelectionPlugin(
+    pub dynamo_kv_router::plugins::worker_selection::WorkerSelectionPolicyFactory,
+);
+
+impl std::fmt::Debug for ReplayWorkerSelectionPlugin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ReplayWorkerSelectionPlugin")
+    }
+}
+
+/// A request classifier factory for offline replay.
+#[derive(Clone)]
+pub struct ReplayClassifierPlugin(
+    pub dynamo_kv_router::plugins::request_classifier::RequestClassifierFactory,
+);
+
+impl std::fmt::Debug for ReplayClassifierPlugin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ReplayClassifierPlugin")
+    }
 }
 
 thread_local! {
@@ -230,6 +275,10 @@ thread_local! {
             kv_event_lag_ms: 0.0,
             router_controls: None,
             determinism: ReplayDeterminism::Random,
+            request_classifier: None,
+            request_fields: None,
+            worker_selection: None,
+            gate_recheck: None,
         })
     };
 }

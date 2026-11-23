@@ -40,6 +40,8 @@ dynamo-worker-selection = { workspace = true }
 dynamo-router-protocol = { workspace = true }
 dynamo-tokens = { workspace = true }
 dynamo-truthy = { workspace = true }
+# Typed errors a request classifier returns to the client (re-exported in plugins::prelude).
+dynamo-error = { workspace = true }
 
 # workspace
 anyhow = { workspace = true }

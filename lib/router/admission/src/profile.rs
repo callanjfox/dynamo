@@ -81,11 +81,16 @@ pub struct PolicyClassConfig {
     pub request_queue_limit_per_worker: Option<usize>,
     pub raw_isl_token_queue_limit_per_worker: Option<usize>,
     pub cached_token_queue_limit_per_worker: Option<usize>,
+    /// f49h: the most active requests of this class a worker rank holds (admitted to it and not
+    /// finished); a rank at it is busy for this class. `None` (default): no cap. Offline replay
+    /// (the mocker's kv_router extension) honours it; the live router's queue does not count
+    /// requests per class and ignores it.
+    pub active_requests_per_worker: Option<usize>,
 }
 
 impl PolicyClassConfig {
     pub fn queueing_enabled(&self) -> bool {
-        self.busy_thresholds.is_configured()
+        self.busy_thresholds.is_configured() || self.active_requests_per_worker.is_some()
     }
 
     /// Whether an online queue expires this class's budget: controlled delay in an EDF class,
@@ -192,6 +197,7 @@ impl PolicyProfile {
             request_queue_limit_per_worker: None,
             raw_isl_token_queue_limit_per_worker: None,
             cached_token_queue_limit_per_worker: None,
+            active_requests_per_worker: None,
         };
         Self {
             class_indices: HashMap::from([(class.name.clone(), 0)]),
@@ -247,6 +253,7 @@ mod tests {
             request_queue_limit_per_worker: None,
             raw_isl_token_queue_limit_per_worker: None,
             cached_token_queue_limit_per_worker: None,
+            active_requests_per_worker: None,
         }
     }
 

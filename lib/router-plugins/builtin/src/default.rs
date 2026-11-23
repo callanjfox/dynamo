@@ -35,6 +35,26 @@ pub fn default_policy_with_rng(
     runtime_policy(config, parameters, worker_label, rng)
 }
 
+/// The default policy with `extra` scorers added after the default cost: each extra scorer's
+/// contribution adds to the default's per-worker cost before the default picker chooses. A plugin
+/// that only shifts the default's choice (for example toward a worker set) composes this way and
+/// keeps the default's cache and load terms. `rng` is as in [`default_policy_with_rng`]. The
+/// result has no runtime-configurable parameters: a runtime patch would rebuild the default
+/// alone and drop the extra scorers.
+pub fn default_policy_with_scorers(
+    config: SelectionConfig,
+    worker_label: &'static str,
+    rng: Option<Arc<Mutex<fastrand::Rng>>>,
+    extra: Vec<Box<dyn WorkerScorer>>,
+) -> WorkerSelectionPolicy {
+    let parameters = PolicyParameters::from(&config);
+    let picker = picker::DefaultPicker::new(parameters.router_temperature, rng);
+    let mut scorers = vec![scorer::build(&parameters, worker_label)];
+    scorers.extend(extra);
+    WorkerSelectionPolicy::new(config, worker_label, scorers, Box::new(picker))
+        .with_exclusive_affinity(true)
+}
+
 /// Resolved runtime parameters a default policy starts with for `role`.
 ///
 /// This is the map that `default_factory` exposes through `runtime_config()` at revision 0 and

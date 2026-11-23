@@ -51,6 +51,9 @@ pub struct QueueMetadata {
     pub class_due_at: Option<Instant>,
     /// Seconds from the queue's arrival origin to router ingress. FCFS and LCFS order by it.
     pub arrival_offset_secs: f64,
+    /// The classifier's ordering key ([`crate::ClassificationOverrides::order_key`]), lower
+    /// first: replaces the queue policy's score and never expires.
+    pub order_key: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -284,6 +287,10 @@ pub enum BlockReason {
     Capacity,
     /// The dispatch gate holds the head.
     Gate,
+    /// The dispatch gate holds the head until something the host tracks wakes it (a keyed hold,
+    /// `HoldWake::Keys`): the lane is parked, and no recheck asks it again until the host
+    /// unparks it ([`PolicyQueue::unpark_lane`]). A host that never answers this never parks.
+    GateParked,
 }
 
 /// A dispatch predicate's answer for one head.
@@ -371,6 +378,9 @@ struct PolicyClassQueue<T> {
     ready_by_lane: FxHashMap<SessionLane, BinaryHeap<PolicyQueueEntry<T>>>,
     /// Lanes whose head could not dispatch, with the reason the last check gave.
     blocked_lanes: FxHashMap<SessionLane, BlockReason>,
+    /// Lanes whose head the gate parked ([`BlockReason::GateParked`]): blocked, but outside every
+    /// recheck until the host unparks them. Disjoint from `blocked_lanes`.
+    parked_lanes: FxHashSet<SessionLane>,
     candidate_lane_heads: BTreeSet<LaneHead>,
     needs_blocked_lane_recheck: Option<RecheckScope>,
     /// Every finite due time expires, found at the lane roots: an EDF class that enables
@@ -388,6 +398,30 @@ struct PolicyClassQueue<T> {
 }
 
 impl<T> PolicyClassQueue<T> {
+    /// Whether the lane's head is out of the candidates: blocked or parked.
+    fn is_blocked(&self, lane: &SessionLane) -> bool {
+        self.blocked_lanes.contains_key(lane) || self.parked_lanes.contains(lane)
+    }
+
+    /// Record why `lane`'s head could not dispatch.
+    fn block(&mut self, lane: SessionLane, reason: BlockReason) {
+        if reason == BlockReason::GateParked {
+            self.parked_lanes.insert(lane);
+        } else {
+            self.blocked_lanes.insert(lane, reason);
+        }
+    }
+
+    /// A parked lane is asked again at the next recheck of its gate holds.
+    fn unpark(&mut self, lane: SessionLane) -> bool {
+        if self.parked_lanes.remove(&lane) {
+            self.blocked_lanes.insert(lane, BlockReason::Gate);
+            true
+        } else {
+            false
+        }
+    }
+
     fn ready_is_empty(&self) -> bool {
         self.pending.is_empty() && self.ready_by_lane.is_empty()
     }
@@ -458,12 +492,21 @@ impl<T> PolicyClassQueue<T> {
         match lane {
             None => self.pending.push(entry),
             Some(key) => {
+                let blocked = self.blocked_lanes.contains_key(&key);
+                let parked = self.parked_lanes.contains(&key);
                 let ready = self.ready_by_lane.entry(key).or_default();
-                let old_head = (!self.blocked_lanes.contains_key(&key))
+                let old_head = (!blocked && !parked)
                     .then(|| ready.peek().map(|entry| LaneHead::new(key, entry)))
                     .flatten();
+                let parked_head = parked
+                    .then(|| ready.peek().map(|e| e.enqueue_seq))
+                    .flatten();
                 ready.push(entry);
-                if !self.blocked_lanes.contains_key(&key) {
+                if parked && ready.peek().map(|e| e.enqueue_seq) != parked_head {
+                    // A new head nobody asked: the next recheck asks it.
+                    self.parked_lanes.remove(&key);
+                    self.blocked_lanes.insert(key, BlockReason::Gate);
+                } else if !blocked && !parked {
                     let new_head =
                         LaneHead::new(key, ready.peek().expect("lane was just populated"));
                     if old_head != Some(new_head) {
@@ -486,7 +529,7 @@ impl<T> PolicyClassQueue<T> {
     ) -> Option<DispatchCandidate> {
         if self.ready_by_lane.is_empty() {
             debug_assert!(
-                self.blocked_lanes.is_empty(),
+                self.blocked_lanes.is_empty() && self.parked_lanes.is_empty(),
                 "blocked lanes must have a ready lane"
             );
             return self
@@ -518,6 +561,7 @@ impl<T> PolicyClassQueue<T> {
                 config,
                 ready_by_lane,
                 blocked_lanes,
+                parked_lanes,
                 candidate_lane_heads,
                 ..
             } = self;
@@ -530,6 +574,10 @@ impl<T> PolicyClassQueue<T> {
                 match is_dispatchable(class_index, config, head.payload()).into() {
                     LaneCheck::Dispatch => {
                         candidate_lane_heads.insert(LaneHead::new(*lane, head));
+                        false
+                    }
+                    LaneCheck::Blocked(BlockReason::GateParked) => {
+                        parked_lanes.insert(*lane);
                         false
                     }
                     LaneCheck::Blocked(now) => {
@@ -574,7 +622,7 @@ impl<T> PolicyClassQueue<T> {
             if let LaneCheck::Blocked(reason) = check {
                 let removed = self.candidate_lane_heads.pop_last();
                 debug_assert_eq!(removed, Some(head));
-                self.blocked_lanes.insert(head.lane, reason);
+                self.block(head.lane, reason);
                 continue;
             }
 
@@ -615,7 +663,8 @@ impl<T> PolicyClassQueue<T> {
         let entry = match lane {
             None => self.pending.pop().expect("expiring shared root vanished"),
             Some(key) => {
-                let blocked = self.blocked_lanes.remove(&key).is_some();
+                let blocked =
+                    self.blocked_lanes.remove(&key).is_some() | self.parked_lanes.remove(&key);
                 let ready = self
                     .ready_by_lane
                     .get_mut(&key)
@@ -647,7 +696,9 @@ impl<T> PolicyClassQueue<T> {
                     .ready_by_lane
                     .get_mut(&key)
                     .expect("queue admission lane vanished");
-                debug_assert!(!self.blocked_lanes.contains_key(&key));
+                debug_assert!(
+                    !self.blocked_lanes.contains_key(&key) && !self.parked_lanes.contains(&key)
+                );
                 let head = LaneHead::new(key, ready.peek().expect("queue admission head vanished"));
                 let removed = self.candidate_lane_heads.remove(&head);
                 debug_assert!(removed);
@@ -676,8 +727,10 @@ impl<T> PolicyClassQueue<T> {
         self.candidate_lane_heads.clear();
         self.blocked_lanes
             .retain(|lane, _| self.ready_by_lane.contains_key(lane));
+        self.parked_lanes
+            .retain(|lane| self.ready_by_lane.contains_key(lane));
         for (&lane, ready) in &self.ready_by_lane {
-            if !self.blocked_lanes.contains_key(&lane) {
+            if !self.is_blocked(&lane) {
                 self.candidate_lane_heads
                     .insert(LaneHead::new(lane, ready.peek().expect("lane is empty")));
             }
@@ -735,6 +788,7 @@ impl<T> PolicyQueue<T> {
                     pending: BinaryHeap::new(),
                     ready_by_lane: FxHashMap::default(),
                     blocked_lanes: FxHashMap::default(),
+                    parked_lanes: FxHashSet::default(),
                     candidate_lane_heads: BTreeSet::new(),
                     needs_blocked_lane_recheck: None,
                     stats: PolicyQueueStats::default(),
@@ -823,6 +877,36 @@ impl<T> PolicyQueue<T> {
         }
     }
 
+    /// Ask a parked lane's head again at the next recheck of gate holds. Returns whether the lane
+    /// was parked.
+    pub fn unpark_lane(&mut self, class_index: usize, lane: SessionLane) -> bool {
+        self.classes[class_index].unpark(lane)
+    }
+
+    /// Ask every parked lane again at the next recheck of gate holds.
+    pub fn unpark_all(&mut self) {
+        for class in &mut self.classes {
+            let parked: Vec<SessionLane> = class.parked_lanes.drain().collect();
+            for lane in parked {
+                class.blocked_lanes.insert(lane, BlockReason::Gate);
+            }
+        }
+    }
+
+    /// The head of one session lane of a class, if the lane holds any entry.
+    pub fn lane_head(&self, class_index: usize, lane: SessionLane) -> Option<&T> {
+        self.classes[class_index]
+            .ready_by_lane
+            .get(&lane)
+            .and_then(BinaryHeap::peek)
+            .map(PolicyQueueEntry::payload)
+    }
+
+    /// Parked lanes over every class.
+    pub fn parked_lane_count(&self) -> usize {
+        self.classes.iter().map(|c| c.parked_lanes.len()).sum()
+    }
+
     pub fn has_backlog(&self, class_index: usize) -> bool {
         !self.classes[class_index].ready_is_empty()
     }
@@ -860,6 +944,7 @@ impl<T> PolicyQueue<T> {
                 due_at: None,
                 class_due_at: None,
                 arrival_offset_secs,
+                order_key: None,
             },
             worker_count,
             priority_jump,
@@ -886,6 +971,7 @@ impl<T> PolicyQueue<T> {
             due_at,
             class_due_at,
             arrival_offset_secs,
+            order_key,
         } = metadata;
         let deadline_origin = self.deadline_origin;
         let class = &mut self.classes[class_index];
@@ -912,6 +998,7 @@ impl<T> PolicyQueue<T> {
             due,
             expires,
             queue_policy,
+            order_key,
             self.next_enqueue_seq,
             payload,
         );
@@ -1000,12 +1087,14 @@ impl<T> PolicyQueue<T> {
         // checked the lane's next head: unblock the lane, as head expiry does, so the next
         // dispatch checks it.
         let ready_by_lane = &class.ready_by_lane;
-        class.blocked_lanes.retain(|lane, _| {
-            !ready_by_lane
+        let root_removed = |lane: &SessionLane| {
+            ready_by_lane
                 .get(lane)
                 .and_then(BinaryHeap::peek)
                 .is_some_and(|root| remove_sequences.contains(&root.enqueue_seq))
-        });
+        };
+        class.blocked_lanes.retain(|lane, _| !root_removed(lane));
+        class.parked_lanes.retain(|lane| !root_removed(lane));
 
         let mut removed = Vec::new();
         let mut retained = Vec::with_capacity(class.pending.len());
@@ -1222,11 +1311,15 @@ fn make_entry<T>(
     due: DueKey,
     expires: bool,
     queue_policy: RouterQueuePolicy,
+    order_key: Option<f64>,
     enqueue_seq: u64,
     payload: T,
 ) -> PolicyQueueEntry<T> {
-    let policy_score =
-        queue_policy_score(queue_policy, snapshot, arrival_offset_secs, priority_jump);
+    // A classifier's ordering key replaces the score: higher scores go first, lower keys do.
+    let policy_score = match order_key.filter(|k| k.is_finite()) {
+        Some(key) => -key,
+        None => queue_policy_score(queue_policy, snapshot, arrival_offset_secs, priority_jump),
+    };
     let strict_priority = match queue_policy {
         RouterQueuePolicy::Edf => 0,
         RouterQueuePolicy::Fcfs | RouterQueuePolicy::Lcfs | RouterQueuePolicy::Wspt => {
@@ -1335,12 +1428,16 @@ impl<T> PolicyQueue<T> {
         class_index: usize,
         lane: SessionLane,
     ) -> Option<BlockReason> {
-        self.classes[class_index].blocked_lanes.get(&lane).copied()
+        let class = &self.classes[class_index];
+        if class.parked_lanes.contains(&lane) {
+            return Some(BlockReason::GateParked);
+        }
+        class.blocked_lanes.get(&lane).copied()
     }
 
-    /// How many of the class's lanes are blocked.
+    /// How many of the class's lanes are blocked (parked ones included).
     pub fn class_blocked_lane_count(&self, class_index: usize) -> usize {
-        self.classes[class_index].blocked_lanes.len()
+        self.classes[class_index].blocked_lanes.len() + self.classes[class_index].parked_lanes.len()
     }
 
     /// The recheck the class's next dispatch will run over its blocked lanes, if one is pending.

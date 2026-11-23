@@ -130,6 +130,404 @@ impl RouterSettings {
     }
 }
 
+/// Per-request KV actions the router attaches to a booking (`kv_actions` in the policy file):
+/// `kv.release_source` on every `kv.fetch` (a move), and `kv.retain` with a TTL per policy
+/// class. The offline replay router reads it; the live router carries the same actions as a
+/// hint policy once the hint-policy stack lands (docs/kv-action-channel.md in the simulator).
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KvActionsConfig {
+    /// Every KV fetch also releases its source's copy once the pull lands.
+    #[serde(default)]
+    pub release_source: bool,
+    /// With `release_source`, a move releases only the blocks no other stream's latest request
+    /// holds: a prefix the stream shares (a parent's context a subagent read, a common system
+    /// prompt) stays on the source for the streams that still read it, as the simulator's
+    /// per-session copies do. Off by default: the whole fetched prefix is released.
+    #[serde(default)]
+    pub release_unshared: bool,
+    /// With `release_source`, a fetch moves only while its source is under host-tier (G2)
+    /// pressure: the source evicted a G2 block (a removal this router did not ask for) within
+    /// this many seconds. Otherwise the fetch copies and the source keeps its blocks, so moves
+    /// stop when G2 holds everything and their pulls would only cost replicas (as the
+    /// simulator's `kvTransfer: 'pressure'`). Off (absent) by default: every own-stream fetch moves.
+    #[serde(default)]
+    pub move_under_pressure_s: Option<f64>,
+    /// Keep a finished request's KV for a TTL, per policy class.
+    #[serde(default)]
+    pub retain: Option<KvRetainConfig>,
+    /// Retention by value in the workers' host tier (G2): send each request's session value.
+    #[serde(default)]
+    pub retain_value: Option<KvRetainValueConfig>,
+    /// Drop dead KV on every worker: the blocks a stream's previous request held and this
+    /// one does not. `marker` only at requests the harness marks as a compaction; `oracle`
+    /// at every request.
+    #[serde(default)]
+    pub invalidate: Option<KvInvalidateMode>,
+    /// Demote a finished request's KV from G1 to G2 for a long think time, and optionally
+    /// prefetch it back before the predicted return.
+    #[serde(default)]
+    pub demote: Option<KvDemoteConfig>,
+    /// A KV fetch keeps no copy in the target's host tier (G2): only its G1 holds the
+    /// fetched prefix once the request finishes.
+    #[serde(default)]
+    pub fetch_no_retain: bool,
+    /// `engine.dequeue`: hand a request still waiting in its worker's queue after `after_s`
+    /// back to the router, which places it on an idle worker (web/sim.js `dequeue`).
+    #[serde(default)]
+    pub dequeue: Option<KvDequeueConfig>,
+    /// KVCR may also read a peer's device KV (G1), not only its host tier (web/sim.js
+    /// `kvcrPeerHbm`): a fetch hint may name a worker that holds the prefix only in HBM.
+    /// Needs the AISimulate KVCR `peer_hbm` engine switch.
+    #[serde(default)]
+    pub peer_hbm: bool,
+    /// Fan-out replicas (web/sim.js `fanout: 'replicate'`): when a subagent of a fan-out of at
+    /// least `fanout` arrives (client hint `x-dynamo-hint-fanout`), copy the prefix it reads into
+    /// the host tier (G2) of up to `replicas` workers over KVCR, ahead of its siblings.
+    #[serde(default)]
+    pub replicate: Option<KvReplicateConfig>,
+    /// Free a session's KV when it ends (web/sim.js `freeKV: 'session'`): when a stream's request
+    /// marked `session_final` (`nvext.agent_context.session_final`, header
+    /// `x-dynamo-session-final`) finishes, drop on every worker the blocks of its last request
+    /// that no other live stream's last request holds (a parent's context its subagents still
+    /// read, a prompt another session shares), with `kv.invalidate`. Off by default.
+    #[serde(default)]
+    pub free_at_session_end: bool,
+    /// f48h: an HBM ledger per worker from the engines' own block counts (active blocks, what
+    /// the waiting queue must reserve) plus the hinted output of in-flight requests; see
+    /// [`KvEngineFitConfig`]. Off (absent) by default. The offline replay reads it.
+    #[serde(default)]
+    pub engine_fit: Option<KvEngineFitConfig>,
+    /// f62: keep big standard/batch prefills off priority's workers; see
+    /// [`KvPrefillIsolationConfig`]. Off (absent) by default. The offline replay reads it.
+    #[serde(default)]
+    pub prefill_isolation: Option<KvPrefillIsolationConfig>,
+}
+
+/// `kv_actions.engine_fit`: a turn fits on a worker when the worker's engine-reported active
+/// blocks, plus its waiting queue's tokens, plus its in-flight requests' hinted output, plus the
+/// turn's whole prefix, stay within `margin` of its G1 blocks (vLLM reserves the whole prefix
+/// before it admits a request, and its queue stops behind one that cannot).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KvEngineFitConfig {
+    /// Share of the worker's G1 blocks the ledger may fill.
+    #[serde(default = "default_engine_fit_margin")]
+    pub margin: f64,
+    /// Exclude the workers a turn does not fit on from its selection, while one fits.
+    #[serde(default = "default_engine_fit_place")]
+    pub place: bool,
+    /// Keep a queued turn at the router while it fits on no worker (classes with queueing).
+    #[serde(default)]
+    pub hold: bool,
+    /// With `hold`, TTFT slack: hold a turn only while it has waited at the router less than
+    /// this many seconds (its TTFT target less its expected prefill), then place it as without
+    /// the hold, so the hold never costs a turn its target on its own. Absent: no limit.
+    #[serde(default)]
+    pub hold_max_s: Option<f64>,
+    /// `kv_actions.dequeue` hands a stuck turn to a worker it fits on by this ledger, instead
+    /// of by the router's bookings.
+    #[serde(default)]
+    pub dequeue: bool,
+    /// Step-time budget as a concurrency limit: a turn also fits on a worker only while the
+    /// engine's running plus waiting requests, with this turn, stay within it, so decode batches
+    /// and co-scheduled prefill keep ITL under the class limit (a pro-tp4 worker sustains about
+    /// 11k prefill tok/s at batch 48 under 50 ms ITL, 5-6k at 128). Absent: HBM only.
+    #[serde(default)]
+    pub max_requests: Option<u64>,
+    /// Spread by least committed KV: of the workers the turn may go to, only those whose
+    /// committed blocks (engine active blocks, plus the waiting queue's tokens, plus in-flight
+    /// hinted output) are within this share of a worker's G1 blocks of the least committed one
+    /// stay eligible; the router's costs pick among them. 0 is the least committed worker only.
+    /// Absent: no spread (the fit check alone, if `place`).
+    #[serde(default)]
+    pub spread: Option<f64>,
+}
+
+/// f62 `kv_actions.prefill_isolation`: turns of `classes` leave the selection of a protected
+/// worker on which they would compute more than `max_prefill_tokens`, so their big chunked
+/// prefills do not share a step with priority decodes. Protected: the priority pool
+/// (`workers: pool`) or the workers running at least `min_priority` priority requests
+/// (`workers: priority_active`). Never holds, never empties a selection. The offline replay
+/// reads it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct KvPrefillIsolationConfig {
+    /// Classes kept off protected workers for big prefills.
+    pub classes: Vec<String>,
+    /// The class whose workers are protected.
+    pub priority_class: String,
+    /// Which workers are protected.
+    pub workers: PrefillIsolationWorkers,
+    /// With `priority_active`, the priority requests that make a worker protected.
+    pub min_priority: usize,
+    /// Tokens a turn may compute on a protected worker.
+    pub max_prefill_tokens: usize,
+}
+
+impl Default for KvPrefillIsolationConfig {
+    fn default() -> Self {
+        Self {
+            classes: vec!["standard".into(), "batch".into()],
+            priority_class: "priority".into(),
+            workers: PrefillIsolationWorkers::Pool,
+            min_priority: 1,
+            max_prefill_tokens: 8192,
+        }
+    }
+}
+
+/// `kv_actions.prefill_isolation.workers`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrefillIsolationWorkers {
+    /// The priority pool's workers (the pool scorer publishes its size).
+    Pool,
+    /// The workers running priority requests.
+    PriorityActive,
+    /// f68pool: the pool's workers while the pool acts (it publishes a size), else the workers
+    /// running priority requests (a mix selector mode without the pool, such as g120's b0).
+    PoolElseActive,
+}
+
+fn default_engine_fit_margin() -> f64 {
+    0.95
+}
+
+fn default_engine_fit_place() -> bool {
+    true
+}
+
+/// `kv_actions.replicate`: at most once per parent session within `window_s`, the deepest holder
+/// of the subagent's prefix is the source and the least-loaded workers that do not hold it, up
+/// to `replicas` holders in all, receive a G2 copy (path B `kv.replicate`).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KvReplicateConfig {
+    #[serde(default = "default_replicate_fanout")]
+    pub fanout: u32,
+    #[serde(default = "default_replicate_replicas")]
+    pub replicas: usize,
+    #[serde(default = "default_replicate_window_s")]
+    pub window_s: f64,
+}
+
+fn default_replicate_fanout() -> u32 {
+    3
+}
+
+fn default_replicate_replicas() -> usize {
+    2
+}
+
+fn default_replicate_window_s() -> f64 {
+    60.0
+}
+
+/// `kv_actions.dequeue`: every `check_s`, a request of a class other than `batch` dispatched at
+/// least `after_s` ago whose prefill has not completed is asked back from its worker when another
+/// worker has no prefill booked, KV room for it and a free running slot; the one holding most of
+/// its prefix takes it. Each request is asked at most once.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KvDequeueConfig {
+    #[serde(default = "default_dequeue_after_s")]
+    pub after_s: f64,
+    #[serde(default = "default_dequeue_check_s")]
+    pub check_s: f64,
+}
+
+fn default_dequeue_after_s() -> f64 {
+    2.0
+}
+
+fn default_dequeue_check_s() -> f64 {
+    1.0
+}
+
+/// `kv_actions.invalidate`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KvInvalidateMode {
+    /// At requests marked `compaction` (the harness's signal).
+    Marker,
+    /// At every request (an upper bound: the router knows every dead block).
+    Oracle,
+}
+
+/// `kv_actions.demote`: at a request's end, when the client expects the next turn no sooner
+/// than `after_think_s` (`x-dynamo-hint-next-think-s`) and the worker's G1 is more than
+/// `g1_fraction` full (resident blocks from its KV events over its advertised capacity),
+/// drop the request's G1 blocks that G2 holds.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KvDemoteConfig {
+    #[serde(default = "default_demote_after_think_s")]
+    pub after_think_s: f64,
+    #[serde(default = "default_demote_g1_fraction")]
+    pub g1_fraction: f64,
+    /// Prefetch the demoted blocks back into G1 ahead of the predicted return.
+    #[serde(default)]
+    pub prefetch: Option<KvPrefetchConfig>,
+    /// Send the demote this many seconds after the request ends instead of at its end (0, the
+    /// default). The engine drops only blocks G2 holds, from the chain's tail; at the end of a
+    /// turn the write-through store of its newest blocks is still in flight, so a demote sent
+    /// then found its tail missing from G2 and dropped nothing.
+    #[serde(default)]
+    pub delay_s: f64,
+}
+
+/// `kv_actions.demote.prefetch`: start the load `lead_s` plus its transfer time (blocks
+/// times `block_bytes` over `load_gbs`) before the predicted return.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KvPrefetchConfig {
+    #[serde(default = "default_prefetch_lead_s")]
+    pub lead_s: f64,
+    #[serde(default)]
+    pub load_gbs: Option<f64>,
+    #[serde(default)]
+    pub block_bytes: Option<f64>,
+}
+
+fn default_demote_after_think_s() -> f64 {
+    20.0
+}
+
+fn default_demote_g1_fraction() -> f64 {
+    0.8
+}
+
+fn default_prefetch_lead_s() -> f64 {
+    1.0
+}
+
+/// `kv_actions.retain_value`: a session's KV value is its class weight discounted by how long
+/// until its next turn; the workers' G2 evicts the least valuable first.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KvRetainValueConfig {
+    /// Retain by value only while a worker's G2 evicted within this many seconds
+    /// (retain-short); absent means always.
+    #[serde(default)]
+    pub short_window_s: Option<f64>,
+    /// Class weights (default: priority 10, standard 3.33, batch 0.3, from 1 / (1 - target)).
+    #[serde(default = "default_class_weights")]
+    pub class_weight: HashMap<String, f64>,
+    /// Memory-pressure guard: off while live sessions' KV exceeds this share of capacity.
+    #[serde(default)]
+    pub guard: Option<KvRetainGuardConfig>,
+    /// How a session's value is reckoned: `session` (the default) is its class weight
+    /// discounted by the wait to its next turn, the same however many blocks it holds, so per
+    /// block a long session is the cheapest to evict; `rebuild_cost` is the cost of losing the
+    /// blocks, as the simulator's `dramLoss`: class weight times min(1, rebuild time over the
+    /// class's TTFT target) plus `stall_weight` times the rebuild time, with the same discount.
+    #[serde(default)]
+    pub value: RetainValueModel,
+    /// `rebuild_cost`: milliseconds to recompute one 64-token block (prefill rate).
+    #[serde(default = "default_rebuild_ms_per_block")]
+    pub rebuild_ms_per_block: f64,
+    /// `rebuild_cost`: TTFT target per class in seconds (a class not listed: 30).
+    #[serde(default = "default_class_ttft_s")]
+    pub class_ttft_s: HashMap<String, f64>,
+    /// `rebuild_cost`: weight of the rebuild time itself (the stall it causes).
+    #[serde(default = "default_stall_weight")]
+    pub stall_weight: f64,
+    /// `rebuild_cost`: a session another rank's G2 also holds costs a KVCR fetch to lose
+    /// (`fetch_latency_ms` plus `fetch_ms_per_block` per block), not a rebuild, as the
+    /// simulator's `policy.retainPeers`. Off by default.
+    #[serde(default)]
+    pub peers: bool,
+    #[serde(default = "default_fetch_latency_ms")]
+    pub fetch_latency_ms: f64,
+    #[serde(default = "default_fetch_ms_per_block")]
+    pub fetch_ms_per_block: f64,
+}
+
+/// `kv_actions.retain_value.value`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetainValueModel {
+    #[default]
+    Session,
+    RebuildCost,
+}
+
+fn default_rebuild_ms_per_block() -> f64 {
+    // DeepSeek-V4-Pro TP4 on B300: about 0.35 s per 8,192-token prefill chunk.
+    3.0
+}
+
+fn default_class_ttft_s() -> HashMap<String, f64> {
+    HashMap::from([
+        ("priority".to_string(), 3.0),
+        ("standard".to_string(), 8.0),
+        ("batch".to_string(), 30.0),
+    ])
+}
+
+fn default_stall_weight() -> f64 {
+    0.5
+}
+
+fn default_fetch_latency_ms() -> f64 {
+    100.0
+}
+
+fn default_fetch_ms_per_block() -> f64 {
+    // 284,416 bytes per 64-token block (V4-Pro) at 50 GB/s.
+    0.0057
+}
+
+fn default_class_weights() -> HashMap<String, f64> {
+    HashMap::from([
+        ("priority".to_string(), 10.0),
+        ("standard".to_string(), 1.0 / 0.3),
+        ("batch".to_string(), 0.3),
+    ])
+}
+
+/// Engage retention by value while live sessions' KV over `capacity_tokens` is below
+/// `engage_below`; release it above `release_above` (hysteresis).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KvRetainGuardConfig {
+    /// HBM plus host (G2) KV capacity of all workers, in tokens.
+    pub capacity_tokens: f64,
+    #[serde(default = "default_engage_below")]
+    pub engage_below: f64,
+    #[serde(default = "default_release_above")]
+    pub release_above: f64,
+}
+
+fn default_engage_below() -> f64 {
+    1.0
+}
+
+fn default_release_above() -> f64 {
+    1.2
+}
+
+/// `kv_actions.retain`: TTL in seconds per policy class (a class not listed, or 0, is not kept).
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KvRetainConfig {
+    #[serde(default)]
+    pub ttl_seconds: HashMap<String, f64>,
+    /// Keep only a request the client expects to follow within the TTL: its
+    /// `x-dynamo-hint-next-think-s` header is present and no longer than the TTL, and it
+    /// does not end its session.
+    #[serde(default)]
+    pub expected: bool,
+    /// Keep a request's blocks until the client's expected return (`x-dynamo-hint-next-think-s`)
+    /// plus this margin, at most the class TTL, instead of for the whole class TTL (unset, the
+    /// default). With a fixed TTL every expected session is protected alike; with the return time
+    /// the sessions not due back soon are evicted first, as the simulator's `policy.evictOrder`
+    /// evicts by predicted return. Needs `expected`.
+    #[serde(default)]
+    pub until_return_margin_s: Option<f64>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RouterPolicyConfig {
     router: Option<RouterSettings>,
@@ -137,6 +535,8 @@ pub struct RouterPolicyConfig {
     models: HashMap<String, PolicyProfile>,
     worker_selection: Option<WorkerSelectionConfig>,
     request_classifier: Option<RequestClassifierConfig>,
+    kv_actions: Option<KvActionsConfig>,
+    engine_priority: Option<HashMap<String, i32>>,
 }
 
 impl RouterPolicyConfig {
@@ -194,6 +594,17 @@ impl RouterPolicyConfig {
         self.request_classifier.as_ref()
     }
 
+    /// Returns the per-request KV actions configuration, if present.
+    pub fn kv_actions(&self) -> Option<&KvActionsConfig> {
+        self.kv_actions.as_ref()
+    }
+
+    /// The backend engine priority for a policy class (`engine_priority` in the policy file),
+    /// if the file maps that class. See [`RawRouterPolicyConfig::engine_priority`].
+    pub fn engine_priority(&self, policy_class: &str) -> Option<i32> {
+        self.engine_priority.as_ref()?.get(policy_class).copied()
+    }
+
     /// Whether this document configures queue policy profiles.
     pub fn has_routing_profiles(&self) -> bool {
         self.root.is_some() || !self.models.is_empty()
@@ -210,6 +621,14 @@ struct RawRouterPolicyConfig {
     models: HashMap<String, RawPolicyProfile>,
     worker_selection: Option<RawWorkerSelectionConfig>,
     request_classifier: Option<RawRequestClassifierConfig>,
+    kv_actions: Option<KvActionsConfig>,
+    /// The backend engine scheduling priority per policy class (ledger L53), for example
+    /// `{priority: 2, standard: 1, batch: 0}`. The router writes it into a routed request's
+    /// `routing.priority` when the client set none; the backend forwards it to the engine's
+    /// generate call (the vLLM worker passes `-routing.priority`, and vLLM with
+    /// `--scheduling-policy priority` serves the lower value first, so a higher
+    /// `routing.priority` goes first). Absent by default: `routing.priority` stays as sent.
+    engine_priority: Option<HashMap<String, i32>>,
 }
 
 impl RawRouterPolicyConfig {
@@ -263,6 +682,8 @@ impl RawRouterPolicyConfig {
             && models.is_empty()
             && worker_selection.is_none()
             && request_classifier.is_none()
+            && self.kv_actions.is_none()
+            && self.engine_priority.is_none()
         {
             return Err(RouterPolicyConfigError::Validation(
                 "router policy config must define router settings, a root profile, at least one model profile, worker_selection, or request_classifier".to_string(),
@@ -275,6 +696,8 @@ impl RawRouterPolicyConfig {
             models,
             worker_selection,
             request_classifier,
+            kv_actions: self.kv_actions,
+            engine_priority: self.engine_priority,
         })
     }
 }
@@ -303,6 +726,8 @@ struct RawPolicyClassConfig {
     request_queue_limit_per_worker: Option<usize>,
     raw_isl_token_queue_limit_per_worker: Option<usize>,
     cached_token_queue_limit_per_worker: Option<usize>,
+    /// f49h: per-class cap on active requests per worker rank (`PolicyClassConfig`). Absent: none.
+    active_requests_per_worker: Option<usize>,
 }
 
 fn default_class_queue_policy() -> RouterQueuePolicy {
@@ -380,6 +805,12 @@ fn resolve_policy_class(
         })?),
     };
 
+    if raw.active_requests_per_worker == Some(0) {
+        return Err(RouterPolicyConfigError::Validation(format!(
+            "{location} policy class {:?} active_requests_per_worker must be greater than zero",
+            raw.name
+        )));
+    }
     if raw.prefill_busy_threshold.is_some() {
         tracing::warn!(
             policy_class = %raw.name,
@@ -400,6 +831,7 @@ fn resolve_policy_class(
         request_queue_limit_per_worker: raw.request_queue_limit_per_worker,
         raw_isl_token_queue_limit_per_worker: raw.raw_isl_token_queue_limit_per_worker,
         cached_token_queue_limit_per_worker: raw.cached_token_queue_limit_per_worker,
+        active_requests_per_worker: raw.active_requests_per_worker,
     })
 }
 
@@ -428,6 +860,39 @@ mod tests {
     use tokio::time::Instant;
 
     use super::*;
+
+    #[test]
+    fn kv_actions_parse_and_default_off() {
+        let config = RouterPolicyConfig::from_yaml(
+            "kv_actions:\n  release_source: true\n  retain:\n    expected: true\n    ttl_seconds: {priority: 3600, standard: 3600}\n",
+        )
+        .unwrap();
+        let actions = config.kv_actions().unwrap();
+        assert!(actions.release_source);
+        let retain = actions.retain.as_ref().unwrap();
+        assert!(retain.expected);
+        assert_eq!(retain.ttl_seconds.get("priority"), Some(&3600.0));
+        let rejected = RouterPolicyConfig::from_yaml("kv_actions:\n  unknown: 1\n");
+        assert!(rejected.is_err());
+        assert_eq!(actions.invalidate, None);
+        assert!(actions.demote.is_none() && !actions.fetch_no_retain);
+    }
+
+    #[test]
+    fn kv_block_actions_parse_with_defaults() {
+        let config = RouterPolicyConfig::from_yaml(
+            "kv_actions:\n  invalidate: oracle\n  fetch_no_retain: true\n  demote:\n    prefetch: {load_gbs: 50}\n",
+        )
+        .unwrap();
+        let actions = config.kv_actions().unwrap();
+        assert_eq!(actions.invalidate, Some(KvInvalidateMode::Oracle));
+        assert!(actions.fetch_no_retain);
+        let demote = actions.demote.as_ref().unwrap();
+        assert_eq!((demote.after_think_s, demote.g1_fraction), (20.0, 0.8));
+        let prefetch = demote.prefetch.as_ref().unwrap();
+        assert_eq!((prefetch.lead_s, prefetch.load_gbs), (1.0, Some(50.0)));
+        assert!(RouterPolicyConfig::from_yaml("kv_actions:\n  invalidate: always\n").is_err());
+    }
     use crate::plugins::worker_selection::WorkerSelectionPolicySelection;
     use crate::plugins::worker_selection::{WorkerLoadInput, WorkerLoadInputExt};
     use dynamo_admission::profile::UnknownPolicyClassError;
@@ -1346,5 +1811,73 @@ models:
             ..Default::default()
         };
         assert!(limits.has_room(&prefill_load(1), WorkerCapacity::new(Some(0), None)));
+    }
+
+    #[test]
+    fn engine_priority_maps_policy_classes_and_is_absent_by_default() {
+        let config = RouterPolicyConfig::from_yaml(
+            "default_policy_class: standard\npolicy_classes:\n  - name: priority\n    quantum: 8\n  - name: standard\n    quantum: 4\nengine_priority: {priority: 0, standard: 1}\n",
+        )
+        .unwrap();
+        assert_eq!(config.engine_priority("priority"), Some(0));
+        assert_eq!(config.engine_priority("standard"), Some(1));
+        assert_eq!(config.engine_priority("batch"), None);
+        let plain = RouterPolicyConfig::from_yaml(
+            "default_policy_class: standard\npolicy_classes:\n  - name: standard\n    quantum: 4\n",
+        )
+        .unwrap();
+        assert_eq!(plain.engine_priority("standard"), None);
+        // It alone is a valid policy file.
+        let only = RouterPolicyConfig::from_yaml("engine_priority: {batch: 5}\n").unwrap();
+        assert_eq!(only.engine_priority("batch"), Some(5));
+    }
+}
+
+#[cfg(test)]
+mod active_requests_per_worker_tests {
+    use super::*;
+
+    #[test]
+    fn active_requests_per_worker_is_an_optional_per_class_cap() {
+        let config = RouterPolicyConfig::from_yaml(
+            r#"
+default_policy_class: standard
+policy_classes:
+  - name: priority
+    quantum: 8
+    prefill_busy_threshold_frac: 1.0
+    active_requests_per_worker: 8
+    request_queue_limit_per_worker: 16
+  - name: standard
+    quantum: 4
+    prefill_busy_threshold_frac: 0.95
+  - name: batch
+    quantum: 1
+    active_requests_per_worker: 2
+"#,
+        )
+        .unwrap();
+        let profile = config.resolve_profile(None, None, RouterQueuePolicy::Fcfs);
+        let cap = |name: &str| {
+            let index = profile.resolve_class_index(Some(name)).unwrap();
+            profile.class(index).active_requests_per_worker
+        };
+        assert_eq!(cap("priority"), Some(8));
+        assert_eq!(cap("standard"), None);
+        assert_eq!(cap("batch"), Some(2));
+        // A cap alone makes a class queue, as a busy threshold does.
+        let batch = profile.class(profile.resolve_class_index(Some("batch")).unwrap());
+        assert!(!batch.busy_thresholds.is_configured());
+        assert!(batch.queueing_enabled());
+
+        let zero = RouterPolicyConfig::from_yaml(
+            "policy_classes:\n  - name: a\n    quantum: 1\n    active_requests_per_worker: 0\n",
+        )
+        .unwrap_err();
+        assert!(
+            zero.to_string()
+                .contains("active_requests_per_worker must be greater than zero"),
+            "{zero}"
+        );
     }
 }

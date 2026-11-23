@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "dynamo-session-scheduler"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Session-aware admission for the Dynamo router: a request classifier with a dispatch gate"
+
+[features]
+default = []
+# The forecast's step model from AISimulate's `ForwardPassPerfModel` (the Mocker's engine model).
+aisimulate = ["dep:aisimulate-core", "dep:serde_json"]
+
+[dependencies]
+dynamo-kv-router = { workspace = true }
+fastrand = "2"
+aisimulate-core = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+async-trait.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+dynamo-kv-router = { workspace = true, features = ["testing"] }
+# The replay gate end to end: this plugin inside offline KV-router replay (tests/replay_gate.rs).
+dynamo-mocker = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
+tempfile = { workspace = true }
+serde_json.workspace = true

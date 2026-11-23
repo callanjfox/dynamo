@@ -579,6 +579,9 @@ pub enum PublicDetails {
     RateLimit {
         limit: Option<u64>,
         remaining: Option<u64>,
+        /// Seconds the client should wait before retrying; HTTP sends it as `Retry-After`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after_s: Option<u64>,
     },
 }
 
@@ -1287,6 +1290,7 @@ mod tests {
             .public_details(PublicDetails::RateLimit {
                 limit: Some(100),
                 remaining: Some(0),
+                retry_after_s: None,
             })
             .build();
 
@@ -1304,6 +1308,7 @@ mod tests {
             Some(&PublicDetails::RateLimit {
                 limit: Some(100),
                 remaining: Some(0),
+                retry_after_s: None,
             })
         );
     }
@@ -1317,6 +1322,7 @@ mod tests {
             .public_details(PublicDetails::RateLimit {
                 limit: Some(100),
                 remaining: Some(0),
+                retry_after_s: None,
             })
             .build();
 
@@ -1377,6 +1383,7 @@ mod tests {
             public: Some(PublicDetails::RateLimit {
                 limit: Some(10),
                 remaining: Some(0),
+                retry_after_s: None,
             }),
         };
 

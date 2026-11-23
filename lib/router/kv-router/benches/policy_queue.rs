@@ -119,6 +119,7 @@ fn edf_queue(
                     due_at: None,
                     class_due_at,
                     arrival_offset_secs: request_index as f64,
+                    order_key: None,
                 },
                 lanes.unwrap_or(1),
                 0.0,

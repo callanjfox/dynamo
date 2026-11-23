@@ -50,6 +50,9 @@ impl RankLoad for WorkerLoadView {
     fn active_decode_blocks(&self) -> usize {
         self.active_decode_blocks
     }
+    fn active_requests(&self) -> Option<usize> {
+        Some(self.active_requests)
+    }
 }
 
 /// A rank's cache estimate for this request as the classifier sees it.

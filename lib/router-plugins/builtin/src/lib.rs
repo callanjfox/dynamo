@@ -14,7 +14,8 @@ mod sticky_min_load;
 mod thunderagent;
 mod two_tier_cost_fn;
 pub use default::{
-    default_factory, default_policy, default_policy_with_rng, startup_policy_parameters,
+    default_factory, default_policy, default_policy_with_rng, default_policy_with_scorers,
+    startup_policy_parameters,
 };
 
 /// Registry every host links: the required default plus the routing modes
@@ -27,7 +28,9 @@ pub fn default_registry() -> RouterPluginRegistry {
 /// it doesn't already provide. A host applies this to the catalog it installs, so
 /// `--router-mode` resolves however that catalog was built.
 pub fn with_defaults(registry: RouterPluginRegistry) -> RouterPluginRegistry {
-    let mut registry = registry.with_default_factory(default_factory());
+    let mut registry = registry
+        .with_default_factory(default_factory())
+        .with_default_policy_with_scorers(std::sync::Arc::new(default_policy_with_scorers));
     router_modes::register_missing(&mut registry);
     registry
 }

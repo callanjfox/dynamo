@@ -44,6 +44,8 @@ const ROUTER_HINT_ENDPOINT: &str = "aisim-replay://worker";
 pub(super) struct ReplayWorkerConfig {
     pub(super) max_num_batched_tokens: u64,
     pub(super) total_kv_blocks: u64,
+    /// The engine's running-request limit; `None` when unlimited.
+    pub(super) max_num_seqs: Option<u64>,
     pub(super) data_parallel_start_rank: u32,
     pub(super) data_parallel_size: u32,
     hint_capable: bool,
@@ -84,6 +86,10 @@ impl WorkerConfigLike for ReplayWorkerConfig {
         Some(self.total_kv_blocks)
     }
 
+    fn max_num_seqs(&self) -> Option<u64> {
+        self.max_num_seqs
+    }
+
     fn kv_hint_transfer_metadata_for_dp_rank(
         &self,
         dp_rank: DpRank,
@@ -117,6 +123,7 @@ pub(in crate::replay) fn replay_worker_config(args: &MockerConfig) -> ReplayWork
             args.max_num_batched_tokens as u64
         },
         total_kv_blocks: args.num_gpu_blocks as u64,
+        max_num_seqs: (args.max_num_seqs != usize::MAX).then_some(args.max_num_seqs as u64),
         data_parallel_start_rank: 0,
         data_parallel_size: args.dp_size.max(1),
         hint_capable: false,
@@ -170,14 +177,47 @@ pub(super) fn replay_selector_with_seed(
     config: &KvRouterConfig,
     selector_seed: Option<u64>,
 ) -> anyhow::Result<DefaultWorkerSelector> {
-    if config.request_classifier_config()?.is_some() {
-        anyhow::bail!("offline replay does not support request_classifier plugins");
+    replay_selector_with_plugins(config, selector_seed, false, None)
+}
+
+/// `classifier_supplied`: the host passed the factory the configured `request_classifier`
+/// resolves to (replay cannot link plugins itself), so a configured classifier is allowed.
+/// `worker_selection`: likewise the factory the configured `worker_selection` instance resolves
+/// to; with it, replay runs that policy (as the aggregated worker type) instead of the default.
+/// The policy owns its random stream, so seeded replay is reproducible only when the plugin seeds
+/// itself (the priority pool takes a `seed` parameter for this).
+pub(super) fn replay_selector_with_plugins(
+    config: &KvRouterConfig,
+    selector_seed: Option<u64>,
+    classifier_supplied: bool,
+    worker_selection: Option<&crate::replay::ReplayWorkerSelectionPlugin>,
+) -> anyhow::Result<DefaultWorkerSelector> {
+    if config.request_classifier_config()?.is_some() && !classifier_supplied {
+        anyhow::bail!(
+            "offline replay does not support request_classifier plugins unless the host supplies the classifier (ReplayScope::request_classifier)"
+        );
     }
     if let Some(instance) = config
         .selected_worker_selection_policy_instance()
         .map_err(anyhow::Error::from)?
     {
-        anyhow::bail!("custom worker-selection policy {instance:?} is not supported by replay");
+        let Some(plugin) = worker_selection else {
+            anyhow::bail!(
+                "custom worker-selection policy {instance:?} is not supported by replay unless the host supplies it (ReplayScope::worker_selection)"
+            );
+        };
+        let factory = plugin.0.clone();
+        return Ok(DefaultWorkerSelector::from_builder(
+            Some(SelectionConfig::from(config)),
+            "replay",
+            Arc::new(move |selection: &SelectionConfig| {
+                factory(
+                    selection,
+                    dynamo_router_protocol::worker_type::WorkerType::Aggregated,
+                    dynamo_router_protocol::identity::RoutingPartitionRef::new("replay", "default"),
+                )
+            }),
+        ));
     }
 
     Ok(match selector_seed {
@@ -206,6 +246,7 @@ mod tests {
     #[test]
     fn router_hint_metadata_covers_each_rank_and_keys_are_built_once() {
         let template = ReplayWorkerConfig {
+            max_num_seqs: None,
             data_parallel_start_rank: 2,
             data_parallel_size: 2,
             ..replay_worker_config(&MockerConfig::default())
@@ -275,5 +316,38 @@ worker_selection:
                 .to_string()
                 .contains("custom worker-selection policy \"test\" is not supported by replay")
         );
+    }
+
+    #[test]
+    fn replay_selector_runs_a_host_supplied_worker_selection_policy() {
+        let policy_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            policy_file.path(),
+            "worker_selection:\n  aggregated: test\n",
+        )
+        .unwrap();
+        let config = KvRouterConfig {
+            router_policy_config: Some(policy_file.path().display().to_string()),
+            ..Default::default()
+        };
+        let built = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&built);
+        let factory: dynamo_kv_router::plugins::worker_selection::WorkerSelectionPolicyFactory =
+            Arc::new(move |selection, _role, _partition| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                dynamo_router_policies::default_policy(selection.clone(), "test")
+            });
+        let plugin = crate::replay::ReplayWorkerSelectionPlugin(factory);
+        let selector = replay_selector_with_plugins(&config, None, false, Some(&plugin))
+            .expect("a supplied worker-selection policy runs");
+        assert_eq!(built.load(std::sync::atomic::Ordering::Relaxed), 1);
+        // A clone builds its own policy from the same factory.
+        let _clone = selector.clone();
+        assert_eq!(built.load(std::sync::atomic::Ordering::Relaxed), 2);
+        // Without a configured instance the supplied factory is not used.
+        let plain =
+            replay_selector_with_plugins(&KvRouterConfig::default(), None, false, Some(&plugin));
+        assert!(plain.is_ok());
+        assert_eq!(built.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 }

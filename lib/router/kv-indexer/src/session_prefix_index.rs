@@ -118,6 +118,9 @@ struct SessionEntry {
 #[derive(Debug)]
 struct IndexState {
     nodes: SlotMap<NodeId, LogicalNode>,
+    /// Each node's children, kept with `child_count`, so a removal can find the frontiers below
+    /// a removed block without walking every frontier to its root.
+    children: FxHashMap<NodeId, FxHashSet<NodeId>>,
     hash_to_node: FxHashMap<ExternalSequenceBlockHash, NodeId>,
     session_to_worker_frontiers: HashMap<SessionId, SessionEntry>,
     worker_frontier_to_sessions: FxHashMap<FrontierKey, FxHashMap<NodeId, HashSet<SessionId>>>,
@@ -132,6 +135,7 @@ impl Default for IndexState {
     fn default() -> Self {
         Self {
             nodes: SlotMap::default(),
+            children: FxHashMap::default(),
             hash_to_node: FxHashMap::default(),
             session_to_worker_frontiers: HashMap::default(),
             worker_frontier_to_sessions: FxHashMap::default(),
@@ -200,6 +204,77 @@ impl SessionPrefixIndexer {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// For each owner and storage tier holding part of the session, the depth in blocks of its
+    /// deepest frontier (the longest resident prefix of the session there). Read-only; one
+    /// parent walk per frontier.
+    pub fn get_session_resident_depths(
+        &self,
+        session_id: &str,
+    ) -> Vec<(SessionResidencyOwner, StorageTier, u64)> {
+        let state = self.state.read();
+        let Some(entry) = state.session_to_worker_frontiers.get(session_id) else {
+            return Vec::new();
+        };
+        entry
+            .worker_frontiers
+            .iter()
+            .filter_map(|(&(owner, tier), frontiers)| {
+                let depth = frontiers
+                    .iter()
+                    .map(|&frontier| state.depth(frontier))
+                    .max()?;
+                Some((owner, tier, depth))
+            })
+            .collect()
+    }
+
+    /// Sessions tracked, and resident blocks per tier summed over sessions and owners (the
+    /// deepest frontier per owner and tier, as in [`Self::get_session_resident_depths`]).
+    /// O(sessions x frontiers x depth): for end-of-run metrics, not the request path.
+    pub fn residency_totals(&self) -> (usize, Vec<(StorageTier, u64)>) {
+        let state = self.state.read();
+        let mut per_tier: FxHashMap<StorageTier, u64> = FxHashMap::default();
+        for entry in state.session_to_worker_frontiers.values() {
+            for (&(_, tier), frontiers) in &entry.worker_frontiers {
+                if let Some(depth) = frontiers.iter().map(|&f| state.depth(f)).max() {
+                    *per_tier.entry(tier).or_default() += depth;
+                }
+            }
+        }
+        (
+            state.session_to_worker_frontiers.len(),
+            per_tier.into_iter().collect(),
+        )
+    }
+
+    /// Unique resident blocks per owner and storage tier (F34): every block on a path from one of
+    /// that owner's frontiers in that tier to its root, counted once however many sessions'
+    /// frontiers reach it (a shared system prompt or a parent's context counts once per owner).
+    /// [`Self::residency_totals`] sums per session instead. O(unique nodes) per owner and tier
+    /// (each walk stops at the first node already counted): for a periodic controller step, not
+    /// the request path.
+    pub fn unique_residency(&self) -> Vec<(SessionResidencyOwner, StorageTier, u64)> {
+        let state = self.state.read();
+        let limit = state.nodes.len();
+        let mut out = Vec::with_capacity(state.worker_frontier_to_sessions.len());
+        for (&(owner, tier), frontiers) in &state.worker_frontier_to_sessions {
+            let mut seen: FxHashSet<NodeId> = FxHashSet::default();
+            for &frontier in frontiers.keys() {
+                let mut current = Some(frontier);
+                while let Some(node) = current {
+                    if seen.len() > limit || !seen.insert(node) {
+                        break;
+                    }
+                    current = state.nodes.get(node).and_then(|n| n.parent);
+                }
+            }
+            if !seen.is_empty() {
+                out.push((owner, tier, seen.len() as u64));
+            }
+        }
+        out
     }
 
     /// Returns root-first device-tier chains for one worker, optionally truncated at an anchor.
@@ -470,6 +545,7 @@ impl IndexState {
         self.hash_to_node.insert(block_hash, node);
         if let Some(parent) = parent {
             self.nodes[parent].child_count += 1;
+            self.children.entry(parent).or_default().insert(node);
         }
         node
     }
@@ -502,6 +578,7 @@ impl IndexState {
                     if let (None, Some(expected)) = (self.nodes[existing].parent, parent) {
                         self.nodes[existing].parent = Some(expected);
                         self.nodes[expected].child_count += 1;
+                        self.children.entry(expected).or_default().insert(existing);
                     }
                     existing
                 }
@@ -660,9 +737,16 @@ impl IndexState {
 
             self.nodes.remove(node);
             self.hash_to_node.remove(&entry.block_hash);
+            self.children.remove(&node);
             removed += 1;
 
             if let Some(parent) = entry.parent {
+                if let Some(siblings) = self.children.get_mut(&parent) {
+                    siblings.remove(&node);
+                    if siblings.is_empty() {
+                        self.children.remove(&parent);
+                    }
+                }
                 let parent_entry = &mut self.nodes[parent];
                 debug_assert!(parent_entry.child_count > 0);
                 parent_entry.child_count -= 1;
@@ -680,6 +764,22 @@ impl IndexState {
     }
 
     // Bound parent walks so corrupted cycles cannot hang while holding the lock.
+    /// Number of nodes from `tail` to its root, inclusive (the same walk as `path_to_root`).
+    fn depth(&self, tail: NodeId) -> u64 {
+        let limit = self.nodes.len();
+        let mut depth = 0usize;
+        let mut current = Some(tail);
+        while let Some(node) = current {
+            if depth >= limit {
+                debug_assert!(false, "parent cycle in session prefix index forest");
+                break;
+            }
+            depth += 1;
+            current = self.nodes.get(node).and_then(|n| n.parent);
+        }
+        depth as u64
+    }
+
     fn path_to_root(&self, tail: NodeId) -> Vec<NodeId> {
         let limit = self.nodes.len();
         let mut path = Vec::new();
@@ -716,36 +816,59 @@ impl IndexState {
         false
     }
 
+    /// The members of `frontiers` that are ancestors of `node` or `node` itself.
+    fn frontiers_on_root_path(&self, node: NodeId, frontiers: &[NodeId]) -> Vec<NodeId> {
+        if frontiers.is_empty() {
+            return Vec::new();
+        }
+        let wanted: FxHashSet<NodeId> = frontiers.iter().copied().collect();
+        let limit = self.nodes.len();
+        let mut found = Vec::new();
+        let mut current = Some(node);
+        let mut steps = 0usize;
+        while let Some(walk) = current {
+            if wanted.contains(&walk) {
+                found.push(walk);
+                if found.len() == wanted.len() {
+                    break;
+                }
+            }
+            steps += 1;
+            if steps > limit {
+                debug_assert!(false, "parent cycle in session prefix index forest");
+                tracing::error!("session prefix index ancestry walk exceeded the arena; aborting");
+                break;
+            }
+            current = self.nodes[walk].parent;
+        }
+        found
+    }
+
     // Keep only the deepest frontier on each worker-tier chain.
     fn advance_frontier(&mut self, session_id: &str, key: FrontierKey, node: NodeId) -> bool {
-        let already_reached = self
+        let frontiers: Vec<NodeId> = self
             .session_to_worker_frontiers
             .get(session_id)
             .and_then(|entry| entry.worker_frontiers.get(&key))
-            .is_some_and(|frontiers| {
-                frontiers.contains(&node)
-                    || frontiers
-                        .iter()
-                        .any(|&frontier| self.is_ancestor_or_self(node, frontier))
-            });
+            .map(|frontiers| frontiers.iter().copied().collect())
+            .unwrap_or_default();
+        // A node with no children is no frontier's strict ancestor, so the ancestry walks run
+        // only for a node that already has descendants (a store that re-reports a shorter
+        // prefix). The common case, a store that extends the session, does no walk here.
+        let already_reached = frontiers.contains(&node)
+            || (self.nodes[node].child_count > 0
+                && frontiers
+                    .iter()
+                    .any(|&frontier| self.is_ancestor_or_self(node, frontier)));
         if already_reached {
             self.touch_session(session_id);
             return false;
         }
 
-        let subsumed: Vec<NodeId> = self
-            .session_to_worker_frontiers
-            .get(session_id)
-            .and_then(|entry| entry.worker_frontiers.get(&key))
-            .map(|frontiers| {
-                frontiers
-                    .iter()
-                    .copied()
-                    .filter(|&frontier| self.is_ancestor_or_self(frontier, node))
-                    .collect()
-            })
-            .unwrap_or_default();
-
+        // Frontiers on the node's own root path: one walk up from the node, stopping once
+        // every frontier is found (a store that appends k blocks finds its frontier in k steps),
+        // instead of one walk to the root per frontier.
+        let subsumed = self.frontiers_on_root_path(node, &frontiers);
         for &frontier in &subsumed {
             self.remove_frontier_binding(session_id, key, frontier);
         }
@@ -851,29 +974,45 @@ impl IndexState {
             return 0;
         }
 
-        // Examine each frontier path; recede past the removed block and its descendants.
-        let affected: Vec<(SessionId, NodeId, Option<NodeId>)> = self
-            .worker_frontier_to_sessions
-            .get(&key)
-            .map(|frontiers| {
-                frontiers
-                    .iter()
-                    .filter_map(|(&frontier, sessions)| {
-                        let path = self.path_to_root(frontier);
-                        let shallowest_removed =
-                            path.into_iter().find(|node| removed_nodes.contains(node))?;
-                        let replacement = self.nodes[shallowest_removed].parent;
-                        Some(
-                            sessions
-                                .iter()
-                                .cloned()
-                                .map(move |session_id| (session_id, frontier, replacement)),
-                        )
-                    })
-                    .flatten()
-                    .collect()
+        // Frontiers of this owner tier at or below a removed block: search down from the removed
+        // blocks through `children` (a tail eviction touches only a few nodes), instead of walking
+        // every frontier of the owner to its root. Each affected frontier then recedes past the
+        // shallowest removed block on its own root path, as before.
+        let Some(frontier_sessions) = self.worker_frontier_to_sessions.get(&key) else {
+            return 0;
+        };
+        let mut seen: FxHashSet<NodeId> = FxHashSet::default();
+        let mut stack: Vec<NodeId> = removed_nodes.iter().copied().collect();
+        let mut hit: Vec<NodeId> = Vec::new();
+        while let Some(node) = stack.pop() {
+            if !seen.insert(node) {
+                continue;
+            }
+            if frontier_sessions.contains_key(&node) {
+                hit.push(node);
+            }
+            if let Some(children) = self.children.get(&node) {
+                stack.extend(children.iter().copied());
+            }
+        }
+        let affected: Vec<(SessionId, NodeId, Option<NodeId>)> = hit
+            .into_iter()
+            .filter_map(|frontier| {
+                let path = self.path_to_root(frontier);
+                let shallowest_removed =
+                    path.into_iter().find(|node| removed_nodes.contains(node))?;
+                let replacement = self.nodes[shallowest_removed].parent;
+                let sessions = frontier_sessions.get(&frontier)?;
+                Some(
+                    sessions
+                        .iter()
+                        .cloned()
+                        .map(move |session_id| (session_id, frontier, replacement))
+                        .collect::<Vec<_>>(),
+                )
             })
-            .unwrap_or_default();
+            .flatten()
+            .collect();
 
         for (session_id, old_frontier, replacement) in &affected {
             self.remove_frontier_binding(session_id, key, *old_frontier);
@@ -1903,5 +2042,203 @@ mod tests {
         let mut extended = chain.clone();
         extended.push(unknown);
         assert_eq!(lineage_on_worker(&indexer, "t", worker(1)), vec![extended]);
+    }
+
+    #[test]
+    fn resident_depths_report_the_deepest_prefix_per_owner_and_tier() {
+        let indexer = SessionPrefixIndexer::new();
+        let chain = hashes(vec![1, 2, 3, 4]);
+        indexer
+            .update_session_from_stored_blocks("s1", worker(1), None, &chain)
+            .unwrap();
+        // A shorter copy of the same prefix on a second worker, and two blocks in host memory.
+        indexer
+            .update_session_from_stored_blocks("s1", worker(2), None, &chain[..2])
+            .unwrap();
+        indexer
+            .update_session_from_stored_blocks_in_tier(
+                "s1",
+                owner(1),
+                StorageTier::HostPinned,
+                None,
+                &chain[..2],
+            )
+            .unwrap();
+
+        let mut depths = indexer.get_session_resident_depths("s1");
+        depths
+            .sort_by_key(|&(owner, tier, _)| (owner.as_worker().map(|w| w.worker_id), tier as u8));
+        assert_eq!(
+            depths,
+            vec![
+                (owner(1), StorageTier::Device, 4),
+                (owner(1), StorageTier::HostPinned, 2),
+                (owner(2), StorageTier::Device, 2),
+            ]
+        );
+        assert!(indexer.get_session_resident_depths("unknown").is_empty());
+    }
+
+    #[test]
+    fn resident_depths_take_the_deeper_of_two_branches() {
+        let indexer = SessionPrefixIndexer::new();
+        let trunk = hashes(vec![1, 2]);
+        let left = hashes(vec![3]);
+        let right = hashes(vec![4, 5, 6]);
+        indexer
+            .update_session_from_stored_blocks("s1", worker(1), None, &trunk)
+            .unwrap();
+        indexer
+            .update_session_from_stored_blocks("s1", worker(1), Some(trunk[1]), &left)
+            .unwrap();
+        indexer
+            .update_session_from_stored_blocks("s1", worker(1), Some(trunk[1]), &right)
+            .unwrap();
+        assert_eq!(
+            indexer.get_session_resident_depths("s1"),
+            vec![(owner(1), StorageTier::Device, 5)]
+        );
+    }
+
+    #[test]
+    fn residency_totals_sum_sessions_per_tier() {
+        let indexer = SessionPrefixIndexer::new();
+        indexer
+            .update_session_from_stored_blocks("a", worker(1), None, &hashes(vec![1, 2, 3]))
+            .unwrap();
+        indexer
+            .update_session_from_stored_blocks("b", worker(2), None, &hashes(vec![7, 8]))
+            .unwrap();
+        indexer
+            .update_session_from_stored_blocks_in_tier(
+                "b",
+                owner(2),
+                StorageTier::Disk,
+                None,
+                &hashes(vec![7]),
+            )
+            .unwrap();
+        let (sessions, mut per_tier) = indexer.residency_totals();
+        per_tier.sort_by_key(|&(tier, _)| tier as u8);
+        assert_eq!(sessions, 2);
+        assert_eq!(
+            per_tier,
+            vec![(StorageTier::Device, 5), (StorageTier::Disk, 1)]
+        );
+    }
+
+    #[test]
+    fn unique_residency_counts_a_shared_prefix_once_per_owner_and_tier() {
+        let indexer = SessionPrefixIndexer::new();
+        // Sessions a and b share blocks 1 and 2 on worker 1; b continues with 4.
+        indexer
+            .update_session_from_stored_blocks("a", worker(1), None, &hashes(vec![1, 2, 3]))
+            .unwrap();
+        indexer
+            .update_session_from_stored_blocks("b", worker(1), None, &hashes(vec![1, 2, 4]))
+            .unwrap();
+        // Session a's prefix is also on worker 2, and one block of it in worker 1's host tier.
+        indexer
+            .update_session_from_stored_blocks("a", worker(2), None, &hashes(vec![1, 2]))
+            .unwrap();
+        indexer
+            .update_session_from_stored_blocks_in_tier(
+                "a",
+                owner(1),
+                StorageTier::HostPinned,
+                None,
+                &hashes(vec![1]),
+            )
+            .unwrap();
+        let unique = indexer.unique_residency();
+        let get = |o: SessionResidencyOwner, t: StorageTier| {
+            unique
+                .iter()
+                .find(|&&(oo, tt, _)| oo == o && tt == t)
+                .map(|&(_, _, n)| n)
+        };
+        // Worker 1 device: blocks 1, 2, 3, 4 once each, where the per-session sum counts 6.
+        assert_eq!(get(owner(1), StorageTier::Device), Some(4));
+        assert_eq!(get(owner(2), StorageTier::Device), Some(2));
+        assert_eq!(get(owner(1), StorageTier::HostPinned), Some(1));
+        let (_, per_tier) = indexer.residency_totals();
+        let summed: u64 = per_tier
+            .iter()
+            .filter(|&&(t, _)| t == StorageTier::Device)
+            .map(|&(_, n)| n)
+            .sum();
+        assert_eq!(summed, 3 + 3 + 2);
+    }
+
+    fn assert_children_match_child_count(indexer: &SessionPrefixIndexer) {
+        let state = indexer.state.read();
+        for (node, entry) in state.nodes.iter() {
+            let listed = state.children.get(&node).map_or(0, |c| c.len());
+            assert_eq!(listed as u32, entry.child_count, "children of {node:?}");
+            for &child in state.children.get(&node).into_iter().flatten() {
+                assert_eq!(state.nodes[child].parent, Some(node));
+            }
+        }
+        assert!(
+            state
+                .children
+                .keys()
+                .all(|node| state.nodes.contains_key(*node))
+        );
+    }
+
+    #[test]
+    fn removals_recede_only_frontiers_below_a_removed_block_and_keep_child_links() {
+        let indexer = SessionPrefixIndexer::new();
+        let trunk = hashes(vec![1, 2, 3]);
+        let left = hashes(vec![4, 5]);
+        let right = hashes(vec![6]);
+        indexer
+            .update_session_from_stored_blocks("a", worker(1), None, &trunk)
+            .unwrap();
+        indexer
+            .update_session_from_stored_blocks("a", worker(1), Some(trunk[2]), &left)
+            .unwrap();
+        indexer
+            .update_session_from_stored_blocks("b", worker(1), Some(trunk[2]), &right)
+            .unwrap();
+        // A former root grafted under a parent keeps the child links too.
+        let late = hashes(vec![9]);
+        indexer
+            .update_session_from_stored_blocks("c", worker(1), None, &late)
+            .unwrap();
+        indexer
+            .update_session_from_stored_blocks("c", worker(1), Some(right[0]), &late)
+            .unwrap();
+        assert_children_match_child_count(&indexer);
+
+        // Removing the left tail recedes only session a, to the left branch's first block.
+        assert_eq!(
+            indexer.update_session_from_removed_blocks(worker(1), &[left[1]]),
+            1
+        );
+        assert_eq!(
+            lineage_of(&indexer, "a"),
+            vec![vec![trunk[0], trunk[1], trunk[2], left[0]]]
+        );
+        assert_eq!(
+            lineage_of(&indexer, "b"),
+            vec![vec![trunk[0], trunk[1], trunk[2], right[0]]]
+        );
+
+        // Removing a trunk block recedes every frontier below it, past the shallowest removal.
+        assert_eq!(
+            indexer.update_session_from_removed_blocks(worker(1), &[trunk[2], right[0]]),
+            3
+        );
+        for session in ["a", "b", "c"] {
+            assert_eq!(
+                lineage_of(&indexer, session),
+                vec![vec![trunk[0], trunk[1]]]
+            );
+        }
+        let pruned = indexer.state.write().prune_stale_nodes();
+        assert!(pruned > 0);
+        assert_children_match_child_count(&indexer);
     }
 }

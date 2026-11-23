@@ -936,6 +936,32 @@ impl KvRouterConfig {
             .and_then(super::policy_config::RouterPolicyConfig::worker_selection))
     }
 
+    /// Return the per-request KV actions configuration from `router_policy_config`, if any.
+    pub fn kv_actions_config(
+        &self,
+    ) -> Result<
+        Option<&super::policy_config::KvActionsConfig>,
+        super::policy_config::RouterPolicyConfigError,
+    > {
+        // The adaptive rule's kv group (`plugins::adaptive_switches`) off: no KV actions.
+        if !crate::plugins::adaptive_switches::kv_actions_enabled() {
+            return Ok(None);
+        }
+        Ok(self
+            .loaded_policy_config()?
+            .and_then(super::policy_config::RouterPolicyConfig::kv_actions))
+    }
+
+    /// The backend engine priority `router_policy_config` maps `policy_class` to
+    /// (`engine_priority`), if any. Unreadable policy files map nothing; the router reports
+    /// them where it loads them.
+    pub fn engine_priority_for(&self, policy_class: &str) -> Option<i32> {
+        self.loaded_policy_config()
+            .ok()
+            .flatten()
+            .and_then(|config| config.engine_priority(policy_class))
+    }
+
     /// Return the custom request-classifier configuration from `router_policy_config`, if any.
     pub fn request_classifier_config(
         &self,

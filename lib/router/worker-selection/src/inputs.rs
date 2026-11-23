@@ -540,6 +540,11 @@ impl dynamo_slot_tracker::busy::RankLoad for WorkerLoadInput {
     fn active_decode_blocks(&self) -> usize {
         self.active_decode_blocks
     }
+
+    #[inline]
+    fn active_requests(&self) -> Option<usize> {
+        Some(self.active_requests)
+    }
 }
 
 impl WorkerLoadInput {

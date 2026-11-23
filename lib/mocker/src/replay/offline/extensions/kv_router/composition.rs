@@ -115,6 +115,11 @@ pub(in crate::replay) struct KvReplayComposition {
     /// Captured from [`crate::replay::ReplayScope`] at construction. Each placement registers its
     /// selector control here under its worker type.
     router_controls: Option<ReplayRouterControls>,
+    /// The request classifier the host supplied, and the per-request fields (replay gate).
+    request_classifier: Option<crate::replay::ReplayClassifierPlugin>,
+    request_fields: Option<std::sync::Arc<super::ReplayRequestAnnotations>>,
+    /// The worker-selection policy the host supplied (aggregated replay only).
+    worker_selection: Option<crate::replay::ReplayWorkerSelectionPlugin>,
 }
 
 impl KvReplayComposition {
@@ -140,6 +145,9 @@ impl KvReplayComposition {
             determinism: ReplayDeterminism::Random,
             kv_event_lag_ms: scope.kv_event_lag_ms,
             router_controls: scope.router_controls,
+            request_classifier: scope.request_classifier,
+            request_fields: scope.request_fields,
+            worker_selection: scope.worker_selection,
         }
     }
 
@@ -169,6 +177,11 @@ impl KvReplayComposition {
             determinism: ReplayDeterminism::Random,
             kv_event_lag_ms: scope.kv_event_lag_ms,
             router_controls: scope.router_controls,
+            request_classifier: scope.request_classifier,
+            request_fields: scope.request_fields,
+            // Disaggregated replay keeps the default selectors; a configured custom policy
+            // still fails there, as before.
+            worker_selection: None,
         }
     }
 }
@@ -212,12 +225,15 @@ impl ReplayComposition for KvReplayComposition {
             bail!("disaggregated Router composition used for aggregated replay");
         };
         validate_runtime_topology("aggregated", args, *num_workers, dp_size, &topology)?;
-        let placement = KvRouterPlacement::new_with_selector_seed(
+        let placement = KvRouterPlacement::new_with_classifier(
             args,
             self.router_config.take(),
             self.prefill_load_estimator.take(),
             &topology,
             self.determinism.selector_seed(),
+            self.request_classifier.as_ref(),
+            self.request_fields.clone(),
+            self.worker_selection.as_ref(),
         )?
         .with_kv_event_lag_ms(self.kv_event_lag_ms)?
         .with_conversation_affinity(self.conversation_affinity)?;
@@ -255,6 +271,11 @@ impl ReplayComposition for KvReplayComposition {
             decode_dp_size,
             &decode_topology,
         )?;
+        if self.request_classifier.is_some() {
+            bail!(
+                "the replay gate (request classifier in offline replay) supports aggregated replay only"
+            );
+        }
         let router_config = self.router_config.take();
         let prefill = KvRouterPlacement::new_with_selector_seed(
             prefill_args,

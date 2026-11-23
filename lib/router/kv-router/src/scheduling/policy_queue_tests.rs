@@ -96,6 +96,7 @@ fn earliest_due_request_precedes_fcfs_arrival_within_a_class() {
                 due_at: Some(now + std::time::Duration::from_secs(20)),
                 class_due_at: None,
                 arrival_offset_secs: 0.0,
+                order_key: None,
             },
             1,
             0.0,
@@ -112,6 +113,7 @@ fn earliest_due_request_precedes_fcfs_arrival_within_a_class() {
                 due_at: Some(now + std::time::Duration::from_secs(10)),
                 class_due_at: None,
                 arrival_offset_secs: 1.0,
+                order_key: None,
             },
             1,
             0.0,
@@ -154,6 +156,7 @@ fn due_time_order_preserves_sub_millisecond_precision() {
                 due_at: Some(due_at + std::time::Duration::from_nanos(1)),
                 class_due_at: None,
                 arrival_offset_secs: 0.0,
+                order_key: None,
             },
             1,
             0.0,
@@ -170,6 +173,7 @@ fn due_time_order_preserves_sub_millisecond_precision() {
                 due_at: Some(due_at),
                 class_due_at: None,
                 arrival_offset_secs: 1.0,
+                order_key: None,
             },
             1,
             0.0,
@@ -209,6 +213,7 @@ fn deadline_count_restores_the_no_deadline_fast_path_after_removal() {
                 due_at: Some(due_at),
                 class_due_at: None,
                 arrival_offset_secs: 1.0,
+                order_key: None,
             },
             2,
             0.0,
@@ -238,6 +243,7 @@ fn deadline_timer_removes_an_expired_blocked_worker_lane() {
                 due_at: Some(due_at),
                 class_due_at: None,
                 arrival_offset_secs: 0.0,
+                order_key: None,
             },
             1,
             0.0,
@@ -281,6 +287,7 @@ fn strict_priority_precedes_earlier_due_request_within_a_class() {
                 due_at: Some(now + std::time::Duration::from_secs(20)),
                 class_due_at: None,
                 arrival_offset_secs: 0.0,
+                order_key: None,
             },
             1,
             0.0,
@@ -297,6 +304,7 @@ fn strict_priority_precedes_earlier_due_request_within_a_class() {
                 due_at: Some(now + std::time::Duration::from_secs(10)),
                 class_due_at: None,
                 arrival_offset_secs: 1.0,
+                order_key: None,
             },
             1,
             0.0,
@@ -338,6 +346,7 @@ fn enqueue_due(
                 due_at,
                 class_due_at,
                 arrival_offset_secs: 0.0,
+                order_key: None,
             },
             2,
             0.0,
@@ -380,6 +389,7 @@ fn edf_orders_by_due_time_then_enqueue_order_and_ignores_priority_modifiers() {
                     due_at,
                     class_due_at,
                     arrival_offset_secs: 0.0,
+                    order_key: None,
                 },
                 1,
                 priority_jump,
@@ -439,6 +449,76 @@ fn edf_lanes_compare_due_times_and_a_blocked_lane_holds_only_itself() {
         drain_payloads(&mut queue, |_, _, _| true),
         ["full-worker-10", "full-worker-15"]
     );
+}
+
+fn drain_checks(
+    queue: &mut PolicyQueue<&'static str>,
+    mut check: impl FnMut(usize, &PolicyClassConfig, &&'static str) -> LaneCheck,
+) -> Vec<&'static str> {
+    std::iter::from_fn(|| {
+        queue
+            .pop_next(&mut check)
+            .map(PolicyQueueEntry::into_payload)
+    })
+    .collect()
+}
+
+#[test]
+fn parked_lanes_are_skipped_until_unparked() {
+    let mut queue = PolicyQueue::new(&edf_profile());
+    enqueue_due(&mut queue, None, None, lane_of(1), "parked");
+    enqueue_due(&mut queue, None, None, lane_of(2), "gate-held");
+    let asked = std::cell::RefCell::new(Vec::new());
+    let open = std::cell::Cell::new(false);
+    let predicate = |_: usize, _: &PolicyClassConfig, payload: &&'static str| {
+        asked.borrow_mut().push(*payload);
+        match *payload {
+            _ if open.get() => LaneCheck::Dispatch,
+            "parked" => LaneCheck::Blocked(BlockReason::GateParked),
+            _ => LaneCheck::Blocked(BlockReason::Gate),
+        }
+    };
+    assert!(queue.pop_next(predicate).is_none());
+    assert_eq!(
+        queue.class_lane_block_reason(0, lane_key(1)),
+        Some(BlockReason::GateParked)
+    );
+    assert_eq!(queue.class_blocked_lane_count(0), 2);
+    assert_eq!(queue.parked_lane_count(), 1);
+    asked.borrow_mut().clear();
+
+    // A full recheck skips the parked lane.
+    queue.recheck_blocked_lanes(RecheckScope::All);
+    assert!(queue.pop_next(predicate).is_none());
+    assert_eq!(asked.borrow().as_slice(), ["gate-held"]);
+    asked.borrow_mut().clear();
+
+    // Unparked, it is asked at the next recheck, and dispatches once the gate lets it.
+    assert!(queue.unpark_lane(0, lane_key(1)));
+    assert!(!queue.unpark_lane(0, lane_key(1)), "no longer parked");
+    open.set(true);
+    queue.recheck_blocked_lanes(RecheckScope::All);
+    let mut out = drain_checks(&mut queue, predicate);
+    out.sort_unstable();
+    assert_eq!(out, ["gate-held", "parked"]);
+    assert_eq!(queue.parked_lane_count(), 0);
+}
+
+#[test]
+fn a_parked_lane_whose_root_leaves_is_asked_about_its_next_head() {
+    let mut queue = PolicyQueue::new(&edf_profile());
+    enqueue_due(&mut queue, None, None, lane_of(1), "first");
+    enqueue_due(&mut queue, None, None, lane_of(1), "second");
+    let park_first = |_: usize, _: &PolicyClassConfig, payload: &&'static str| match *payload {
+        "first" => LaneCheck::Blocked(BlockReason::GateParked),
+        _ => LaneCheck::Dispatch,
+    };
+    assert!(queue.pop_next(park_first).is_none());
+    assert_eq!(queue.parked_lane_count(), 1);
+    // The parked root leaves (a cancel): the lane is unblocked and its next head goes.
+    queue.retain(|payload| *payload != "first");
+    assert_eq!(queue.parked_lane_count(), 0);
+    assert_eq!(drain_checks(&mut queue, park_first), ["second"]);
 }
 
 #[test]
@@ -581,6 +661,7 @@ fn fcfs_and_wspt_do_not_order_by_class_due_times() {
         due_at,
         class_due_at,
         arrival_offset_secs,
+        order_key: None,
     };
 
     // FCFS keeps arrival order although the later arrival's class due time is earlier.
@@ -649,6 +730,7 @@ fn timed(cost: usize, due_at: Option<Instant>, class_due_at: Option<Instant>) ->
         due_at,
         class_due_at,
         arrival_offset_secs: 0.0,
+        order_key: None,
     }
 }
 
@@ -686,6 +768,41 @@ fn drain_all<T>(queue: &mut PolicyQueue<T>) -> Vec<T> {
     std::iter::from_fn(|| queue.pop_next(|_, _, _| true))
         .map(PolicyQueueEntry::into_payload)
         .collect()
+}
+
+#[test]
+fn a_classifier_order_key_orders_within_a_class_after_deadlines_and_never_expires() {
+    let mut queue = PolicyQueue::new(&admission_profile());
+    let now = Instant::now();
+    let keyed = |arrival: f64, key: Option<f64>| QueueMetadata {
+        order_key: key,
+        arrival_offset_secs: arrival,
+        ..timed(1, None, None)
+    };
+    // FCFS would serve by arrival; the keys reverse it, lower first, ties by enqueue order.
+    push(&mut queue, keyed(0.0, Some(30.0)), "first-in-key-30");
+    push(&mut queue, keyed(1.0, Some(10.0)), "second-in-key-10");
+    push(&mut queue, keyed(2.0, Some(10.0)), "third-in-key-10");
+    // A deadline still goes ahead of every key.
+    push(
+        &mut queue,
+        QueueMetadata {
+            order_key: Some(0.0),
+            ..timed(1, Some(now + std::time::Duration::from_secs(60)), None)
+        },
+        "deadline",
+    );
+    // The key never expires: only the deadline is due.
+    assert_eq!(queue.due_entry_count(0), 1);
+    assert_eq!(
+        drain_all(&mut queue),
+        vec![
+            "deadline",
+            "second-in-key-10",
+            "third-in-key-10",
+            "first-in-key-30"
+        ]
+    );
 }
 
 #[test]

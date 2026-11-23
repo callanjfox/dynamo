@@ -27,6 +27,8 @@ zmq-events = ["dep:tmq"]
 
 [dependencies]
 dynamo-router-policies = { workspace = true }
+# Typed classifier refusals (rate limit with Retry-After) read by the replay client.
+dynamo-error = { workspace = true }
 # repo
 aisimulate-core = { workspace = true }
 dynamo-admission = { workspace = true }
@@ -76,6 +78,7 @@ zip = { version = "9.1.3", default-features = false, features = ["deflate-flate2
 tokio-timerfd = "0.2"
 
 [dev-dependencies]
+async-trait = { workspace = true }
 dynamo-kv-router = { workspace = true, features = ["metrics"] }
 rstest = "0.18.2"
 tempfile = { workspace = true }

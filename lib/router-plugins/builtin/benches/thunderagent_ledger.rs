@@ -128,6 +128,7 @@ async fn complete(classifier: &mut dyn RequestClassifier, request_id: &str, sess
             request_id: request_id.to_owned(),
             worker,
             context_tokens: Some(ISL),
+            output_tokens: None,
         })
         .await;
 }

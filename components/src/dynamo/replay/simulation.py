@@ -385,6 +385,31 @@ class DynamoReplayRunner:
         raise ValueError("agentic execution requires a configured target model")
 
     @staticmethod
+    def _restore_late_engine_keys(args, late) -> None:
+        """Put keys the materializer does not know back on the sections that carry them: the host
+        tier (the mapping with num_host_blocks) and KVCR (the mapping under a kvcr key)."""
+        found: set[str] = set()
+
+        def walk(node, parent_key=None):
+            if isinstance(node, dict):
+                if "native_host_offload" in late and "num_host_blocks" in node:
+                    node.update(late["native_host_offload"])
+                    found.add("native_host_offload")
+                if "kvcr" in late and parent_key == "kvcr":
+                    node.update(late["kvcr"])
+                    found.add("kvcr")
+                for k, v in node.items():
+                    walk(v, k)
+            elif isinstance(node, list):
+                for v in node:
+                    walk(v, parent_key)
+
+        walk(args)
+        missing = set(late) - found
+        if missing:
+            raise ValueError(f"engine sections not found after materializing: {sorted(missing)}")
+
+    @staticmethod
     def _engine_args(deployment, role: str) -> dict[str, JSONValue]:
         payload = getattr(
             deployment,
@@ -392,7 +417,28 @@ class DynamoReplayRunner:
         )
         if payload is None:
             raise ValueError("ReplaySpec is missing required engine arguments")
-        return normalize_mocker_config(
+        # class_scheduling (AISimulate class-aware scheduling) is read by the engine in
+        # dynamo._core, not by the launch-config materializer, which predates it: set it aside
+        # while materializing and restore it after.
+        payload = dict(payload)
+        class_scheduling = payload.pop("class_scheduling", None)
+        # Likewise the host tier's write_back and vllm_recency and KVCR's peer_hbm,
+        # keep_source_recency and demote_whole_chain (AISimulate engine switches, all off by default): set
+        # aside, then restored on the materialized sections.
+        late: dict[str, dict[str, JSONValue]] = {}
+        for section, key in (
+            ("native_host_offload", "write_back"),
+            ("native_host_offload", "vllm_recency"),
+            ("kvcr", "peer_hbm"),
+            ("kvcr", "keep_source_recency"),
+            ("kvcr", "demote_whole_chain"),
+        ):
+            value = payload.get(section)
+            if isinstance(value, Mapping) and key in value:
+                value = dict(value)
+                late.setdefault(section, {})[key] = value.pop(key)
+                payload[section] = value
+        args = normalize_mocker_config(
             materialize_engine_launch_config(
                 deployment.backend,
                 deployment.backend_version,
@@ -401,6 +447,15 @@ class DynamoReplayRunner:
                 role,
             )
         )
+        if late:
+            DynamoReplayRunner._restore_late_engine_keys(args, late)
+        if class_scheduling is not None:
+            engine = args.get("engine")
+            if isinstance(engine, dict):
+                engine["class_scheduling"] = class_scheduling
+            else:
+                args["class_scheduling"] = class_scheduling
+        return args
 
     def _run_trace(
         self,

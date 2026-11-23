@@ -26,9 +26,11 @@ pub mod queue;
 
 pub use classifier::{
     AbortCause, ClassificationError, ClassificationOverrides, ClassifierError, ClassifyEvent,
-    ClassifyRequest, DispatchDecision, DispatchGate, DispatchHead, DispatchRecheck, NoWorkers,
-    RequestClassifier, RequestClassifierContext, RequestClassifierRuntime, RequestLifecycle,
-    RequestProgress, RequestProgressUpdater, WorkerCacheView, WorkerLoadView, WorkerView,
+    ClassifyRequest, DispatchDecision, DispatchGate, DispatchHead, DispatchRecheck, HoldWake,
+    NoWorkers, RequestClassifier, RequestClassifierContext, RequestClassifierRuntime,
+    RequestLifecycle, RequestProgress, RequestProgressUpdater, SessionHolder, SessionIndexReader,
+    SessionIndexTotals, SessionResidency, SessionTier, WakeScope, WorkerCacheView, WorkerLoadView,
+    WorkerView,
 };
 pub use placement::SessionLane;
 pub use profile::{

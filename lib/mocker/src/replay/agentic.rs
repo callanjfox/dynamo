@@ -3,7 +3,9 @@
 
 use anyhow::{Context, Result, ensure};
 
-use crate::loadgen::{AgenticProfileOptions, AgenticSnapshotOptions, AgenticTrace, WorkloadDriver};
+use crate::loadgen::{
+    AgenticProfileOptions, AgenticSnapshotOptions, AgenticTrace, AgenticUsers, WorkloadDriver,
+};
 
 /// Optional AgentX phases for the existing typed workload replay API.
 #[derive(Clone, Debug)]
@@ -12,6 +14,9 @@ pub struct AgenticReplayOptions {
     pub warmup: bool,
     pub profile: Option<AgenticProfileOptions>,
     pub arrival_speedup_ratio: f64,
+    /// A closed-loop users schedule (AISimulate's `AgenticUsers`): when set, the replay runs its
+    /// users over its play templates instead of the trace's plays.
+    pub users: Option<std::path::PathBuf>,
 }
 
 impl Default for AgenticReplayOptions {
@@ -21,6 +26,7 @@ impl Default for AgenticReplayOptions {
             warmup: false,
             profile: None,
             arrival_speedup_ratio: 1.0,
+            users: None,
         }
     }
 }
@@ -65,6 +71,17 @@ impl AgenticReplayOptions {
         lanes: Option<usize>,
         max_sim_time_ms: Option<f64>,
     ) -> Result<WorkloadDriver> {
+        if let Some(schedule) = &self.users {
+            ensure!(
+                !self.has_phases() && self.arrival_speedup_ratio == 1.0,
+                "a users schedule cannot be combined with agentic phases or arrival speedup"
+            );
+            return WorkloadDriver::new_agentic_users(
+                AgenticUsers::load(schedule)?,
+                block_size,
+                include_replay_hashes,
+            );
+        }
         // Snapshot lanes independently sample the corpus and may outnumber
         // source plays; only finite replay caps lanes to the play count.
         let lanes = if self.snapshot.is_some() {

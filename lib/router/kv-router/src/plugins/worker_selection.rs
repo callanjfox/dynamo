@@ -26,7 +26,7 @@ pub use dynamo_worker_selection::{
 pub use dynamo_worker_selection::{DefaultPick, DefaultWorkerPicker};
 
 pub use super::registry::{
-    WorkerSelectionPolicyParameters, WorkerSelectionPolicyProvider,
+    DefaultPolicyWithScorers, WorkerSelectionPolicyParameters, WorkerSelectionPolicyProvider,
     WorkerSelectionPolicyProviderError, WorkerSelectionPolicyRegistryError,
 };
 pub(crate) use config::RawWorkerSelectionConfig;

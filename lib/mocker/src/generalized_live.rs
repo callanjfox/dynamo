@@ -806,6 +806,7 @@ mod tests {
             session_id: None,
             images: Vec::new(),
             kv_hint: None,
+            policy_class: None,
         }
     }
 
@@ -1948,6 +1949,7 @@ mod tests {
             session_id: None,
             images: Vec::new(),
             kv_hint: None,
+            policy_class: None,
         };
 
         // One pass stores both prompts; the FIFO D2H lane finishes the copies

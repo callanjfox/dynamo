@@ -34,6 +34,7 @@ members = [
     "lib/global-view-receiver",
     "lib/router-plugins/catalog",
     "lib/router-plugins/builtin",
+    "lib/router-plugins/session-scheduler",
     "lib/generate-format-catalog",
     "lib/generate-formats/sglang",
     "lib/generate-formats/vllm",
@@ -269,3 +270,9 @@ lto = "thin"
 inherits = "release"
 debug = true
 strip = false
+
+# Replay gate: AISimulate with PlacementPolicy::next_wakeup_ms (branch replay-gate-wakeup of
+# ai-dynamo/aisimulate at 03eadda3, the source of the pinned 0.13.0-dev.202610290000000087).
+# Clone aisimulate next to this checkout. Patch: dynamo-admission-sim dynamo-plugin/aisimulate-patches/.
+[patch.crates-io]
+aisimulate-core = { path = "../aisimulate/crates/core" }

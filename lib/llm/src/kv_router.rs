@@ -950,10 +950,16 @@ impl KvRouter {
         Ok(())
     }
 
+    /// The backend engine priority the router policy file maps `policy_class` to
+    /// (`engine_priority`, ledger L53), if any.
+    pub fn engine_priority_for(&self, policy_class: &str) -> Option<i32> {
+        self.kv_router_config.engine_priority_for(policy_class)
+    }
+
     /// Cached per-rank capacity and registration state for this router's classifier.
     pub fn request_classifier_context(&self) -> RequestClassifierContext {
         let workers = self.workers_with_configs.clone();
-        RequestClassifierContext::new(self.block_size, move || {
+        let context = RequestClassifierContext::new(self.block_size, move || {
             workers
                 .borrow()
                 .iter()
@@ -965,7 +971,16 @@ impl KvRouter {
                     })
                 })
                 .collect()
-        })
+        });
+        // Plugins read the session prefix index when the router tracks one (L47).
+        match &self.session_prefix_index {
+            Some(index) => context.with_session_index(Arc::new(
+                dynamo_kv_router::plugins::request_classifier::SessionPrefixIndexReader::new(
+                    Arc::clone(index),
+                ),
+            )),
+            None => context,
+        }
     }
 
     pub(crate) fn begin_request_lifecycle(

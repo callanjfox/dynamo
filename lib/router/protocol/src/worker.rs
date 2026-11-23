@@ -45,6 +45,19 @@ pub const DEFAULT_MAX_BATCHED_TOKENS: u64 = 10_000_000;
 pub struct WorkerCapacity {
     max_num_batched_tokens: Option<u64>,
     total_kv_blocks: Option<u64>,
+    /// The rank's running-request limit (`max_num_seqs`), set only when the busy check counts
+    /// it ([`busy_at_max_num_seqs`]).
+    max_num_seqs: Option<u64>,
+}
+
+/// Whether a worker counts as busy at its running-request limit (`max_num_seqs`) as well as by
+/// tokens: `DYN_ROUTER_BUSY_AT_MAX_NUM_SEQS=1`. Off by default. Read once.
+pub fn busy_at_max_num_seqs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("DYN_ROUTER_BUSY_AT_MAX_NUM_SEQS")
+            .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+    })
 }
 
 impl WorkerCapacity {
@@ -54,7 +67,19 @@ impl WorkerCapacity {
         Self {
             max_num_batched_tokens: max_num_batched_tokens.filter(|&value| value > 0),
             total_kv_blocks: total_kv_blocks.filter(|&value| value > 0),
+            max_num_seqs: None,
         }
+    }
+
+    /// With the rank's running-request limit; a reported zero means unreported.
+    pub fn with_max_num_seqs(mut self, max_num_seqs: Option<u64>) -> Self {
+        self.max_num_seqs = max_num_seqs.filter(|&value| value > 0);
+        self
+    }
+
+    /// The running-request limit the busy check counts, when set.
+    pub fn max_num_seqs(self) -> Option<u64> {
+        self.max_num_seqs
     }
 
     /// Prefill tokens the rank batches per engine step, when reported.

@@ -21,8 +21,32 @@ pub struct DefaultWorkerSelector {
     worker_type: &'static str,
     policy: Arc<Mutex<WorkerSelectionPolicy>>,
     rng: Option<Arc<Mutex<fastrand::Rng>>>,
+    /// Builds a host-supplied policy in place of the default (offline replay of a configured
+    /// worker-selection plugin); a clone builds its own from it.
+    build: Option<PolicyBuilder>,
 }
+
+/// Builds a worker-selection policy from the selection config.
+pub type PolicyBuilder = Arc<dyn Fn(&SelectionConfig) -> WorkerSelectionPolicy + Send + Sync>;
+
 impl DefaultWorkerSelector {
+    /// A selector that runs the policy `build` returns instead of the default: how offline
+    /// replay hosts a worker-selection plugin the host resolved. The policy owns its random
+    /// stream, if any.
+    pub fn from_builder(
+        config: Option<SelectionConfig>,
+        worker_type: &'static str,
+        build: PolicyBuilder,
+    ) -> Self {
+        let config = config.unwrap_or_default();
+        Self {
+            policy: Arc::new(Mutex::new(build(&config))),
+            kv_router_config: config,
+            worker_type,
+            rng: None,
+            build: Some(build),
+        }
+    }
     pub fn new(config: Option<SelectionConfig>, worker_type: &'static str) -> Self {
         Self::with_rng(config.unwrap_or_default(), worker_type, None)
     }
@@ -52,6 +76,7 @@ impl DefaultWorkerSelector {
             kv_router_config: config,
             worker_type,
             rng,
+            build: None,
         }
     }
     /// Handle that reads and updates this selector's runtime parameters from another owner.
@@ -68,6 +93,13 @@ impl DefaultWorkerSelector {
 /// the random stream of the original.
 impl Clone for DefaultWorkerSelector {
     fn clone(&self) -> Self {
+        if let Some(build) = &self.build {
+            return Self::from_builder(
+                Some(self.kv_router_config.clone()),
+                self.worker_type,
+                Arc::clone(build),
+            );
+        }
         Self::with_rng(
             self.kv_router_config.clone(),
             self.worker_type,
@@ -88,7 +120,8 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
         <WorkerSelectionPolicy as WorkerSelector<C>>::required_worker_inputs(&self.policy.lock())
     }
     fn uses_exclusive_affinity_target(&self) -> bool {
-        true
+        // The default composes with exclusive affinity; a hosted plugin says for itself.
+        self.build.is_none() || self.policy.lock().uses_exclusive_affinity_target()
     }
     fn applies_worker_filters(&self) -> bool {
         <WorkerSelectionPolicy as WorkerSelector<C>>::applies_worker_filters(&self.policy.lock())

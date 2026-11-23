@@ -7,7 +7,10 @@ mod inputs;
 mod progress;
 pub mod runtime;
 mod view;
-pub use inputs::RequestClassifierContext;
+pub use inputs::{
+    RequestClassifierContext, SessionHolder, SessionIndexReader, SessionIndexTotals,
+    SessionResidency, SessionTier,
+};
 pub use progress::{RequestProgress, RequestProgressUpdater};
 pub use runtime::{ClassificationError, RequestClassifierRuntime, RequestLifecycle};
 pub use view::{NoWorkers, WorkerCacheView, WorkerLoadView, WorkerView};
@@ -58,6 +61,15 @@ pub struct ClassificationOverrides {
     pub due_at: Option<Instant>,
     pub scheduling_cost_tokens: Option<usize>,
     pub worker_selection_target: Option<Option<WorkerAffinityTarget>>,
+    /// How long the client should wait before retrying when this request is refused at its
+    /// `due_at` (HTTP `Retry-After`). Offline replay honours it; the live queue's expiry does not
+    /// carry it yet (it answers 429 without the header).
+    pub retry_after: Option<std::time::Duration>,
+    /// An ordering key within the request's policy class, lower first: the queue orders by it in
+    /// place of the queue policy's score (after strict priority and any deadline), and it never
+    /// expires the request. Lets a classifier order requests (for example by the service its
+    /// session has received) without the expiry a `due_at` brings.
+    pub order_key: Option<f64>,
 }
 
 impl ClassifyRequest {
@@ -235,6 +247,27 @@ impl ClassifyRequest {
         self.overrides.due_at = Some(due_at);
     }
 
+    /// See [`ClassificationOverrides::retry_after`].
+    pub fn order_key(&self) -> Option<f64> {
+        self.overrides.order_key
+    }
+
+    /// Order the request within its class by `key` (lower first) instead of the queue policy's
+    /// score; it never expires the request. A non-finite key is ignored.
+    pub fn set_order_key(&mut self, key: f64) {
+        if key.is_finite() {
+            self.overrides.order_key = Some(key);
+        }
+    }
+
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
+        self.overrides.retry_after
+    }
+
+    pub fn set_retry_after(&mut self, retry_after: std::time::Duration) {
+        self.overrides.retry_after = Some(retry_after);
+    }
+
     pub fn scheduling_cost_tokens(&self) -> usize {
         self.overrides.scheduling_cost_tokens.unwrap_or_else(|| {
             QueueSnapshot::new(self.input_tokens, self.initial_cached_tokens).scheduling_cost_tokens
@@ -303,10 +336,32 @@ pub enum ClassifyEvent {
         request_id: String,
         worker: WorkerWithDpRank,
     },
+    /// The host's estimate, at selection, of the prompt tokens `worker` will not compute for
+    /// `request_id` (its cached prefix in any tier, or a planned peer transfer's). Offline replay
+    /// only, with `DYNAMO_REPLAY_PLACED_CACHE=1`; delivered just before [`Self::Sent`].
+    Placed {
+        request_id: String,
+        worker: WorkerWithDpRank,
+        cached_tokens: usize,
+    },
+    /// One engine rank's own gauges as of its last pass: running and waiting requests, KV blocks
+    /// in use and in all, and the tokens its waiting queue must reserve. Offline replay only, with
+    /// `DYNAMO_REPLAY_ENGINE_GAUGES=1`, when they change; live routers never send it.
+    EngineGauge {
+        worker: WorkerWithDpRank,
+        running_requests: u64,
+        waiting_requests: u64,
+        active_blocks: u64,
+        total_blocks: u64,
+        waiting_tokens: u64,
+    },
     Completed {
         request_id: String,
         worker: WorkerWithDpRank,
         context_tokens: Option<usize>,
+        /// Output tokens the request produced, when the host knows them (offline replay does);
+        /// with the first-token time this gives the request's mean inter-token latency.
+        output_tokens: Option<usize>,
     },
     Aborted {
         request_id: String,
@@ -448,19 +503,78 @@ pub enum DispatchDecision {
     Hold { until: Option<Instant> },
 }
 
+/// What can end a hold before its `until`, from [`DispatchGate::check_wake`]. A host that
+/// honours it (see [`DispatchRecheck::honours_keys`]) may answer a held head from its last
+/// answer instead of asking the gate again, until a key of the hold is woken.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum HoldWake {
+    /// Anything the host re-asks held heads for can change the answer: ask again every time
+    /// (what every gate gets without `check_wake`).
+    #[default]
+    Any,
+    /// Until `until`, only [`DispatchRecheck::wake_keys`] naming one of these keys, or
+    /// [`DispatchRecheck::wake_all`], can change the answer, and the gate's own upkeep does not
+    /// depend on being asked about this head. Keys are the gate's own (for example a hash of the
+    /// session the head waits behind).
+    Keys(Vec<u64>),
+}
+
+/// What [`DispatchRecheck::wake_keys`] and [`DispatchRecheck::wake_all`] hand the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeScope<'a> {
+    Keys(&'a [u64]),
+    All,
+}
+
+type KeyedWake = Arc<dyn Fn(WakeScope<'_>) + Send + Sync>;
+
 /// Wakes the router queue to ask the gate about its held heads again. Cheap to clone and to
 /// call from any thread; calls coalesce into one recheck.
 #[derive(Clone)]
-pub struct DispatchRecheck(Arc<dyn Fn() + Send + Sync>);
+pub struct DispatchRecheck {
+    wake: Arc<dyn Fn() + Send + Sync>,
+    keyed: Option<KeyedWake>,
+}
 
 impl DispatchRecheck {
     /// Wraps the wake function the host (or a test) wants `notify` to call.
     pub fn new(wake: Arc<dyn Fn() + Send + Sync>) -> Self {
-        Self(wake)
+        Self { wake, keyed: None }
+    }
+
+    /// A host that honours [`HoldWake::Keys`]: `keyed` receives the keys the gate wakes.
+    pub fn with_keys(wake: Arc<dyn Fn() + Send + Sync>, keyed: KeyedWake) -> Self {
+        Self {
+            wake,
+            keyed: Some(keyed),
+        }
     }
 
     pub fn notify(&self) {
-        (self.0)();
+        (self.wake)();
+    }
+
+    /// Whether the host may answer a keyed hold from its last answer. Without it, a gate need
+    /// not track which keys change.
+    pub fn honours_keys(&self) -> bool {
+        self.keyed.is_some()
+    }
+
+    /// Something keyed holds wait on changed: holds naming one of `keys` are asked again at the
+    /// host's next recheck. Does not itself start a recheck; [`Self::notify`] does.
+    pub fn wake_keys(&self, keys: &[u64]) {
+        if let Some(keyed) = &self.keyed
+            && !keys.is_empty()
+        {
+            keyed(WakeScope::Keys(keys));
+        }
+    }
+
+    /// Every keyed hold is asked again at the host's next recheck.
+    pub fn wake_all(&self) {
+        if let Some(keyed) = &self.keyed {
+            keyed(WakeScope::All);
+        }
     }
 }
 
@@ -486,6 +600,15 @@ impl std::fmt::Debug for DispatchRecheck {
 pub trait DispatchGate: Send + Sync + 'static {
     fn check(&self, head: &DispatchHead<'_>) -> DispatchDecision;
 
+    /// [`Self::check`] with what can end a `Hold` before its `until`. The default answers
+    /// [`HoldWake::Any`], so a host re-asks the head as it would without this method. A gate
+    /// that returns [`HoldWake::Keys`] must wake those keys (or all) through its
+    /// [`DispatchRecheck`] whenever the answer for the head could change, before the host's
+    /// next recheck.
+    fn check_wake(&self, head: &DispatchHead<'_>) -> (DispatchDecision, HoldWake) {
+        (self.check(head), HoldWake::Any)
+    }
+
     /// The host took `head` out of the queue for admission with `target`, the `Go` target
     /// after the request's hard pin, if any, replaced it.
     fn dispatched(&self, _head: &DispatchHead<'_>, _target: Option<WorkerWithDpRank>) {}
@@ -493,4 +616,19 @@ pub trait DispatchGate: Send + Sync + 'static {
     /// Handed the recheck handle once, when the gate is installed. Keep it to wake the queue
     /// when a hold's reason goes away.
     fn attach(&self, _recheck: DispatchRecheck) {}
+
+    /// Whether the host should queue every request so this gate sees it, including requests of
+    /// classes with no busy threshold (which otherwise go straight to selection). The live
+    /// router already queues every request; offline replay queued only classes with a busy
+    /// threshold. Off by default.
+    fn gates_every_class(&self) -> bool {
+        false
+    }
+
+    /// A one-line JSON object describing the gate's current view (its KV budget, live and
+    /// waiting sessions per class), for diagnostics such as offline replay's working-set log.
+    /// A read: it must not change later answers. `None` by default.
+    fn report(&self) -> Option<String> {
+        None
+    }
 }

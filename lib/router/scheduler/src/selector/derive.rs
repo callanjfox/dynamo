@@ -19,7 +19,12 @@ pub trait WorkerCapacityExt {
 
 impl WorkerCapacityExt for WorkerCapacity {
     fn of<C: WorkerConfigLike>(config: &C) -> Self {
-        Self::new(config.max_num_batched_tokens(), config.total_kv_blocks())
+        let capacity = Self::new(config.max_num_batched_tokens(), config.total_kv_blocks());
+        if dynamo_router_protocol::worker::busy_at_max_num_seqs() {
+            capacity.with_max_num_seqs(config.max_num_seqs())
+        } else {
+            capacity
+        }
     }
 }
 

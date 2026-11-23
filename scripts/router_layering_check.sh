@@ -66,6 +66,7 @@ ROUTER_FAMILY="dynamo-error dynamo-kv-hashing dynamo-router-protocol dynamo-kv-e
 # example policies; the EPP example links the catalog into the gateway binary.
 PLUGIN_TABLE=(
   "dynamo-router-policies | dynamo-kv-router"
+  "dynamo-session-scheduler | dynamo-kv-router"
   "dynamo-worker-selection-policy-catalog | dynamo-kv-router"
   "dynamo-custom-policy-example-soft-pin-repin | dynamo-kv-router"
   "dynamo-custom-policy-example-simple-filter-score-pick | dynamo-kv-router"
@@ -242,7 +243,7 @@ fi
 # carries the kernel and the stages and none of the transport crates.
 # ---------------------------------------------------------------------------
 COMPOSITION="dynamo-kv-router"
-COMPOSITION_ROUTER_DEPS="dynamo-admission dynamo-kv-events dynamo-kv-hashing dynamo-kv-hints dynamo-kv-indexer dynamo-router-protocol dynamo-scheduler dynamo-session-affinity dynamo-slot-tracker dynamo-worker-selection"
+COMPOSITION_ROUTER_DEPS="dynamo-admission dynamo-error dynamo-kv-events dynamo-kv-hashing dynamo-kv-hints dynamo-kv-indexer dynamo-router-protocol dynamo-scheduler dynamo-session-affinity dynamo-slot-tracker dynamo-worker-selection"
 in_workspace "$COMPOSITION" || die "$COMPOSITION is not a workspace package"
 tree "$COMPOSITION" "$COMPOSITION" --no-default-features >"$tmp/comp_tree.txt"
 awk -v c="$COMPOSITION" '$1 != c { print $1 }' "$tmp/comp_tree.txt" | lines >"$tmp/comp_names.txt"

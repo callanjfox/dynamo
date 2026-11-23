@@ -26,6 +26,10 @@ pub trait WorkerConfigLike {
     fn data_parallel_size(&self) -> u32;
     fn max_num_batched_tokens(&self) -> Option<u64>;
     fn total_kv_blocks(&self) -> Option<u64>;
+    /// The worker's running-request limit (`max_num_seqs`), when it reports one.
+    fn max_num_seqs(&self) -> Option<u64> {
+        None
+    }
 
     /// TRANSFER capability and source metadata for a specific global DP rank.
     ///

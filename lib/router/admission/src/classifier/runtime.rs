@@ -488,6 +488,7 @@ impl RequestLifecycle {
                     request_id,
                     worker,
                     context_tokens,
+                    output_tokens: None,
                 }
             });
     }
@@ -520,7 +521,10 @@ fn terminal_request_id(event: &ClassifyEvent) -> Option<String> {
         ClassifyEvent::Completed { request_id, .. } | ClassifyEvent::Aborted { request_id, .. } => {
             Some(request_id.clone())
         }
-        ClassifyEvent::Sent { .. } | ClassifyEvent::Responding { .. } => None,
+        ClassifyEvent::Sent { .. }
+        | ClassifyEvent::Responding { .. }
+        | ClassifyEvent::Placed { .. }
+        | ClassifyEvent::EngineGauge { .. } => None,
     }
 }
 
@@ -965,11 +969,14 @@ mod tests {
                     request_id,
                     worker,
                     context_tokens,
+                    ..
                 } => Some(RecordedEvent::Completed(request_id, worker, context_tokens)),
                 ClassifyEvent::Aborted {
                     request_id, worker, ..
                 } => Some(RecordedEvent::Aborted(request_id, worker)),
-                ClassifyEvent::Responding { .. } => None,
+                ClassifyEvent::Responding { .. }
+                | ClassifyEvent::Placed { .. }
+                | ClassifyEvent::EngineGauge { .. } => None,
             };
             if let Some(event) = event {
                 let _ = self.events.send(event);
@@ -1105,7 +1112,9 @@ mod tests {
                 ClassifyEvent::Aborted { request_id, .. } => {
                     let _ = self.observed.send(format!("aborted:{request_id}"));
                 }
-                ClassifyEvent::Responding { .. } => {}
+                ClassifyEvent::Responding { .. }
+                | ClassifyEvent::Placed { .. }
+                | ClassifyEvent::EngineGauge { .. } => {}
             }
         }
     }

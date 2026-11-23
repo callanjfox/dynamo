@@ -1404,6 +1404,7 @@ impl<
             arrival_offset_secs: ingress_at
                 .saturating_duration_since(self.start_time)
                 .as_secs_f64(),
+            order_key: None,
         }
     }
 
@@ -1418,6 +1419,9 @@ impl<
             due_at,
             scheduling_cost_tokens,
             worker_selection_target,
+            // Not carried to the live queue's expiry yet; offline replay honours it.
+            retry_after: _,
+            order_key,
         } = classified_request.into_queue_inputs();
 
         if scheduling_cost_tokens == Some(0) {
@@ -1459,6 +1463,7 @@ impl<
             metadata.snapshot.scheduling_cost_tokens = cost;
         }
         metadata.due_at = due_at;
+        metadata.order_key = order_key.filter(|k| k.is_finite());
         Ok(metadata)
     }
 
@@ -1864,7 +1869,7 @@ impl<
                     Self::all_eligible_workers_full(
                         &self.slots.worker_load_reader(decay_now),
                         &configs,
-                        class.busy_thresholds,
+                        class.busy_thresholds.for_class(&class.name),
                         request
                             .eligibility()
                             .with_available_workers(available.as_deref()),
@@ -2169,7 +2174,7 @@ impl<
             LaneCheck::from(!Self::all_eligible_workers_full(
                 &slots.worker_load_reader(decay_now),
                 &configs,
-                class.busy_thresholds,
+                class.busy_thresholds.for_class(&class.name),
                 queued
                     .request
                     .eligibility()
@@ -2279,7 +2284,7 @@ impl<
                     LaneCheck::from(!Self::all_eligible_workers_full(
                         &slots.worker_load_reader(decay_now),
                         &configs,
-                        class.busy_thresholds,
+                        class.busy_thresholds.for_class(&class.name),
                         queued
                             .request
                             .eligibility()
@@ -3057,6 +3062,7 @@ mod tests {
             request_queue_limit_per_worker: None,
             raw_isl_token_queue_limit_per_worker: None,
             cached_token_queue_limit_per_worker: None,
+            active_requests_per_worker: None,
         }
     }
 

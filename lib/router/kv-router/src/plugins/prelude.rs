@@ -11,11 +11,11 @@
 
 // Worker-selection contracts and the candidate rows they read.
 pub use crate::plugins::worker_selection::{
-    HostedSelectionRequest, HostedWorkerPicker, RuntimePolicyBuilder, RuntimePolicyConfig,
-    RuntimePolicyError, RuntimePolicyUpdate, ScoredWorkerCandidate, SelectionConfig,
-    SelectionFailure, WorkerCacheInput, WorkerCacheInputs, WorkerCandidate, WorkerCandidates,
-    WorkerCapacity, WorkerFilter, WorkerInfo, WorkerInputView, WorkerInputs, WorkerLoadInput,
-    WorkerPicker, WorkerScorer, WorkerSelectionConfig, WorkerSelectionContext,
+    DefaultPolicyWithScorers, HostedSelectionRequest, HostedWorkerPicker, RuntimePolicyBuilder,
+    RuntimePolicyConfig, RuntimePolicyError, RuntimePolicyUpdate, ScoredWorkerCandidate,
+    SelectionConfig, SelectionFailure, WorkerCacheInput, WorkerCacheInputs, WorkerCandidate,
+    WorkerCandidates, WorkerCapacity, WorkerFilter, WorkerInfo, WorkerInputView, WorkerInputs,
+    WorkerLoadInput, WorkerPicker, WorkerScorer, WorkerSelectionConfig, WorkerSelectionContext,
     WorkerSelectionInstance, WorkerSelectionPolicy, WorkerSelectionPolicyError,
     WorkerSelectionPolicyFactory, WorkerSelectionPolicySelection, WorkerTransferInput,
 };
@@ -23,9 +23,10 @@ pub use crate::plugins::worker_selection::{
 // Request-classifier contracts and the request they classify.
 pub use crate::plugins::request_classifier::{
     AbortCause, ClassifierError, ClassifyEvent, ClassifyRequest, DispatchDecision, DispatchGate,
-    DispatchHead, DispatchRecheck, NoWorkers, RequestClassifier, RequestClassifierContext,
-    RequestClassifierFactory, RequestClassifierParameters, RequestClassifierProvider,
-    RequestClassifierProviderError, RequestClassifierRegistryError, RequestProgress, WorkerView,
+    DispatchHead, DispatchRecheck, HoldWake, NoWorkers, RequestClassifier,
+    RequestClassifierContext, RequestClassifierFactory, RequestClassifierParameters,
+    RequestClassifierProvider, RequestClassifierProviderError, RequestClassifierRegistryError,
+    RequestProgress, WorkerView,
 };
 
 // Registration and the configuration the registry resolves plugins from.
@@ -38,6 +39,11 @@ pub use crate::plugins::{
 
 // Wire vocabulary the signal views carry.
 pub use dynamo_kv_hashing::ExternalSequenceBlockHash;
+// The busy check's load view, so a plugin judges load as the router's busy thresholds do.
+pub use dynamo_slot_tracker::busy::RankLoad;
+// Typed refusals a classifier returns; the frontend passes them to the client with their status
+// (a RateLimited one is HTTP 429, with Retry-After from its details).
+pub use dynamo_error::{DynamoError, ErrorClass, ErrorReason, PublicDetails};
 pub use dynamo_kv_hints::{
     KvHintTransferWorkerMetadata, KvTransferEnforcement, WorkerKvTransferKeys,
     WorkerKvTransferKeysCache,

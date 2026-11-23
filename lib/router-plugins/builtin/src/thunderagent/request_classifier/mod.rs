@@ -407,6 +407,7 @@ mod tests {
                 request_id: "a1".into(),
                 worker: WorkerWithDpRank::new(1, 0),
                 context_tokens: Some(50),
+                output_tokens: None,
             })
             .await;
         assert!(wakes.load(Ordering::Relaxed) > before);

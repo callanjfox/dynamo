@@ -1143,6 +1143,7 @@ mod tests {
                 request_id: request_id.into(),
                 worker,
                 context_tokens: Some(tokens),
+                output_tokens: None,
             },
             caps,
             now,

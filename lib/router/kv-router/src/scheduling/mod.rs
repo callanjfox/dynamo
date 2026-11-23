@@ -28,6 +28,9 @@ mod policy_queue_tests;
 mod queue_yaml_tests;
 
 pub use policy_config::{
-    BusyRanksExt, BusyThresholds, BusyThresholdsExt, PolicyClassConfig, PolicyProfile,
-    RejectThresholdsProvider, RouterPolicyConfig, RouterPolicyConfigError,
+    BusyRanksExt, BusyThresholds, BusyThresholdsExt, KvActionsConfig, KvDemoteConfig,
+    KvDequeueConfig, KvEngineFitConfig, KvInvalidateMode, KvPrefetchConfig,
+    KvPrefillIsolationConfig, KvReplicateConfig, KvRetainConfig, KvRetainGuardConfig,
+    KvRetainValueConfig, PolicyClassConfig, PolicyProfile, PrefillIsolationWorkers,
+    RejectThresholdsProvider, RetainValueModel, RouterPolicyConfig, RouterPolicyConfigError,
 };

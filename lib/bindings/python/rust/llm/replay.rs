@@ -339,6 +339,7 @@ pub fn run_mocker_trace_replay(
         warmup: agentic_warmup,
         profile: agentic_profile.map(pythonize::depythonize).transpose()?,
         arrival_speedup_ratio,
+        users: std::env::var_os(REPLAY_USERS_ENV).map(std::path::PathBuf::from),
     };
     agentic_options
         .validate(
@@ -448,6 +449,9 @@ pub fn run_mocker_trace_replay(
         telemetry_jsonl_path.as_deref(),
         telemetry_callback_error.clone(),
     )?;
+    // Resolved before `run` takes the router config.
+    let (request_classifier, request_fields, worker_selection) =
+        replay_gate_inputs(router_config.as_ref())?;
     let run = move |mut scaling_policy: Option<Box<dyn ReplayScalingPolicy>>,
                     mut telemetry: Option<ReplayTelemetryOptions>| {
         let replay_concurrency = parse_replay_concurrency(replay_concurrency)?;
@@ -651,6 +655,10 @@ pub fn run_mocker_trace_replay(
         } else {
             ReplayDeterminism::Random
         },
+        request_classifier,
+        request_fields,
+        worker_selection,
+        gate_recheck: None,
     };
     let report_result = if let Some(callback) = scaling_policy {
         let router_controls = ReplayRouterControls::new();
@@ -1040,6 +1048,9 @@ pub fn run_mocker_synthetic_trace_replay(
         telemetry_jsonl_path.as_deref(),
         telemetry_callback_error.clone(),
     )?;
+    // Resolved before `run` takes the router config.
+    let (request_classifier, request_fields, worker_selection) =
+        replay_gate_inputs(router_config.as_ref())?;
     let run = move |mut scaling_policy: Option<Box<dyn ReplayScalingPolicy>>,
                     mut telemetry: Option<ReplayTelemetryOptions>| {
         let load_controller =
@@ -1281,6 +1292,9 @@ pub fn run_mocker_synthetic_trace_replay(
     };
     let scope = ReplayScope {
         kv_event_lag_ms,
+        request_classifier,
+        request_fields,
+        worker_selection,
         ..Default::default()
     };
     let report_result = if let Some(callback) = scaling_policy {
@@ -2344,4 +2358,48 @@ impl ReplayScalingPolicy for PyReplayScalingPolicy {
         }
         result.map_err(anyhow::Error::new)
     }
+}
+
+/// Environment variable naming a JSON Lines file of per-request fields (session end, parent
+/// session, policy class, agent headers) for offline replay; see the mocker's
+/// `ReplayRequestFields`. Written by the trace exporter.
+const REPLAY_REQUEST_FIELDS_ENV: &str = "DYNAMO_REPLAY_REQUEST_FIELDS";
+
+/// Environment variable naming a closed-loop users schedule (`schedule.json` from the
+/// simulator's `scripts/users_export.py`); an agentic replay then runs those users over the
+/// schedule's play templates instead of the trace file's plays.
+const REPLAY_USERS_ENV: &str = "DYNAMO_REPLAY_USERS";
+
+type ReplayGateInputs = (
+    Option<dynamo_mocker::replay::ReplayClassifierPlugin>,
+    Option<Arc<dynamo_mocker::replay::ReplayRequestAnnotations>>,
+    Option<dynamo_mocker::replay::ReplayWorkerSelectionPlugin>,
+);
+
+/// The replay gate's inputs: the request classifier the router config's `request_classifier`
+/// resolves to through this build's plugin catalog, and the per-request fields file.
+fn replay_gate_inputs(
+    router_config: Option<&dynamo_kv_router::config::KvRouterConfig>,
+) -> PyResult<ReplayGateInputs> {
+    let plugins = match router_config {
+        Some(config) => Some(crate::router_plugins(config).map_err(to_pyerr)?),
+        None => None,
+    };
+    let classifier = plugins
+        .as_ref()
+        .and_then(|p| p.request_classifier().cloned())
+        .map(dynamo_mocker::replay::ReplayClassifierPlugin);
+    // Only an explicitly configured worker-selection instance replaces replay's own default.
+    let worker_selection = plugins
+        .as_ref()
+        .filter(|p| p.has_custom_worker_selection())
+        .and_then(|p| p.worker_selection().cloned())
+        .map(dynamo_mocker::replay::ReplayWorkerSelectionPlugin);
+    let fields = match std::env::var_os(REPLAY_REQUEST_FIELDS_ENV) {
+        Some(path) => Some(Arc::new(
+            dynamo_mocker::replay::load_request_annotations(Path::new(&path)).map_err(to_pyerr)?,
+        )),
+        None => None,
+    };
+    Ok((classifier, fields, worker_selection))
 }

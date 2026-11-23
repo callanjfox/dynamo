@@ -10,6 +10,7 @@
 //! Plugins import [`prelude`]; [`worker_selection`] and [`request_classifier`] are the
 //! per-contract modules behind it.
 
+pub mod adaptive_switches;
 pub mod prelude;
 mod registry;
 pub mod request_classifier;

@@ -67,8 +67,11 @@ fn validate_agentic_host_offload(
 
     // These entrypoints are offline. Apply the AgentX G2 deployment contract
     // to every active role, including a P/D role whose own G2 is disabled.
+    // DYN_REPLAY_ALLOW_AGENTIC_G2_WORKERS=1 lifts the one-worker rule for an
+    // experiment outside AISimulate's qualified envelope (KVCR needs peers).
     anyhow::ensure!(
-        roles.iter().all(|(workers, _)| *workers == 1),
+        roles.iter().all(|(workers, _)| *workers == 1)
+            || std::env::var("DYN_REPLAY_ALLOW_AGENTIC_G2_WORKERS").as_deref() == Ok("1"),
         "agentic host offload requires one aggregated worker or one prefill and one decode worker"
     );
     anyhow::ensure!(
