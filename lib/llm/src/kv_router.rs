@@ -592,6 +592,9 @@ fn map_scheduler_error(error: dynamo_scheduler::host::KvSchedulerError) -> anyho
     // retried elsewhere; a pool with no free worker cannot, and migrating it
     // would just bounce the request around. A filter rejection is unavailable,
     // not overload, and becomes HTTP 503.
+    if let dynamo_scheduler::host::KvSchedulerError::WaitLimitRetryAfter { retry_after } = error {
+        return wait_limit_refusal(retry_after);
+    }
     let unknown_policy_class = matches!(
         error,
         dynamo_scheduler::host::KvSchedulerError::UnknownPolicyClass(_)
@@ -638,6 +641,29 @@ fn map_scheduler_error(error: dynamo_scheduler::host::KvSchedulerError) -> anyho
     } else {
         error.build().into()
     }
+}
+
+/// A queued request reached its request classifier's wait limit: HTTP 429 with the classifier's
+/// Retry-After (`details.retry_after_s`, which the HTTP service also sends as the `Retry-After`
+/// header), the same refusal a classifier gives at classification. Never migrated.
+fn wait_limit_refusal(retry_after: std::time::Duration) -> anyhow::Error {
+    let seconds = retry_after.as_secs_f64().ceil() as u64;
+    let error = DynamoError::builder()
+        .error_type(ErrorType::RateLimited)
+        .reason(
+            dynamo_runtime::error::ErrorReason::new("request.rate_limited")
+                .expect("registered rate limit reason"),
+        )
+        .message(format!(
+            "request waited past its admission limit; retry after {seconds} s"
+        ))
+        .public_details(dynamo_runtime::error::PublicDetails::RateLimit {
+            limit: None,
+            remaining: Some(0),
+            retry_after_s: Some(seconds),
+        })
+        .build();
+    crate::migration::ClassifierRejection(error).into()
 }
 
 fn cancelled_error(context_id: &str) -> anyhow::Error {
@@ -2133,6 +2159,28 @@ mod tests {
         assert_eq!(decoded.reason().as_str(), "router.queue_deadline_exceeded");
         assert!(crate::http::service::metrics::request_deadline_exceeded(
             &decoded
+        ));
+    }
+
+    /// A wait-limit expiry is a typed rate-limit refusal with its Retry-After, never migrated.
+    #[test]
+    fn wait_limit_expiry_is_a_rate_limit_with_retry_after() {
+        let error = map_scheduler_error(KvSchedulerError::WaitLimitRetryAfter {
+            retry_after: std::time::Duration::from_millis(12_300),
+        });
+        assert!(!crate::migration::is_migratable(error.as_ref()));
+        let typed = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<DynamoError>())
+            .expect("a typed error in the chain");
+        assert_eq!(typed.class(), ErrorType::RateLimited);
+        assert_eq!(typed.reason().as_str(), "request.rate_limited");
+        assert!(matches!(
+            typed.public_details(),
+            Some(dynamo_runtime::error::PublicDetails::RateLimit {
+                retry_after_s: Some(13),
+                ..
+            })
         ));
     }
 

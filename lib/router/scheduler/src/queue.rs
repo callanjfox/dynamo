@@ -1419,7 +1419,8 @@ impl<
             due_at,
             scheduling_cost_tokens,
             worker_selection_target,
-            // Not carried to the live queue's expiry yet; offline replay honours it.
+            // Not queue state: `LocalScheduler` turns this request's expiry into
+            // `KvSchedulerError::WaitLimitRetryAfter` with it; offline replay honours it itself.
             retry_after: _,
             order_key,
         } = classified_request.into_queue_inputs();

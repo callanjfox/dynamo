@@ -81,7 +81,8 @@ fn scheduler_error_status(error: &KvSchedulerError) -> StatusCode {
         KvSchedulerError::AllEligibleWorkersOverloaded
         | KvSchedulerError::PinnedWorkerOverloaded { .. }
         | KvSchedulerError::QueueRejected(_)
-        | KvSchedulerError::DeadlineExceeded => StatusCode::TOO_MANY_REQUESTS,
+        | KvSchedulerError::DeadlineExceeded
+        | KvSchedulerError::WaitLimitRetryAfter { .. } => StatusCode::TOO_MANY_REQUESTS,
         KvSchedulerError::PinnedWorkerNotAllowed { .. }
         | KvSchedulerError::UnknownPolicyClass(_) => StatusCode::BAD_REQUEST,
         // A duplicate live request id, or a lifecycle the caller ended (or

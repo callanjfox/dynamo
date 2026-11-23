@@ -154,6 +154,12 @@ pub enum KvSchedulerError {
     #[error("request deadline exceeded")]
     DeadlineExceeded,
 
+    /// A queued request reached the deadline its request classifier set and the classifier
+    /// named a Retry-After for it (`ClassificationOverrides::retry_after`): the client is told
+    /// to come back later (HTTP 429 with `Retry-After`) rather than that the request timed out.
+    #[error("request waited past its admission limit; retry after {} s", retry_after.as_secs_f64().ceil())]
+    WaitLimitRetryAfter { retry_after: std::time::Duration },
+
     #[error(transparent)]
     WorkerSelectionPolicy(#[from] WorkerSelectionPolicyError),
 }

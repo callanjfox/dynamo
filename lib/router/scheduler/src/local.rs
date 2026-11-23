@@ -391,6 +391,12 @@ where
         let tracked = request.mode.is_tracked();
         let request_id = request.mode.request_id().map(str::to_owned);
         let classified_request = self.classify_request(&mut request, ingress_at).await?;
+        // The classifier's Retry-After for this request, if it named one. The queue expires a
+        // request at its classifier deadline as `DeadlineExceeded`; with a Retry-After that
+        // expiry is the classifier's wait limit, and the client is told when to come back.
+        let retry_after = classified_request
+            .as_ref()
+            .and_then(ClassifyRequest::retry_after);
         let lifecycle_lease = self
             .queue
             .new_request_lifecycle_lease(request.mode.lifecycle_request_id());
@@ -409,7 +415,8 @@ where
 
         let response = resp_rx
             .await
-            .map_err(|_| KvSchedulerError::SubscriberShutdown)??;
+            .map_err(|_| KvSchedulerError::SubscriberShutdown)?
+            .map_err(|error| with_wait_limit_retry_after(error, retry_after))?;
         log_selection(request_id.as_deref(), &response);
         let attempt = if tracked {
             AdmissionAttempt::Tracked(
@@ -971,6 +978,21 @@ where
 
     pub fn get_active_lora_counts(&self) -> HashMap<String, usize> {
         self.slots.get_active_lora_counts()
+    }
+}
+
+/// A queue expiry of a request whose classifier named a Retry-After is the classifier's wait
+/// limit: [`KvSchedulerError::WaitLimitRetryAfter`]. Every other error, and an expiry without a
+/// Retry-After, is unchanged.
+fn with_wait_limit_retry_after(
+    error: KvSchedulerError,
+    retry_after: Option<Duration>,
+) -> KvSchedulerError {
+    match (error, retry_after) {
+        (KvSchedulerError::DeadlineExceeded, Some(retry_after)) => {
+            KvSchedulerError::WaitLimitRetryAfter { retry_after }
+        }
+        (error, _) => error,
     }
 }
 
@@ -1841,6 +1863,68 @@ mod tests {
             0
         );
         cancel_token.cancel();
+    }
+
+    /// A classifier deadline with a Retry-After expires as a wait limit that carries it.
+    #[tokio::test(start_paused = true)]
+    async fn classifier_deadline_with_retry_after_expires_as_wait_limit() {
+        struct WaitLimitClassifier(Instant);
+        impl RequestClassifier for WaitLimitClassifier {
+            fn classify(
+                &mut self,
+                mut request: ClassifyRequest,
+                _workers: &dyn WorkerView,
+            ) -> Result<ClassifyRequest, Box<ClassifierError>> {
+                request.set_due_at(self.0 + Duration::from_secs(1));
+                request.set_retry_after(Duration::from_secs(42));
+                Ok(request)
+            }
+        }
+
+        let workers = HashMap::from([(0, SimpleWorkerConfig::default())]);
+        let (scheduler, _slots, _cfg_tx, cancel_token) = make_scheduler(workers, None, true, None);
+        let ingress_at = Instant::now();
+        assert!(scheduler.install_request_classifier(
+            Box::new(WaitLimitClassifier(ingress_at)),
+            cancel_token.clone(),
+        ));
+        let _lifecycle = scheduler
+            .begin_request_lifecycle("expired")
+            .unwrap()
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(2)).await;
+
+        let result = scheduler
+            .schedule_request_with_booking_and_context(
+                request(ScheduleMode::TrackedWithLifecycle {
+                    request_id: "expired".to_string(),
+                }),
+                ingress_at,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(KvSchedulerError::WaitLimitRetryAfter { retry_after })
+                if retry_after == Duration::from_secs(42)
+        ));
+        cancel_token.cancel();
+    }
+
+    #[test]
+    fn only_a_deadline_expiry_with_a_retry_after_becomes_a_wait_limit() {
+        let ra = Some(Duration::from_secs(7));
+        assert!(matches!(
+            with_wait_limit_retry_after(KvSchedulerError::DeadlineExceeded, None),
+            KvSchedulerError::DeadlineExceeded
+        ));
+        assert!(matches!(
+            with_wait_limit_retry_after(KvSchedulerError::NoEndpoints, ra),
+            KvSchedulerError::NoEndpoints
+        ));
+        assert!(matches!(
+            with_wait_limit_retry_after(KvSchedulerError::DeadlineExceeded, ra),
+            KvSchedulerError::WaitLimitRetryAfter { retry_after } if retry_after == Duration::from_secs(7)
+        ));
     }
 
     #[tokio::test]
