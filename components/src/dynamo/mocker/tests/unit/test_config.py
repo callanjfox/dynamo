@@ -395,6 +395,81 @@ def test_mocker_cli_maps_native_host_offload_flags():
     assert engine_args["native_host_offload"]["num_host_blocks"] == 128
     assert engine_args["native_host_offload"]["d2h_bandwidth_gbps"] == 12.5
     assert engine_args["native_host_offload"]["h2d_bandwidth_gbps"] == 0.0
+    assert "latency_to_first_byte_ms" not in engine_args["native_host_offload"]
+    assert "vllm_recency" not in engine_args["native_host_offload"]
+
+
+def test_mocker_cli_maps_host_offload_latency_and_recency():
+    args = parse_args(
+        [
+            "--kv-bytes-per-token",
+            "1024",
+            "--num-host-blocks",
+            "128",
+            "--host-offload-latency-ms",
+            "5",
+            "--host-offload-vllm-recency",
+        ]
+    )
+
+    offload = CONFIG.build_mocker_engine_args(args)["engine"]["native_host_offload"]
+
+    assert offload["latency_to_first_byte_ms"] == 5.0
+    assert offload["vllm_recency"] is True
+
+
+def test_class_scheduling_and_engine_priority_are_off_by_default():
+    config = CONFIG.load_mocker_engine_args(parse_args([]))
+
+    assert config["engine"].get("class_scheduling") is None
+    assert config["dynamo"].get("engine_priority") is None
+
+
+def test_class_scheduling_flags_apply_over_extra_engine_args(tmp_path):
+    base = tmp_path / "engine.json"
+    base.write_text(json.dumps({"engine": {"max_num_seqs": 32}}))
+    classes = tmp_path / "classes.json"
+    classes.write_text(
+        json.dumps(
+            {
+                "order": ["priority", "standard", "batch"],
+                "preempt_max_rank": 0,
+                "itl_target_ms": [50, 100, None],
+            }
+        )
+    )
+    args = parse_args(
+        [
+            "--extra-engine-args",
+            str(base),
+            "--class-scheduling",
+            f"@{classes}",
+            "--engine-priority",
+            '{"priority": 2, "standard": 1, "batch": 0}',
+        ]
+    )
+
+    config = CONFIG.load_mocker_engine_args(args)
+
+    assert config["engine"]["max_num_seqs"] == 32
+    assert config["engine"]["class_scheduling"]["order"] == [
+        "priority",
+        "standard",
+        "batch",
+    ]
+    assert config["engine"]["class_scheduling"]["preempt_max_rank"] == 0
+    assert config["dynamo"]["engine_priority"] == {
+        "priority": 2,
+        "standard": 1,
+        "batch": 0,
+    }
+
+
+def test_engine_priority_rejects_shared_priorities():
+    args = parse_args(["--engine-priority", '{"priority": 1, "standard": 1}'])
+
+    with pytest.raises(Exception, match="own priority"):
+        CONFIG.load_mocker_engine_args(args)
 
 
 @pytest.mark.asyncio

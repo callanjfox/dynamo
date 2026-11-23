@@ -46,6 +46,14 @@ def _build_native_host_offload(args: argparse.Namespace) -> dict | None:
                 "h2d_bandwidth_gbps",
                 getattr(args, "host_offload_h2d_bandwidth_gbps", None),
             ),
+            (
+                "latency_to_first_byte_ms",
+                getattr(args, "host_offload_latency_ms", None),
+            ),
+            (
+                "vllm_recency",
+                getattr(args, "host_offload_vllm_recency", None) or None,
+            ),
         )
         if value is not None
     }
@@ -182,11 +190,51 @@ def build_mocker_engine_args(args: argparse.Namespace) -> dict:
     return normalize_mocker_config({**config, "engine": rank, "dynamo": runtime})
 
 
+def _json_flag(value: str | None, flag: str) -> Any:
+    """A flag's JSON value, inline or `@path` to a JSON file; None when unset."""
+    if value is None:
+        return None
+    text = value
+    if value.startswith("@"):
+        with open(value[1:], encoding="utf-8") as f:
+            text = f.read()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{flag} is not valid JSON: {error}") from error
+
+
+def apply_class_scheduling_args(config: Mapping[str, Any], args: argparse.Namespace) -> dict:
+    """Engine class scheduling (`--class-scheduling`) and the router's class priorities
+    (`--engine-priority`) on a mocker config, over what the config sets. Both unset: unchanged.
+
+    `--class-scheduling` is AISimulate's `ClassSchedulingConfig` (`order`, `preempt_max_rank`,
+    `itl_target_ms`, `protect_max_rank`, `yield_decodes`). `--engine-priority` is the router policy
+    file's `engine_priority` map (class name to priority): the router writes a request's class
+    priority into `routing.priority` and the mocker maps it back to the class the engine ranks.
+    """
+    class_scheduling = _json_flag(
+        getattr(args, "class_scheduling", None), "--class-scheduling"
+    )
+    engine_priority = _json_flag(
+        getattr(args, "engine_priority", None), "--engine-priority"
+    )
+    if class_scheduling is None and engine_priority is None:
+        return dict(config)
+    config = copy.deepcopy(dict(config))
+    if class_scheduling is not None:
+        config["engine"]["class_scheduling"] = class_scheduling
+    if engine_priority is not None:
+        config.setdefault("dynamo", {})["engine_priority"] = engine_priority
+    return normalize_mocker_config(config)
+
+
 def load_mocker_engine_args(args: argparse.Namespace) -> dict:
     if args.extra_engine_args:
         config = normalize_mocker_config(args.extra_engine_args.read_text())
     else:
         config = build_mocker_engine_args(args)
+    config = apply_class_scheduling_args(config, args)
     validate_systemone_serial_config(args, config)
     return config
 

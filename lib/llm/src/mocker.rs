@@ -374,6 +374,17 @@ impl MockerExecutionContext {
         }
     }
 
+    /// The request's policy class for the engine's class scheduling: the class whose
+    /// `engine_priority` the router wrote into `routing.priority`. `None` without that map or
+    /// without a mapped priority, as before.
+    fn policy_class_of(&self, request: &PreprocessedRequest) -> Option<String> {
+        let priority = request.routing.as_ref()?.priority?;
+        self.engine_args
+            .runtime
+            .policy_class_for_priority(priority)
+            .map(str::to_owned)
+    }
+
     fn resolve_dp_rank(&self, request: &PreprocessedRequest) -> u32 {
         if let Some(dp_rank) = request.routing.as_ref().and_then(|routing| routing.dp_rank) {
             return dp_rank;
@@ -979,8 +990,17 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
                     session_id: Some(id.to_owned()),
                     ..Default::default()
                 }),
+            policy_class: self.policy_class_of(&request),
             ..Default::default()
         };
+
+        if let Some(class) = direct_request.policy_class.as_deref() {
+            tracing::trace!(
+                policy_class = class,
+                prompt_tokens = prompt_tokens_count,
+                "mocker request carries an engine class"
+            );
+        }
 
         let (stream_tx, stream_rx) = mpsc::unbounded_channel::<LLMEngineOutput>();
 
@@ -1572,6 +1592,41 @@ mod tests {
         });
 
         request
+    }
+
+    /// The router's `routing.priority` reaches the engine as its policy class through the
+    /// mocker's `engine_priority` map; without the map or a mapped priority there is none.
+    #[test]
+    fn routed_priority_maps_to_the_engine_policy_class() {
+        use crate::protocols::common::preprocessor::RoutingHints;
+
+        let mapped = MockerExecutionContext::new(
+            MockerConfig::from_value(serde_json::json!({
+                "dynamo": {"engine_priority": {"priority": 2, "standard": 1, "batch": 0}}
+            }))
+            .unwrap(),
+        );
+        let plain = dp_rank_engine(EngineType::Vllm, WorkerType::Aggregated, 1);
+        let with_priority = |priority: Option<i32>| {
+            let mut request = prefill_request();
+            request.routing = Some(RoutingHints {
+                priority,
+                ..Default::default()
+            });
+            request
+        };
+        assert_eq!(
+            mapped.policy_class_of(&with_priority(Some(2))).as_deref(),
+            Some("priority")
+        );
+        assert_eq!(
+            mapped.policy_class_of(&with_priority(Some(0))).as_deref(),
+            Some("batch")
+        );
+        assert_eq!(mapped.policy_class_of(&with_priority(Some(7))), None);
+        assert_eq!(mapped.policy_class_of(&with_priority(None)), None);
+        assert_eq!(mapped.policy_class_of(&prefill_request()), None);
+        assert_eq!(plain.policy_class_of(&with_priority(Some(2))), None);
     }
 
     #[test]

@@ -630,6 +630,39 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "(AISimulate default when unset; 0 is unlimited). Requires --num-host-blocks.",
         )
     parser.add_argument(
+        "--host-offload-latency-ms",
+        type=float,
+        default=None,
+        help="Per-transfer latency to first byte of the native G2 tier in ms "
+        "(AISimulate default 0 when unset). Requires --num-host-blocks.",
+    )
+    parser.add_argument(
+        "--host-offload-vllm-recency",
+        action="store_true",
+        default=False,
+        help="Rank G2 blocks as vLLM's CPU offloading LRU does (at admission; pins and "
+        "completions never re-rank). Off by default. Requires --num-host-blocks.",
+    )
+    parser.add_argument(
+        "--class-scheduling",
+        type=str,
+        default=None,
+        help="Class-aware engine scheduling, as JSON or @file: AISimulate's "
+        'ClassSchedulingConfig, for example {"order": ["priority", "standard", "batch"], '
+        '"preempt_max_rank": 0, "itl_target_ms": [50, 100, null]}. Off when unset. '
+        "Applies over --extra-engine-args too. Live requests get their class through "
+        "--engine-priority.",
+    )
+    parser.add_argument(
+        "--engine-priority",
+        type=str,
+        default=None,
+        help="Class name to engine priority, as JSON or @file: the router policy file's "
+        'engine_priority map, for example {"priority": 2, "standard": 1, "batch": 0}. The '
+        "router writes a request's class priority into routing.priority; the mocker maps it "
+        "back to the class --class-scheduling ranks. Off when unset.",
+    )
+    parser.add_argument(
         "--stagger-delay",
         type=float,
         default=0.0,

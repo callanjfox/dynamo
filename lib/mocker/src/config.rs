@@ -28,6 +28,11 @@ pub struct MockerRuntimeOptions {
     pub zmq_kv_events_port: Option<u16>,
     pub zmq_replay_port: Option<u16>,
     pub router_queue_policy: Option<RouterQueuePolicy>,
+    /// Policy class by engine priority, the inverse of the router policy file's
+    /// `engine_priority` map (class name to priority). The router writes a class's priority into
+    /// a routed request's `routing.priority`; the live mocker maps it back to the class, which
+    /// `engine.class_scheduling` ranks. Unset (the default): live requests carry no class.
+    pub engine_priority: Option<std::collections::BTreeMap<String, i32>>,
 }
 
 impl Default for MockerRuntimeOptions {
@@ -41,7 +46,19 @@ impl Default for MockerRuntimeOptions {
             zmq_kv_events_port: None,
             zmq_replay_port: None,
             router_queue_policy: None,
+            engine_priority: None,
         }
+    }
+}
+
+impl MockerRuntimeOptions {
+    /// The policy class whose `engine_priority` is `priority`, if one has it.
+    pub fn policy_class_for_priority(&self, priority: i32) -> Option<&str> {
+        self.engine_priority
+            .as_ref()?
+            .iter()
+            .find(|(_, value)| **value == priority)
+            .map(|(class, _)| class.as_str())
     }
 }
 
@@ -140,6 +157,13 @@ impl MockerConfig {
         );
         if let Some(reasoning) = &self.runtime.reasoning {
             reasoning.validate()?;
+        }
+        if let Some(priorities) = &self.runtime.engine_priority {
+            let distinct: std::collections::BTreeSet<i32> = priorities.values().copied().collect();
+            ensure!(
+                distinct.len() == priorities.len(),
+                "engine_priority must give each policy class its own priority"
+            );
         }
         Ok(self)
     }
@@ -243,5 +267,26 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(args.effective_handoff_capacity(), 32);
+    }
+
+    #[test]
+    fn engine_priority_maps_a_routed_priority_back_to_its_class() {
+        let args = MockerConfig::from_value(json!({
+            "dynamo": {"engine_priority": {"priority": 2, "standard": 1, "batch": 0}}
+        }))
+        .unwrap();
+        assert_eq!(args.runtime.policy_class_for_priority(2), Some("priority"));
+        assert_eq!(args.runtime.policy_class_for_priority(0), Some("batch"));
+        assert_eq!(args.runtime.policy_class_for_priority(5), None);
+        assert_eq!(
+            MockerConfig::default().runtime.policy_class_for_priority(2),
+            None
+        );
+        assert!(
+            MockerConfig::from_value(json!({
+                "dynamo": {"engine_priority": {"priority": 1, "standard": 1}}
+            }))
+            .is_err()
+        );
     }
 }
