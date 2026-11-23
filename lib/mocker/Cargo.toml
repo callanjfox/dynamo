@@ -51,6 +51,8 @@ bytes = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }
 parking_lot = { workspace = true }
+# The users-over-HTTP driver (replay::users_http) talks to a live frontend.
+reqwest = { workspace = true }
 rmp-serde = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

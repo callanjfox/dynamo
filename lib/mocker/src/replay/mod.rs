@@ -9,6 +9,7 @@ pub(crate) mod offline;
 mod online;
 mod router_controls;
 mod router_shared;
+mod users_http;
 mod validate;
 
 use std::collections::VecDeque;
@@ -164,6 +165,7 @@ pub use offline::run_offline_handoff_conformance;
 pub use router_controls::{
     ReplayRouterControls, ReplayRouterParameters, apply_router_parameters, parse_router_worker_type,
 };
+pub use users_http::{UsersHttpConfig, UsersHttpSummary, run_users_http};
 pub use validate::validate_replay_args_mode;
 
 /// Conversation grouping used by native session affinity in offline replay.

@@ -2411,6 +2411,16 @@ class _OfflineReplayResult:
     @property
     def telemetry(self) -> Optional[ReplayTelemetryDetails]: ...
 
+def run_users_http_replay(config: str) -> str:
+    """Run a closed-loop users export against a live frontend over HTTP.
+
+    ``config`` is the JSON of ``UsersHttpConfig`` (``users_dir``, ``url``, ``model``, ``out``,
+    ``speedup``, ``stop_s``, ``block_size``, ``vocab_size``, ``ready_timeout_s``, ``record``).
+    Returns the run summary as JSON. See ``dynamo.replay.users_http``.
+    """
+    ...
+
+
 @overload
 def run_mocker_trace_replay(
     trace_files: Sequence[str | os.PathLike[str]],

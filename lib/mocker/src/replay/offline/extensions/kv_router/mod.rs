@@ -91,6 +91,9 @@ pub use gate::{
     ReplayGateRecheck, ReplayGateStats, ReplayRequestAnnotations, ReplayRequestFields,
     load_request_annotations,
 };
+// The users-over-HTTP driver (`replay::users_http`) resolves request fields and backs off as
+// offline replay's clients do.
+pub(crate) use gate::{resolve_request_fields, retry_delay_ms as client_retry_delay_ms};
 
 #[derive(Clone, Copy)]
 enum KvEventSummary {
