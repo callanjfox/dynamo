@@ -113,6 +113,25 @@ pub const HEADER_USER_ID: &str = "x-dynamo-user-id";
 /// previous turn handed back to the user, a stop point) or `tool` (a tool result; F35).
 pub const HEADER_HINT_LAST_ROLE: &str = "x-dynamo-hint-last-role";
 
+/// A count (tokens, subagents) from an untrusted client hint: a non-negative number written as
+/// an integer or a decimal ("450", "450.0", " 450 ", "4.5e2"), rounded to the nearest integer
+/// (half away from zero). Clients and exporters that keep numbers as floats write "450.0"; a
+/// plain integer parse dropped those silently (f81). Anything else (negative, NaN, infinite,
+/// above `max`, not a number) is ignored, as untrusted input must be.
+pub(crate) fn parse_count_hint(value: &str, max: u64) -> Option<u64> {
+    let value = value.trim();
+    if let Ok(n) = value.parse::<u64>() {
+        return (n <= max).then_some(n);
+    }
+    let x = value
+        .parse::<f64>()
+        .ok()
+        .filter(|x| x.is_finite() && *x >= 0.0)?
+        .round();
+    // `max as f64` may round up (u64::MAX); the cast below saturates, so the bound still holds.
+    (x <= max as f64).then(|| (x as u64).min(max))
+}
+
 /// The tenant, client signals and session end marker a request carries: the session end from
 /// `nvext.agent_context.session_final` (header `x-dynamo-session-final`), the rest from agent
 /// headers. Malformed values are ignored, as untrusted input must be.
@@ -125,8 +144,11 @@ fn request_attributes(session: &SessionContext) -> RequestAttributes {
             next_think_s: first(HEADER_HINT_NEXT_THINK_S)
                 .and_then(|v| v.parse::<f64>().ok())
                 .filter(|v| v.is_finite() && *v >= 0.0),
-            osl_tokens: first(HEADER_HINT_OSL).and_then(|v| v.parse().ok()),
-            next_turn_tokens: first(HEADER_HINT_NEXT_TOKENS).and_then(|v| v.parse().ok()),
+            osl_tokens: first(HEADER_HINT_OSL)
+                .and_then(|v| parse_count_hint(v, u64::from(u32::MAX)))
+                .map(|n| n as u32),
+            next_turn_tokens: first(HEADER_HINT_NEXT_TOKENS)
+                .and_then(|v| parse_count_hint(v, u64::MAX)),
             peak_tokens: first(HEADER_HINT_PEAK_TOKENS)
                 .and_then(|v| v.parse::<f64>().ok())
                 .filter(|v| v.is_finite() && *v >= 0.0)
@@ -1443,7 +1465,8 @@ impl RequestClassifier for SessionSchedulerClassifier {
                 .agent_headers()
                 .get(crate::affinity::HEADER_HINT_FANOUT)
                 .and_then(|values| values.first())
-                .and_then(|v| v.parse::<u32>().ok());
+                .and_then(|v| parse_count_hint(v, u64::from(u32::MAX)))
+                .map(|n| n as u32);
             affinity.arrived(
                 request_id,
                 session.session_id(),
@@ -2829,6 +2852,87 @@ mod tests {
         assert!(attributes.session_final);
         let plain = SessionContext::new("s".into(), None, None, None);
         assert_eq!(request_attributes(&plain), RequestAttributes::default());
+    }
+
+    #[test]
+    fn count_hints_accept_integers_and_decimals() {
+        let max = u64::from(u32::MAX);
+        assert_eq!(parse_count_hint("450", max), Some(450));
+        assert_eq!(parse_count_hint("450.0", max), Some(450));
+        assert_eq!(parse_count_hint(" 450.0 ", max), Some(450));
+        assert_eq!(parse_count_hint("4.5e2", max), Some(450));
+        assert_eq!(parse_count_hint("0", max), Some(0));
+        assert_eq!(parse_count_hint("0.0", max), Some(0));
+        // Rounded to the nearest integer, half away from zero.
+        assert_eq!(parse_count_hint("449.4", max), Some(449));
+        assert_eq!(parse_count_hint("449.5", max), Some(450));
+        assert_eq!(parse_count_hint("0.4", max), Some(0));
+        // Bounds: at the limit, above it, and u64 counts.
+        assert_eq!(parse_count_hint("4294967295", max), Some(max));
+        assert_eq!(parse_count_hint("4294967295.0", max), Some(max));
+        assert_eq!(parse_count_hint("4294967296", max), None);
+        assert_eq!(parse_count_hint("4294967296.0", max), None);
+        assert_eq!(parse_count_hint("63744.0", u64::MAX), Some(63_744));
+        assert_eq!(
+            parse_count_hint("18446744073709551615", u64::MAX),
+            Some(u64::MAX)
+        );
+        assert_eq!(parse_count_hint("1e30", u64::MAX), None);
+        // Untrusted input: anything that is not a non-negative finite number is ignored.
+        for bad in [
+            "",
+            " ",
+            "-1",
+            "-0.6",
+            "NaN",
+            "inf",
+            "-inf",
+            "abc",
+            "450 tokens",
+            "0x10",
+        ] {
+            assert_eq!(parse_count_hint(bad, max), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn decimal_token_hints_reach_the_signals() {
+        // f81: exporters that keep floats write the token hints as "450.0"; they used to be dropped.
+        let headers: std::collections::BTreeMap<String, Vec<String>> = [
+            (HEADER_HINT_OSL, "395.0"),
+            (HEADER_HINT_NEXT_TOKENS, "63744.0"),
+            (HEADER_HINT_NEXT_THINK_S, "2.50"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), vec![v.to_owned()]))
+        .collect();
+        let context =
+            SessionContext::new("s".into(), None, None, None).with_agent_headers(Arc::new(headers));
+        let signals = request_attributes(&context).signals;
+        assert_eq!(signals.osl_tokens, Some(395));
+        assert_eq!(signals.next_turn_tokens, Some(63_744));
+        assert_eq!(signals.next_think_s, Some(2.5));
+        // The integer form gives the same signals.
+        let headers: std::collections::BTreeMap<String, Vec<String>> = [
+            (HEADER_HINT_OSL, "395"),
+            (HEADER_HINT_NEXT_TOKENS, "63744"),
+            (HEADER_HINT_NEXT_THINK_S, "2.50"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), vec![v.to_owned()]))
+        .collect();
+        let context =
+            SessionContext::new("s".into(), None, None, None).with_agent_headers(Arc::new(headers));
+        assert_eq!(request_attributes(&context).signals, signals);
+        // An OSL above u32 is ignored rather than truncated.
+        let headers: std::collections::BTreeMap<String, Vec<String>> =
+            [(HEADER_HINT_OSL, "5000000000.0")]
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), vec![v.to_owned()]))
+                .collect();
+        let context =
+            SessionContext::new("s".into(), None, None, None).with_agent_headers(Arc::new(headers));
+        assert_eq!(request_attributes(&context).signals.osl_tokens, None);
     }
 
     #[test]
