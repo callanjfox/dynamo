@@ -48,6 +48,10 @@ fn classifier_provider(
     policy
         .validate()
         .map_err(|error| RequestClassifierProviderError::new(error.to_string()))?;
+    // `DYNAMO_SESSION_SCHEDULER_CLOCK_SCALE` (unset by default): scheduler time runs that many
+    // times faster than the host's, for a live router in front of sped-up mock engines.
+    let clock_scale =
+        crate::clock::clock_scale_from_env().map_err(RequestClassifierProviderError::new)?;
     // Built once: an AISimulate model loads its step data at construction.
     let step_model = if policy.forecast.enabled {
         Some(
@@ -64,11 +68,13 @@ fn classifier_provider(
         let session_reader = context.session_index();
         // The context's clock: tokio time in a live router, virtual time in offline replay.
         let clock_context = context.clone();
-        let mut classifier = SessionSchedulerClassifier::new(
-            policy.clone(),
-            Arc::new(ContextClock::new(move || clock_context.now())),
-            capacity_source(context),
-        );
+        let host_clock = ContextClock::new(move || clock_context.now());
+        let clock: Arc<dyn Clock> = match clock_scale {
+            Some(scale) => Arc::new(crate::clock::ScaledClock::new(Box::new(host_clock), scale)),
+            None => Arc::new(host_clock),
+        };
+        let mut classifier =
+            SessionSchedulerClassifier::new(policy.clone(), clock, capacity_source(context));
         if let Some(model) = &step_model {
             classifier = classifier.with_step_model(Arc::clone(model));
         }
@@ -113,7 +119,7 @@ pub const HEADER_HINT_LAST_ROLE: &str = "x-dynamo-hint-last-role";
 fn request_attributes(session: &SessionContext) -> RequestAttributes {
     let headers = session.agent_headers();
     let first = |name: &str| headers.get(name).and_then(|values| values.first());
-    RequestAttributes {
+    let attributes = RequestAttributes {
         tenant: first(HEADER_TENANT).cloned(),
         signals: Signals {
             next_think_s: first(HEADER_HINT_NEXT_THINK_S)
@@ -148,7 +154,18 @@ fn request_attributes(session: &SessionContext) -> RequestAttributes {
             let v = v.trim();
             v.eq_ignore_ascii_case("user") || v.eq_ignore_ascii_case("tool")
         }),
-    }
+    };
+    tracing::trace!(
+        session = session.session_id(),
+        parent = session.parent_session_id(),
+        session_final = attributes.session_final,
+        user = attributes.user.as_deref(),
+        next_think_s = attributes.signals.next_think_s,
+        osl_tokens = attributes.signals.osl_tokens,
+        next_turn_tokens = attributes.signals.next_turn_tokens,
+        "session scheduler request attributes"
+    );
+    attributes
 }
 
 /// A typed refusal the router passes to the client as HTTP 429, with `seconds` as Retry-After
@@ -2053,6 +2070,12 @@ impl RequestClassifier for SessionSchedulerClassifier {
                     output_tokens,
                     ..
                 } => {
+                    tracing::trace!(
+                        %request_id,
+                        ?context_tokens,
+                        ?output_tokens,
+                        "session scheduler request completed"
+                    );
                     scheduler.on_completed_with_output(
                         &request_id,
                         context_tokens,
