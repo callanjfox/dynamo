@@ -1,0 +1,367 @@
+From 93a25b9f0e6e3ea6f24a51479454ad31967cfc0e Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Thu, 12 Nov 2026 13:35:08 +1000
+Subject: [PATCH 05/38] feat(engine): pause lower-class prefill and yield
+ lower-class decodes to protect a class's ITL, off by default
+
+class_scheduling gains itl_target_ms (per class), protect_max_rank and yield_decodes. Each pass,
+the slack of the protected classes' decoding requests (90% of their ITL target times tokens made,
+less the time since their first token) sets how many lower-class prefill tokens fit (256-token
+steps, from the timing model) and, with yield_decodes, how many lower-class decodes may run
+(oldest first). protect_max_rank 0 is the JS model's pausePrefill; 1 with yield_decodes and
+preempt_max_rank 1 is its batchYield engine side. Counters: prefill_pauses_total,
+decode_yields_total.
+---
+ crates/core/src/engine/config.rs              |  20 ++-
+ crates/core/src/engine/scheduler/vllm/core.rs | 144 +++++++++++++++++-
+ .../core/src/engine/scheduler/vllm/tests.rs   |  77 ++++++++++
+ 3 files changed, 238 insertions(+), 3 deletions(-)
+
+diff --git a/crates/core/src/engine/config.rs b/crates/core/src/engine/config.rs
+index ccafcf6b7..ad1376c15 100644
+--- a/crates/core/src/engine/config.rs
++++ b/crates/core/src/engine/config.rs
+@@ -143,7 +143,7 @@ pub enum WorkerType {
+ /// Class-aware scheduling for the vLLM-style engine (the JS model's `classQueue` and
+ /// `preemptLower`/`batchPreempt`). Requests carry a policy class; `order` ranks the classes from
+ /// highest to lowest, and a request whose class is missing or unknown ranks below them all.
+-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+ #[serde(deny_unknown_fields)]
+ pub struct ClassSchedulingConfig {
+     /// Policy classes from highest to lowest priority, e.g. `["priority", "standard", "batch"]`.
+@@ -154,6 +154,19 @@ pub struct ClassSchedulingConfig {
+     /// `Some(1)` is `batchPreempt` (priority and standard take room from batch).
+     #[serde(default)]
+     pub preempt_max_rank: Option<usize>,
++    /// Inter-token latency target per class in milliseconds, in `order` (missing or null: none).
++    #[serde(default)]
++    pub itl_target_ms: Vec<Option<f64>>,
++    /// Classes ranked at or above this are protected each pass: lower classes' prefill is cut
++    /// (in 256-token chunks, to nothing if need be) so the pass stays within the slack the
++    /// protected decodes have against 90% of their ITL target. `Some(0)` is the JS model's
++    /// `pausePrefill`; `Some(1)` with `yield_decodes` is its batch step yielding.
++    #[serde(default)]
++    pub protect_max_rank: Option<usize>,
++    /// With `protect_max_rank`: also leave lower-class decodes (newest first) out of a pass that
++    /// would still exceed that slack.
++    #[serde(default)]
++    pub yield_decodes: bool,
+ }
+ 
+ impl ClassSchedulingConfig {
+@@ -163,6 +176,11 @@ impl ClassSchedulingConfig {
+             .and_then(|c| self.order.iter().position(|o| o == c))
+             .unwrap_or(self.order.len())
+     }
++
++    /// The ITL target of a class rank, in milliseconds.
++    pub fn itl_target_ms_of(&self, rank: usize) -> Option<f64> {
++        self.itl_target_ms.get(rank).copied().flatten()
++    }
+ }
+ 
+ /// Decode preemption victim selection.
+diff --git a/crates/core/src/engine/scheduler/vllm/core.rs b/crates/core/src/engine/scheduler/vllm/core.rs
+index 61e847bdf..baa80c1fe 100644
+--- a/crates/core/src/engine/scheduler/vllm/core.rs
++++ b/crates/core/src/engine/scheduler/vllm/core.rs
+@@ -71,6 +71,8 @@ pub(crate) struct VllmRequestState {
+     pub(crate) num_preemptions: usize,
+     /// Index of the request's policy class under `class_scheduling` (0 is highest); 0 when off.
+     pub(crate) class_rank: usize,
++    /// Start of the pass that produced the request's first output token.
++    pub(crate) first_token_ms: Option<f64>,
+     /// Prefix tokens found cached at first admission (set once: a preempted
+     /// request re-probes against a cache warmed by its own blocks, which
+     /// would inflate the value).
+@@ -711,6 +713,13 @@ pub(crate) struct VllmCore {
+     next_waiting_order: u64,
+     /// Preemptions made by `class_scheduling.preempt_max_rank` (a subset of all preemptions).
+     pub(crate) class_preemptions_total: u64,
++    /// This pass's limits under `class_scheduling.protect_max_rank`: prefill tokens left for
++    /// lower classes and lower-class decodes still allowed (`None`: no limit).
++    pass_low_prefill_budget: Option<usize>,
++    pass_low_decode_allow: Option<usize>,
++    /// Lower-class prefills cut to nothing, and lower-class decodes left out, by those limits.
++    pub(crate) prefill_pauses_total: u64,
++    pub(crate) decode_yields_total: u64,
+     capacity_generation: u64,
+     #[cfg(test)]
+     destination_reservation_attempts: usize,
+@@ -957,6 +966,10 @@ impl VllmCore {
+             active_destination_handoffs: ActiveHandoffRequests::default(),
+             next_waiting_order: 0,
+             class_preemptions_total: 0,
++            pass_low_prefill_budget: None,
++            pass_low_decode_allow: None,
++            prefill_pauses_total: 0,
++            decode_yields_total: 0,
+             capacity_generation: 0,
+             #[cfg(test)]
+             destination_reservation_attempts: 0,
+@@ -1514,6 +1527,7 @@ impl VllmCore {
+             drafts_ready: false,
+             num_preemptions: 0,
+             class_rank,
++            first_token_ms: None,
+             cached_prefix_tokens: None,
+             cached_tokens_signaled: false,
+             host_offload,
+@@ -1907,6 +1921,7 @@ impl VllmCore {
+         if self.class_preempt_for_waiting(now_ms) > 0 {
+             self.state.compact_running();
+         }
++        self.set_class_step_limits(now_ms)?;
+         let mut token_budget = self.args.max_num_batched_tokens.unwrap_or(usize::MAX);
+         let cadence_step = self.wave_step.is_multiple_of(
+             u64::try_from(self.args.prefill_schedule_interval)
+@@ -2688,6 +2703,90 @@ impl VllmCore {
+         made
+     }
+ 
++    /// The protected classes' slack this pass, as the JS model's `prioStepCap`: for each
++    /// protected request that is decoding, 90% of its ITL target times the tokens it has made,
++    /// less the time since its first token. From it, how many lower-class decodes may run
++    /// (`yield_decodes`, oldest first) and how many lower-class prefill tokens fit (256-token
++    /// steps), using the timing model with prefill and decode added.
++    fn set_class_step_limits(&mut self, now_ms: f64) -> anyhow::Result<()> {
++        self.pass_low_prefill_budget = None;
++        self.pass_low_decode_allow = None;
++        let Some(cfg) = self.args.class_scheduling.clone() else {
++            return Ok(());
++        };
++        let Some(protect) = cfg.protect_max_rank else {
++            return Ok(());
++        };
++        let mut cap = f64::INFINITY;
++        let (mut n_hi, mut ctx_hi) = (0usize, 0usize);
++        let mut low_decodes: Vec<usize> = Vec::new();
++        for uuid in self.state.running.iter() {
++            let Some(request) = self.state.requests.get(uuid) else {
++                continue;
++            };
++            if !self.state.running_members.contains(uuid) || request.status != RequestStatus::Running {
++                continue;
++            }
++            let decoding = request.num_computed_tokens >= request.sequence.num_input_tokens();
++            if !decoding {
++                continue;
++            }
++            if request.class_rank <= protect {
++                n_hi += 1;
++                ctx_hi += request.sequence.len();
++                if let (Some(itl), Some(first)) = (cfg.itl_target_ms_of(request.class_rank), request.first_token_ms) {
++                    let generated = request.sequence.generated_tokens().max(1) as f64;
++                    cap = cap.min(0.9 * itl * generated - (now_ms - first));
++                }
++            } else {
++                low_decodes.push(request.sequence.len());
++            }
++        }
++        if !cap.is_finite() {
++            return Ok(());
++        }
++        let decode_ms = |n: usize, ctx: usize| -> anyhow::Result<f64> {
++            if n == 0 {
++                return Ok(0.0);
++            }
++            let ms = self.args.perf_model.predict_decode_time(n, ctx, ctx / n, self.decode_kv_context_bound(ctx))?;
++            Ok(scale_decode_time(ms, &self.args)?.as_secs_f64() * 1e3)
++        };
++        let lim = cap.max(decode_ms(n_hi, ctx_hi)?);
++        let (mut n_dec, mut ctx_dec) = (n_hi, ctx_hi);
++        let mut decode_allow = None;
++        if cfg.yield_decodes {
++            let mut allow = 0;
++            for ctx in &low_decodes {
++                if decode_ms(n_dec + 1, ctx_dec + ctx)? > lim {
++                    break;
++                }
++                allow += 1;
++                n_dec += 1;
++                ctx_dec += ctx;
++            }
++            decode_allow = Some(allow);
++        } else {
++            for ctx in &low_decodes {
++                n_dec += 1;
++                ctx_dec += ctx;
++            }
++        }
++        let base = decode_ms(n_dec, ctx_dec)?;
++        let max_tokens = self.args.max_num_batched_tokens.unwrap_or(8192);
++        let mut budget = 0usize;
++        while budget + 256 <= max_tokens {
++            let ms = self.args.perf_model.predict_prefill_time(1, budget + 256, 0)?;
++            if scale_prefill_time(ms, &self.args)?.as_secs_f64() * 1e3 + base > lim {
++                break;
++            }
++            budget += 256;
++        }
++        self.pass_low_decode_allow = decode_allow;
++        self.pass_low_prefill_budget = Some(budget);
++        Ok(())
++    }
++
+     fn preempt_selected(&mut self, selected: Uuid, at_ms: f64) -> Option<PreemptedRequest> {
+         let state_before = self.pressure_state();
+         let request_active_blocks_before = self
+@@ -2922,12 +3021,45 @@ impl VllmCore {
+             return Ok(ScheduleOutcome::Blocked);
+         }
+ 
++        let request_len = request.sequence.len();
++        let class_rank = request.class_rank;
++        let protected_rank = self
++            .args
++            .class_scheduling
++            .as_ref()
++            .and_then(|c| c.protect_max_rank);
++        let low_class = protected_rank.is_some_and(|rank| class_rank > rank);
++        let is_prefill = prompt_remaining > 0;
++        if low_class && !is_prefill && self.pass_low_decode_allow == Some(0) {
++            self.decode_yields_total += 1;
++            return Ok(ScheduleOutcome::SkippedForAlignment);
++        }
++        let low_budget = if low_class && is_prefill {
++            self.pass_low_prefill_budget
++        } else {
++            None
++        };
++        if low_budget == Some(0) {
++            self.prefill_pauses_total += 1;
++            return Ok(ScheduleOutcome::SkippedForAlignment);
++        }
+         let desired_tokens = self.align_state_prefill(
+             effective_computed_before,
+             prompt_len,
+-            request.sequence.len(),
+-            remaining_known_tokens.min(*token_budget),
++            request_len,
++            remaining_known_tokens
++                .min(*token_budget)
++                .min(low_budget.unwrap_or(usize::MAX)),
+         );
++        if low_class {
++            if is_prefill {
++                if let Some(budget) = self.pass_low_prefill_budget.as_mut() {
++                    *budget = budget.saturating_sub(desired_tokens);
++                }
++            } else if let Some(allow) = self.pass_low_decode_allow.as_mut() {
++                *allow = allow.saturating_sub(1);
++            }
++        }
+         // Speculative positions consume scheduler budget but are not committed
+         // sequence/KV state until verification accepts them.
+         let scheduled_drafts = draft_tokens.min(token_budget.saturating_sub(desired_tokens));
+@@ -3240,6 +3372,14 @@ impl VllmCore {
+             }
+         }
+ 
++        for uuid in &ready {
++            if let Some(request) = self.state.requests.get_mut(uuid)
++                && request.first_token_ms.is_none()
++                && request.sequence.generated_tokens() == 0
++            {
++                request.first_token_ms = Some(compute_start_ms);
++            }
++        }
+         // Requests already terminal after prefill must release their running slots
+         // without manufacturing an output token.
+         let mut output_signals = Vec::with_capacity(already_complete.len() + ready.len());
+diff --git a/crates/core/src/engine/scheduler/vllm/tests.rs b/crates/core/src/engine/scheduler/vllm/tests.rs
+index 95629a6a1..1b8553460 100644
+--- a/crates/core/src/engine/scheduler/vllm/tests.rs
++++ b/crates/core/src/engine/scheduler/vllm/tests.rs
+@@ -3253,6 +3253,9 @@ mod class_scheduling {
+             .class_scheduling(classes.then(|| ClassSchedulingConfig {
+                 order: vec!["priority".into(), "standard".into(), "batch".into()],
+                 preempt_max_rank,
++                itl_target_ms: Vec::new(),
++                protect_max_rank: None,
++                yield_decodes: false,
+             }))
+             .build()
+             .unwrap()
+@@ -3337,6 +3340,80 @@ mod class_scheduling {
+         assert_eq!(core.class_preemptions_total, 0);
+     }
+ 
++    fn protect_args(protect: Option<usize>, yield_decodes: bool) -> MockEngineArgs {
++        MockEngineArgs::builder()
++            .block_size(4)
++            .num_gpu_blocks(1024)
++            .max_num_batched_tokens(Some(2048))
++            .max_num_seqs(Some(8))
++            .enable_chunked_prefill(true)
++            .enable_prefix_caching(false)
++            .class_scheduling(Some(ClassSchedulingConfig {
++                order: vec!["priority".into(), "standard".into(), "batch".into()],
++                preempt_max_rank: None,
++                itl_target_ms: vec![Some(50.0), Some(100.0), None],
++                protect_max_rank: protect,
++                yield_decodes,
++            }))
++            .build()
++            .unwrap()
++    }
++
++    /// A priority request decoding with no slack left (its first token long ago), then a batch
++    /// request with a long prompt: under protect_max_rank 0 the batch prefill is paused.
++    fn behind_late_priority(protect: Option<usize>, yield_decodes: bool) -> (VllmCore, Uuid) {
++        let mut core = VllmCore::new(protect_args(protect, yield_decodes));
++        let _priority = submit(&mut core, 1, "priority");
++        let mut collector = crate::engine::trace::TraceCollector::default();
++        let mut t = 0.0;
++        for _ in 0..3 {
++            t = core.execute_pass(&mut collector, t).end_ms;
++        }
++        let batch = Uuid::from_u128(2);
++        core.receive(DirectRequest {
++            tokens: vec![2; 1024],
++            max_output_tokens: 8,
++            uuid: Some(batch),
++            policy_class: Some("batch".to_string()),
++            ..Default::default()
++        });
++        core.execute_pass(&mut collector, t + 100_000.0);
++        (core, batch)
++    }
++
++    #[test]
++    fn pause_prefill_holds_lower_class_prefill_when_priority_has_no_slack() {
++        let (core, batch) = behind_late_priority(Some(0), false);
++        assert_eq!(core.state.requests[&batch].num_computed_tokens, 0);
++        assert!(core.prefill_pauses_total >= 1);
++    }
++
++    #[test]
++    fn without_protection_lower_class_prefill_runs() {
++        let (core, batch) = behind_late_priority(None, false);
++        assert!(core.state.requests[&batch].num_computed_tokens > 0);
++        assert_eq!(core.prefill_pauses_total, 0);
++    }
++
++    #[test]
++    fn yield_decodes_leaves_batch_decodes_out_when_priority_has_no_slack() {
++        for (yield_decodes, expect_yield) in [(true, true), (false, false)] {
++            let mut core = VllmCore::new(protect_args(Some(1), yield_decodes));
++            let batch = submit(&mut core, 1, "batch");
++            let _priority = submit(&mut core, 2, "priority");
++            let mut collector = crate::engine::trace::TraceCollector::default();
++            let mut t = 0.0;
++            for _ in 0..3 {
++                t = core.execute_pass(&mut collector, t).end_ms;
++            }
++            let before = core.state.requests[&batch].sequence.generated_tokens();
++            core.execute_pass(&mut collector, t + 100_000.0);
++            let after = core.state.requests[&batch].sequence.generated_tokens();
++            assert_eq!(core.decode_yields_total >= 1, expect_yield, "yield_decodes={yield_decodes}");
++            assert_eq!(after == before, expect_yield, "yield_decodes={yield_decodes}");
++        }
++    }
++
+     #[test]
+     fn batch_preempt_lets_standard_take_room_from_batch_only() {
+         let mut core = VllmCore::new(args(Some(1), true));

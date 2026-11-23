@@ -1,0 +1,154 @@
+{
+  "engine": {
+    "backend": "vllm",
+    "num_gpu_blocks": 136050,
+    "block_size": 64,
+    "max_model_len": 1048576,
+    "max_num_seqs": 256,
+    "max_num_batched_tokens": 8192,
+    "prefill_schedule_interval": 1,
+    "prefill_decode_interval": 0,
+    "enable_prefix_caching": true,
+    "enable_chunked_prefill": true,
+    "speedup_ratio": 1.0,
+    "decode_speedup_ratio": 1.0,
+    "aic_nextn": null,
+    "aic_nextn_accept_rates": null,
+    "aic_mtp_seed": 42,
+    "worker_type": "aggregated",
+    "preemption_mode": "lifo",
+    "emit_kv_events": false,
+    "emit_kv_token_ids": false,
+    "kv_transfer_bytes_per_token": null,
+    "kv_cache_bytes_per_token": 4444,
+    "native_host_offload": {
+      "num_host_blocks": 1135660,
+      "d2h_bandwidth_gbps": 128.0,
+      "h2d_bandwidth_gbps": 128.0,
+      "latency_to_first_byte_ms": 5.0,
+      "vllm_recency": true
+    },
+    "kv_transfer_bandwidth": null,
+    "kv_transfer_timing_mode": "full_prompt",
+    "timing_model": {
+      "type": "external",
+      "provider": "ais",
+      "config": {
+        "model": "deepseek-ai/DeepSeek-V4-Pro",
+        "system": "b300_sxm",
+        "backend": "vllm",
+        "worker_type": "aggregated",
+        "backend_version": "0.24.0",
+        "fpm_profile": null,
+        "tp": 4,
+        "pp": 1,
+        "attention_dp": 1,
+        "dcp": null,
+        "moe_tp_size": 1,
+        "moe_ep_size": 4,
+        "cp_size": null,
+        "gemm_quant_mode": null,
+        "moe_quant_mode": null,
+        "fmha_quant_mode": null,
+        "fpm_fmha_quant_mode": null,
+        "kvcache_quant_mode": null,
+        "comm_quant_mode": null,
+        "nextn": 0,
+        "speculation": null,
+        "kv_block_size": 64,
+        "decoder_replay": false,
+        "estimation_mode": "op_level",
+        "database_mode": "SILICON",
+        "transfer_policy": [
+          "xshape",
+          "xquant",
+          "xprofile",
+          "xop"
+        ],
+        "fallback_policy": "deny",
+        "estimator_config": {
+          "correction": {
+            "enabled": true,
+            "factor_bounds": {
+              "max": 2.0,
+              "min": 0.5
+            },
+            "feature_space": "legacy_workload",
+            "max_batch_size": 512,
+            "max_kv_tokens": 2000000,
+            "max_num_tokens": 8192,
+            "min_observations": 5,
+            "sampling": {
+              "bins_per_axis": [
+                4,
+                4
+              ],
+              "max_observations": 64
+            }
+          },
+          "features": {
+            "attention_kv_weight": 1.0,
+            "ffn_token_weight": 1.0,
+            "prefill_attention_pair_weight": 1.0
+          },
+          "fpm_interpolation": {
+            "method": "sol"
+          },
+          "fpm_regression": {
+            "fit": {
+              "kind": "standardized_nnls",
+              "rebuild_interval": null,
+              "singular_ridge_scale": 1e-09
+            },
+            "min_observations": 5,
+            "sampling": {
+              "bins_per_axis": [
+                4,
+                4
+              ],
+              "max_observations": 64
+            }
+          },
+          "op_level": {}
+        },
+        "attention_backend": null,
+        "moe_kernel_source": null,
+        "enable_shared_layer": null,
+        "strict_provenance": false,
+        "moe_backend": null,
+        "enable_eplb": false,
+        "wideep_num_slots": null
+      }
+    },
+    "sglang": {
+      "schedule_policy": "fifo",
+      "max_prefill_tokens": 16384,
+      "chunked_prefill_size": 8192,
+      "clip_max_new_tokens": 4096,
+      "schedule_conservativeness": 1.0,
+      "vlm_cache_bytes": 104857600,
+      "host_loop": false
+    },
+    "trtllm": {
+      "capacity_scheduler_policy": "guaranteed_no_evict"
+    }
+  },
+  "dp_size": 1,
+  "tensor_parallel_size": 4,
+  "startup_time": 0.0,
+  "num_gpu_blocks_is_explicit": false,
+  "gpu_memory_utilization": 0.9,
+  "mem_fraction_static": null,
+  "free_gpu_memory_fraction": null,
+  "cuda_graph_reserved_bytes": 0,
+  "dynamo": {
+    "enable_local_indexer": true,
+    "bootstrap_port": null,
+    "handoff_session_timeout_ms": 300000,
+    "reasoning": null,
+    "response_replay_trace_path": null,
+    "zmq_kv_events_port": null,
+    "zmq_replay_port": null,
+    "router_queue_policy": null
+  }
+}

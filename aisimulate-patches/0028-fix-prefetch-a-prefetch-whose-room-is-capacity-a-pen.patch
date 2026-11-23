@@ -1,0 +1,93 @@
+From fe33c1269fdcc6234ca89e42d6cdfa328e98ea07 Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Fri, 13 Nov 2026 22:55:45 +1000
+Subject: [PATCH 28/38] fix(prefetch): a prefetch whose room is capacity a
+ pending transfer still reads (a G2 store of the blocks evicted for it) loads
+ nothing; it loads at once and cannot wait behind that transfer as a request's
+ load does, and writing that capacity panicked (demote + prefetch and kitchen
+ sink v1 stopped the replay: cannot write dependency-bearing capacity before
+ its source transfer is terminal); unit test
+
+---
+ .../src/engine/kv_manager/vllm_backend.rs     | 11 +++++
+ .../src/engine/scheduler/vllm/host_offload.rs | 45 +++++++++++++++++++
+ 2 files changed, 56 insertions(+)
+
+diff --git a/crates/core/src/engine/kv_manager/vllm_backend.rs b/crates/core/src/engine/kv_manager/vllm_backend.rs
+index af3c794a9..8ef478ae5 100644
+--- a/crates/core/src/engine/kv_manager/vllm_backend.rs
++++ b/crates/core/src/engine/kv_manager/vllm_backend.rs
+@@ -1447,6 +1447,17 @@ impl VllmKvManager {
+             self.pool.cancel(outcome.reservation);
+             return Vec::new();
+         }
++        // The room may be capacity a pending transfer still reads (a G2 store of the blocks
++        // evicted for it). A prefetch loads at once and cannot wait behind that transfer, as a
++        // request's load does (`native_destination_pending_dependencies`): load nothing then.
++        if !self
++            .pool
++            .reservation_pending_dependencies(&outcome.reservation)
++            .is_empty()
++        {
++            self.pool.cancel(outcome.reservation);
++            return Vec::new();
++        }
+         let mut loaded = Vec::with_capacity(hashes.len());
+         let mut copies = Vec::with_capacity(hashes.len());
+         for &hash in hashes {
+diff --git a/crates/core/src/engine/scheduler/vllm/host_offload.rs b/crates/core/src/engine/scheduler/vllm/host_offload.rs
+index 694270d32..1660b0f6d 100644
+--- a/crates/core/src/engine/scheduler/vllm/host_offload.rs
++++ b/crates/core/src/engine/scheduler/vllm/host_offload.rs
+@@ -1333,6 +1333,51 @@ mod tests {
+         assert_eq!((stats.retained_requests, stats.retained_blocks), (1, 2));
+     }
+ 
++    #[test]
++    fn a_prefetch_never_writes_capacity_a_pending_store_still_reads() {
++        // G1 of two blocks, G2 of eight, stores at 1 MB/ms-scale bandwidth so they stay pending.
++        // A is stored and demoted. B then fills G1 and its store is still in flight when A is
++        // prefetched: the only room is B's blocks, which the pending store still reads. The
++        // prefetch (an instant load) must load nothing rather than write that capacity (the
++        // demote + prefetch replay stopped: "cannot write dependency-bearing capacity before its
++        // source transfer is terminal").
++        let mut host = NativeHostOffloadConfig::new(8).with_bandwidths(0.001, 0.0);
++        host.write_back = false;
++        let args = MockEngineArgs::builder()
++            .num_gpu_blocks(2)
++            .block_size(4)
++            .max_num_seqs(Some(4))
++            .max_num_batched_tokens(Some(64))
++            .enable_prefix_caching(true)
++            .kv_cache_bytes_per_token(Some(250_000))
++            .native_host_offload(Some(host))
++            .speedup_ratio(0.0)
++            .build()
++            .unwrap();
++        let mut core = VllmCore::new(args);
++        let mut now_ms = 0.0;
++        let a_tokens: Vec<u32> = (1..=8).collect();
++        let a = Uuid::from_u128(50);
++        run_to_completion(&mut core, a, a_tokens.clone(), &mut now_ms);
++        now_ms += 1.0e7;
++        core.process_internal_work(now_ms);
++        let a_hashes = prompt_hashes(a, a_tokens);
++        assert!(a_hashes.iter().all(|hash| core.kv_residency(*hash) == (true, true)));
++        core.apply_command(drop_blocks(&a_hashes, true, false, true)).unwrap();
++        assert!(a_hashes.iter().all(|hash| core.kv_residency(*hash) == (false, true)));
++        run_to_completion(&mut core, Uuid::from_u128(51), (31..=38).collect(), &mut now_ms);
++        core.apply_command(prefetch_blocks(&a_hashes)).unwrap();
++        assert!(
++            a_hashes.iter().all(|hash| !core.kv_residency(*hash).0),
++            "nothing loaded over capacity a pending store reads"
++        );
++        // Once the store is done, the same prefetch loads the run.
++        now_ms += 1.0e7;
++        core.process_internal_work(now_ms);
++        core.apply_command(prefetch_blocks(&a_hashes)).unwrap();
++        assert!(a_hashes.iter().all(|hash| core.kv_residency(*hash) == (true, true)));
++    }
++
+     #[test]
+     fn a_prefetched_run_is_evicted_tail_first() {
+         // G1 of four blocks, G2 of eight. A three-block chain is demoted, then prefetched back as

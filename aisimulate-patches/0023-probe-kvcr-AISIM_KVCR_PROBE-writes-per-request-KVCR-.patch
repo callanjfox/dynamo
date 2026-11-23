@@ -1,0 +1,266 @@
+From 51c1fcf2154c5decdb283aae4c22064e5dc0204b Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Fri, 13 Nov 2026 04:48:14 +1000
+Subject: [PATCH 23/38] probe(kvcr): AISIM_KVCR_PROBE writes per-request KVCR
+ diagnostics (off by default): at arrival and first G2 lookup, the leading
+ prompt blocks the rank's own G2, the longest-holding peer's G2 and the hinted
+ source's G2 hold; each staged pull's wanted and pulled blocks and stop
+ reason; every 600 s a G2 snapshot (blocks per rank, distinct across the pool,
+ held by two or more ranks)
+
+---
+ crates/core/src/engine/host_offload/tier.rs   |  9 ++
+ crates/core/src/engine/kvcr.rs                | 37 ++++++++
+ crates/core/src/engine/scheduler/vllm/core.rs |  6 +-
+ .../src/engine/scheduler/vllm/host_offload.rs | 20 +++++
+ crates/core/src/engine/scheduler/vllm/kvcr.rs | 84 +++++++++++++++++++
+ 5 files changed, 154 insertions(+), 2 deletions(-)
+
+diff --git a/crates/core/src/engine/host_offload/tier.rs b/crates/core/src/engine/host_offload/tier.rs
+index a5c919267..1ba47e21a 100644
+--- a/crates/core/src/engine/host_offload/tier.rs
++++ b/crates/core/src/engine/host_offload/tier.rs
+@@ -1437,6 +1437,15 @@ impl HostTier {
+                 .any(|transfer| transfer.client == client)
+     }
+ 
++    /// Sequence hashes of the resident blocks (the KVCR probe's G2 snapshot).
++    pub(crate) fn resident_hashes(&self) -> Vec<u64> {
++        self.entries
++            .iter()
++            .filter(|(_, entry)| entry.state == EntryState::Resident)
++            .map(|(key, _)| key.sequence_hash())
++            .collect()
++    }
++
+     pub(crate) fn capacity_blocks(&self) -> usize {
+         self.config.capacity_blocks
+     }
+diff --git a/crates/core/src/engine/kvcr.rs b/crates/core/src/engine/kvcr.rs
+index 8532b339b..066cdcc66 100644
+--- a/crates/core/src/engine/kvcr.rs
++++ b/crates/core/src/engine/kvcr.rs
+@@ -426,6 +426,15 @@ impl KvcrRegistry {
+         self.stats.peer_hbm_blocks += blocks as u64;
+     }
+ 
++    /// Every registered rank's G2 but `except`, for the KVCR probe.
++    pub(crate) fn peer_tiers(&self, except: KvHintSource) -> Vec<(KvHintSource, HostTierHandle)> {
++        self.ranks
++            .iter()
++            .filter(|(rank, _)| **rank != except)
++            .map(|(rank, r)| (*rank, r.g2.clone()))
++            .collect()
++    }
++
+     pub(crate) fn source(&self, rank: KvHintSource) -> Option<HostTierHandle> {
+         self.ranks.get(&rank).map(|rank| rank.g2.clone())
+     }
+@@ -945,3 +954,31 @@ mod tests {
+         assert_eq!(r.next_deadline(rank(2, 0)), None);
+     }
+ }
++
++/// Per-request KVCR probe (diagnostics only): with `AISIM_KVCR_PROBE=<path>` set, ranks append one
++/// JSON line per event (request arrival, first G2 lookup, each staged pull) to that file. Unset, it
++/// does nothing and costs one environment read.
++pub(crate) mod probe {
++    use std::io::Write;
++    use std::sync::{Mutex, OnceLock};
++
++    static OUT: OnceLock<Option<Mutex<std::io::LineWriter<std::fs::File>>>> = OnceLock::new();
++
++    fn out() -> &'static Option<Mutex<std::io::LineWriter<std::fs::File>>> {
++        OUT.get_or_init(|| {
++            std::env::var_os("AISIM_KVCR_PROBE")
++                .and_then(|path| std::fs::File::create(path).ok())
++                .map(|file| Mutex::new(std::io::LineWriter::new(file)))
++        })
++    }
++
++    pub(crate) fn enabled() -> bool {
++        out().is_some()
++    }
++
++    pub(crate) fn write(line: &str) {
++        if let Some(out) = out() {
++            let _ = writeln!(out.lock().unwrap(), "{line}");
++        }
++    }
++}
+diff --git a/crates/core/src/engine/scheduler/vllm/core.rs b/crates/core/src/engine/scheduler/vllm/core.rs
+index de290dffd..e3a87a008 100644
+--- a/crates/core/src/engine/scheduler/vllm/core.rs
++++ b/crates/core/src/engine/scheduler/vllm/core.rs
+@@ -1548,13 +1548,15 @@ impl VllmCore {
+             sequence.lease.configure_prefix_hashes(&tokens, unit);
+         }
+         let host_offload = self.native_host_offload.as_ref().map(|adapter| {
+-            Box::new(VllmHostRequestState::new(
++            let state = Box::new(VllmHostRequestState::new(
+                 &sequence.sequence,
+                 &sequence.lease,
+                 self.args.block_size,
+                 adapter.publishes_residency(),
+                 request.kv_hint,
+-            ))
++            ));
++            adapter.probe_arrival(&state);
++            state
+         });
+         VllmRequestState {
+             sequence,
+diff --git a/crates/core/src/engine/scheduler/vllm/host_offload.rs b/crates/core/src/engine/scheduler/vllm/host_offload.rs
+index d8d8a9931..e676eaa32 100644
+--- a/crates/core/src/engine/scheduler/vllm/host_offload.rs
++++ b/crates/core/src/engine/scheduler/vllm/host_offload.rs
+@@ -99,6 +99,8 @@ pub(super) struct VllmHostRequestState {
+     latest_store: Option<TransferId>,
+     load: Option<LoadState>,
+     first_admission_recorded: bool,
++    /// The KVCR probe wrote this request's first-lookup line.
++    probed: bool,
+ }
+ 
+ impl VllmHostRequestState {
+@@ -144,6 +146,7 @@ impl VllmHostRequestState {
+             latest_store: None,
+             load: None,
+             first_admission_recorded: false,
++            probed: false,
+         }
+     }
+ 
+@@ -254,6 +257,17 @@ impl VllmHostOffloadAdapter {
+         self.host.tier_handle()
+     }
+ 
++    /// KVCR probe (`AISIM_KVCR_PROBE`): what this rank's G2 and its peers' G2 hold of a request's
++    /// prompt as it arrives.
++    pub(super) fn probe_arrival(&self, request: &VllmHostRequestState) {
++        if !crate::engine::kvcr::probe::enabled() {
++            return;
++        }
++        if let Some(kvcr) = &self.kvcr {
++            kvcr.probe(&self.host.lock(), "arrive", request.owner, &request.prompt_keys, request.kv_hint, None, None);
++        }
++    }
++
+     /// Changes whenever G3 or KVCR stages, lands or loads; drives
+     /// same-timestamp retries. `None` without G3 until this rank's first KVCR
+     /// pull, so an idle KVCR schedules exactly like G2 alone.
+@@ -573,6 +587,12 @@ impl VllmHostOffloadAdapter {
+ 
+         debug_assert_eq!(g1_cost.cached_tokens % block_size, 0);
+         let base_g1_blocks = g1_cost.cached_tokens / block_size;
++        if !request.probed && crate::engine::kvcr::probe::enabled() {
++            request.probed = true;
++            if let Some(kvcr) = kvcr.as_ref() {
++                kvcr.probe(&tier, "lookup", request.owner, &request.prompt_keys, request.kv_hint, Some(base_g1_blocks), Some(now_ms));
++            }
++        }
+         let outcome = if base_g1_blocks >= request.prompt_keys.len() {
+             if let Some(g3) = g3 {
+                 g3.release(request.owner);
+diff --git a/crates/core/src/engine/scheduler/vllm/kvcr.rs b/crates/core/src/engine/scheduler/vllm/kvcr.rs
+index e42c8e4b0..ad69b0d01 100644
+--- a/crates/core/src/engine/scheduler/vllm/kvcr.rs
++++ b/crates/core/src/engine/scheduler/vllm/kvcr.rs
+@@ -66,6 +66,78 @@ impl VllmKvcrAdapter {
+         self.rank
+     }
+ 
++    /// KVCR probe (`AISIM_KVCR_PROBE`): the leading blocks of `keys` that this rank's G2, the
++    /// longest-holding peer's G2 and the hinted source's G2 hold now, as one JSON line.
++    #[allow(clippy::too_many_arguments)]
++    pub(super) fn probe(
++        &self,
++        own: &HostTier,
++        event: &str,
++        owner: Uuid,
++        keys: &[HostBlockKey],
++        hint: Option<KvHintSource>,
++        g1_blocks: Option<usize>,
++        now: Option<f64>,
++    ) {
++        let lead = |tier: &HostTier| {
++            keys.iter()
++                .take_while(|key| matches!(tier.lookup(**key), Lookup::Hit))
++                .count()
++        };
++        let own_blocks = lead(own);
++        let peers = self.registry.lock().unwrap().peer_tiers(self.rank);
++        // Every 600 s of simulated time, at the first lookup past it: what each rank's G2 holds,
++        // how many distinct blocks the pool holds, and how many of them two or more ranks hold.
++        static NEXT_SNAPSHOT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++        if let Some(now) = now
++            && now >= f64::from_bits(NEXT_SNAPSHOT_MS.load(std::sync::atomic::Ordering::Relaxed))
++        {
++            NEXT_SNAPSHOT_MS.store(
++                (now - now % 600_000.0 + 600_000.0).to_bits(),
++                std::sync::atomic::Ordering::Relaxed,
++            );
++            let mut held: FxHashMap<u64, u32> = FxHashMap::default();
++            let mut per_rank = vec![(self.rank.worker_id, own.resident_hashes())];
++            for (rank, g2) in &peers {
++                per_rank.push((rank.worker_id, g2.lock().resident_hashes()));
++            }
++            for (_, hashes) in &per_rank {
++                for hash in hashes {
++                    *held.entry(*hash).or_default() += 1;
++                }
++            }
++            let sizes: Vec<String> = per_rank.iter().map(|(w, h)| format!("[{w},{}]", h.len())).collect();
++            crate::engine::kvcr::probe::write(&format!(
++                r#"{{"ev":"g2snap","t":{now:.3},"capacity":{},"per_rank":[{}],"unique":{},"multi":{}}}"#,
++                own.capacity_blocks(),
++                sizes.join(","),
++                held.len(),
++                held.values().filter(|n| **n >= 2).count(),
++            ));
++        }
++        let (mut best, mut best_worker, mut named) = (0usize, None, None);
++        for (rank, g2) in peers {
++            let held = lead(&g2.lock());
++            if held > best {
++                (best, best_worker) = (held, Some(rank.worker_id));
++            }
++            if Some(rank) == hint {
++                named = Some(held);
++            }
++        }
++        let opt = |v: Option<String>| v.unwrap_or_else(|| "null".into());
++        crate::engine::kvcr::probe::write(&format!(
++            r#"{{"ev":"{event}","uuid":"{owner}","w":{},"t":{},"keys":{},"g1":{},"own":{own_blocks},"best":{best},"best_w":{},"named":{},"named_w":{}}}"#,
++            self.rank.worker_id,
++            opt(now.map(|t| format!("{t:.3}"))),
++            keys.len(),
++            opt(g1_blocks.map(|n| n.to_string())),
++            opt(best_worker.map(|w| w.to_string())),
++            opt(named.map(|n| n.to_string())),
++            opt(hint.map(|h| h.worker_id.to_string())),
++        ));
++    }
++
+     /// Whether `owner` waits for a pull it staged.
+     pub(super) fn is_pulling(&self, owner: Uuid) -> bool {
+         self.pulling.contains_key(&owner)
+@@ -140,6 +212,18 @@ impl VllmKvcrAdapter {
+             registry.note_stop(reason, unpulled as u64, in_device as u64);
+         }
+         let plan = plan.filter(|plan| !plan.reserved().is_empty());
++        if crate::engine::kvcr::probe::enabled() {
++            let reserved = plan.as_ref().map_or(0, |plan| plan.reserved().len());
++            let (reason, at) = stop.map_or(("none", keys.len()), |(reason, at)| {
++                (["source_missing", "attempted", "no_room"][usize::from(reason)], at)
++            });
++            crate::engine::kvcr::probe::write(&format!(
++                r#"{{"ev":"stage","uuid":"{owner}","w":{},"t":{now:.3},"src":{},"wanted":{},"pulled":{reserved},"stop":"{reason}","stop_at":{at}}}"#,
++                self.rank.worker_id,
++                source.worker_id,
++                keys.len(),
++            ));
++        }
+         let pulled = plan
+             .as_ref()
+             .map(|plan| plan.reserved().to_vec())

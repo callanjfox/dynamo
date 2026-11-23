@@ -1,0 +1,51 @@
+From 848f9aa35c108a4d9a022ebf8fbea3ada1b3f5bb Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Thu, 12 Nov 2026 18:49:34 +1000
+Subject: [PATCH 12/38] feat(engine): a process-wide switch for class
+ preemption (engine::set_class_preemption_enabled), on by default
+
+class_scheduling.preempt_max_rank preempts only while the switch is on. A router's adaptive rule
+turns it off and on during a replay (its preempt group); with nothing turning it, behaviour is
+unchanged.
+---
+ crates/core/src/engine/mod.rs                 | 12 ++++++++++++
+ crates/core/src/engine/scheduler/vllm/core.rs |  3 +++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/crates/core/src/engine/mod.rs b/crates/core/src/engine/mod.rs
+index 4aad0205e..5e70b335e 100644
+--- a/crates/core/src/engine/mod.rs
++++ b/crates/core/src/engine/mod.rs
+@@ -14,6 +14,18 @@ mod host_offload;
+ mod kv_manager;
+ pub(crate) mod kv_retain;
+ pub use kv_retain::KvRetainValue;
++
++static CLASS_PREEMPTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
++
++/// Whether `class_scheduling.preempt_max_rank` may preempt (on by default). A router's adaptive
++/// rule turns it off and on while a replay runs (its `preempt` group); process-wide.
++pub fn class_preemption_enabled() -> bool {
++    CLASS_PREEMPTION.load(std::sync::atomic::Ordering::Relaxed)
++}
++
++pub fn set_class_preemption_enabled(on: bool) {
++    CLASS_PREEMPTION.store(on, std::sync::atomic::Ordering::Relaxed);
++}
+ pub(crate) mod kvcr;
+ mod launch;
+ mod offload_lru;
+diff --git a/crates/core/src/engine/scheduler/vllm/core.rs b/crates/core/src/engine/scheduler/vllm/core.rs
+index 803f4ec88..d400b3628 100644
+--- a/crates/core/src/engine/scheduler/vllm/core.rs
++++ b/crates/core/src/engine/scheduler/vllm/core.rs
+@@ -2795,6 +2795,9 @@ impl VllmCore {
+     /// in free blocks and a sequence slot, as the JS model's `preemptFor`. A request that would
+     /// not fit even with every lower-class request gone is left waiting. Returns preemptions made.
+     fn class_preempt_for_waiting(&mut self, at_ms: f64) -> usize {
++        if !crate::engine::class_preemption_enabled() {
++            return 0;
++        }
+         let Some(max_rank) = self
+             .args
+             .class_scheduling

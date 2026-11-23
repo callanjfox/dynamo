@@ -1,0 +1,230 @@
+From db31a332630f19dd811196b13bbb3a99d0caedcb Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Thu, 12 Nov 2026 18:45:33 +1000
+Subject: [PATCH 11/38] feat(replay): fan-out replicas on path B
+ (kv.replicate), unused unless a policy sends it
+
+KvAction::Replicate { source_scheduler_id, block_hashes, local_hashes } on a target rank:
+KvBlockCommand::Replicate stages one KVCR pull from the source into the target's G2 of the leading
+blocks of the chain the target lacks, detached from any request (it lands as any pull does).
+Done, Partial or Failed by the blocks staged; Unsupported without KVCR or toward itself. Test: a
+replica pulls a peer prefix into G2 without a request; nothing more once held, nothing from itself
+or without KVCR.
+---
+ crates/core/src/engine/protocol.rs            |  8 ++
+ crates/core/src/engine/scheduler/vllm/core.rs | 11 +++
+ .../src/engine/scheduler/vllm/host_offload.rs | 80 +++++++++++++++++++
+ crates/core/src/replay/components/engine.rs   | 41 ++++++++++
+ crates/core/src/replay/core/mod.rs            |  8 ++
+ 5 files changed, 148 insertions(+)
+
+diff --git a/crates/core/src/engine/protocol.rs b/crates/core/src/engine/protocol.rs
+index f804aa21c..7b7d8a12c 100644
+--- a/crates/core/src/engine/protocol.rs
++++ b/crates/core/src/engine/protocol.rs
+@@ -114,6 +114,14 @@ pub enum KvBlockCommand {
+         hashes: Vec<u64>,
+         local_hashes: Vec<u64>,
+     },
++    /// Pull into this rank's G2 over KVCR, from `source`, the leading blocks of a prefix chain
++    /// this rank lacks (a fan-out replica ahead of the subagents that will read it).
++    /// `local_hashes` are the blocks' token hashes.
++    Replicate {
++        source: crate::engine::KvHintSource,
++        hashes: Vec<u64>,
++        local_hashes: Vec<u64>,
++    },
+ }
+ 
+ /// Commands supported by the standalone scheduler.
+diff --git a/crates/core/src/engine/scheduler/vllm/core.rs b/crates/core/src/engine/scheduler/vllm/core.rs
+index 9c0ee33b4..803f4ec88 100644
+--- a/crates/core/src/engine/scheduler/vllm/core.rs
++++ b/crates/core/src/engine/scheduler/vllm/core.rs
+@@ -2656,6 +2656,17 @@ impl VllmCore {
+                 }
+                 affected
+             }
++            KvBlockCommand::Replicate {
++                source,
++                hashes,
++                local_hashes,
++            } => {
++                // Only blocks neither tier of this rank holds are pulled.
++                let Some(adapter) = self.native_host_offload.as_mut() else {
++                    return Vec::new();
++                };
++                adapter.replicate(source, &hashes, &local_hashes, now_ms)
++            }
+         }
+     }
+ 
+diff --git a/crates/core/src/engine/scheduler/vllm/host_offload.rs b/crates/core/src/engine/scheduler/vllm/host_offload.rs
+index 9086c99a5..b4387e44a 100644
+--- a/crates/core/src/engine/scheduler/vllm/host_offload.rs
++++ b/crates/core/src/engine/scheduler/vllm/host_offload.rs
+@@ -262,6 +262,56 @@ impl VllmHostOffloadAdapter {
+         self.kvcr.as_ref()?.registry().lock().unwrap().retain_ms(owner)
+     }
+ 
++    /// A fan-out replica (path B `kv.replicate`): stage one KVCR pull from `source` into this
++    /// rank's G2 of the leading blocks of `hashes` it lacks. Returns the blocks staged (they land
++    /// later, as any pull does). Without KVCR nothing is staged.
++    pub(super) fn replicate(
++        &mut self,
++        source: KvHintSource,
++        hashes: &[u64],
++        local_hashes: &[u64],
++        now_ms: f64,
++    ) -> Vec<u64> {
++        let Some(kvcr) = self.kvcr.as_mut() else {
++            return Vec::new();
++        };
++        let keys: Vec<HostBlockKey> = hashes.iter().copied().map(HostBlockKey::new).collect();
++        let meta: Vec<HostBlockMeta> = (0..keys.len())
++            .map(|index| HostBlockMeta {
++                parent: index.checked_sub(1).map(|parent| keys[parent].sequence_hash()),
++                tokens_hash: local_hashes.get(index).copied().unwrap_or_default(),
++                position: index,
++                session_id: None,
++            })
++            .collect();
++        let mut tier = self.host.lock();
++        let before: Vec<bool> = keys
++            .iter()
++            .map(|key| matches!(tier.lookup(*key), Lookup::Miss))
++            .collect();
++        let mut restore = RestoreRounds::default();
++        // The replica has no request: its pull is detached (it lands, nothing waits on it).
++        let owner = Uuid::from_u64_pair(0x7265_706c_6963_6174, hashes.first().copied().unwrap_or(0));
++        let staged = kvcr.stage(
++            &mut tier,
++            self.host.id(),
++            owner,
++            source,
++            &mut restore,
++            &keys,
++            Some(&meta),
++            now_ms,
++        );
++        if staged {
++            kvcr.release(owner);
++        }
++        keys.iter()
++            .zip(before)
++            .filter(|(key, missed)| *missed && !matches!(tier.lookup(**key), Lookup::Miss))
++            .map(|(key, _)| key.sequence_hash())
++            .collect()
++    }
++
+     /// KVCR `peer_hbm`: let peers see this rank's device-resident blocks.
+     pub(super) fn note_device_events(&self, events: &[crate::engine::KvEvent]) {
+         if let Some(kvcr) = &self.kvcr {
+@@ -2219,6 +2269,36 @@ mod tests {
+         (registry, ranks, adapters)
+     }
+ 
++    #[test]
++    fn a_replica_pulls_a_peer_prefix_into_g2_without_a_request() {
++        let config = crate::engine::KvcrConfig {
++            latency_to_first_byte_ms: 1.0,
++            bandwidth_gbps: 1.0,
++            ..Default::default()
++        };
++        let (registry, ranks, [mut source, mut target]) = kvcr_workers(config, [4, 4]);
++        let keys: Vec<HostBlockKey> = [11_u64, 12].into_iter().map(HostBlockKey::new).collect();
++        for key in &keys {
++            seed_host(&mut source, *key);
++        }
++        let hashes: Vec<u64> = keys.iter().map(|k| k.sequence_hash()).collect();
++        // Staged: both blocks, from the source's G2.
++        let staged = target.replicate(ranks[0], &hashes, &[1, 2], 0.0);
++        assert_eq!(staged, hashes);
++        registry.lock().unwrap().start_parked();
++        let mut manager = G1Manager::new_with_caching(4, 4, KvEventPublishers::default(), 0, true);
++        assert!(target.advance(&mut manager, 3.0).completed_any);
++        for key in &keys {
++            assert_eq!(target.host.lock().lookup(*key), Lookup::Hit);
++        }
++        // Already held: nothing more is staged; from itself, nothing.
++        assert!(target.replicate(ranks[0], &hashes, &[1, 2], 4.0).is_empty());
++        assert!(source.replicate(ranks[0], &hashes, &[1, 2], 4.0).is_empty());
++        // Without KVCR, nothing.
++        let mut plain = adapter(4);
++        assert!(plain.replicate(ranks[0], &hashes, &[1, 2], 0.0).is_empty());
++    }
++
+     #[test]
+     fn hinted_lookup_pulls_a_peer_prefix_and_counts_only_its_first_load() {
+         let config = crate::engine::KvcrConfig {
+diff --git a/crates/core/src/replay/components/engine.rs b/crates/core/src/replay/components/engine.rs
+index 6de63f3bb..daafb9e0a 100644
+--- a/crates/core/src/replay/components/engine.rs
++++ b/crates/core/src/replay/components/engine.rs
+@@ -743,6 +743,47 @@ where
+                     }
+                     // Replay handles `engine.dequeue` before the engine sees the message.
+                     KvAction::Dequeue { .. } => (KvActionStatus::Unsupported, Vec::new()),
++                    KvAction::Replicate {
++                        source_scheduler_id,
++                        block_hashes,
++                        local_hashes,
++                    } => {
++                        let source = self.rank_identity(*source_scheduler_id).map(
++                            |(worker_id, dp_rank)| KvHintSource {
++                                worker_id: worker_id as u64,
++                                dp_rank,
++                            },
++                        );
++                        match (source, rank, &self.factory.kvcr) {
++                            (Some(source), Some(_), Some(_)) if *source_scheduler_id != message.scheduler_id => {
++                                let effects = self.apply_command(
++                                    message.scheduler_id,
++                                    Command::KvBlocks(KvBlockCommand::Replicate {
++                                        source,
++                                        hashes: block_hashes.clone(),
++                                        local_hashes: local_hashes.clone(),
++                                    }),
++                                    now_ms,
++                                )?;
++                                observed.push(effects.engine_events);
++                                let staged = self
++                                    .factory
++                                    .kvcr
++                                    .as_ref()
++                                    .and_then(|registry| registry.lock().unwrap().take_kv_command_result())
++                                    .unwrap_or_default();
++                                let status = if staged.is_empty() {
++                                    KvActionStatus::Failed
++                                } else if staged.len() >= block_hashes.len() {
++                                    KvActionStatus::Done
++                                } else {
++                                    KvActionStatus::Partial
++                                };
++                                (status, staged)
++                            }
++                            _ => (KvActionStatus::Unsupported, Vec::new()),
++                        }
++                    }
+                     KvAction::ReleaseSource { block_hashes } => {
+                         let tier = self
+                             .factory
+diff --git a/crates/core/src/replay/core/mod.rs b/crates/core/src/replay/core/mod.rs
+index 2ca1461fd..2c623dce3 100644
+--- a/crates/core/src/replay/core/mod.rs
++++ b/crates/core/src/replay/core/mod.rs
+@@ -154,6 +154,14 @@ pub enum KvAction {
+         block_hashes: Vec<u64>,
+         local_hashes: Vec<u64>,
+     },
++    /// `kv.replicate@1.0`: pull into this rank's G2, over KVCR from the rank
++    /// `source_scheduler_id`, the leading blocks of this chain it lacks (a fan-out replica
++    /// ahead of the subagents that will read it). `local_hashes` are the blocks' token hashes.
++    Replicate {
++        source_scheduler_id: usize,
++        block_hashes: Vec<u64>,
++        local_hashes: Vec<u64>,
++    },
+     /// `engine.dequeue@1.0`: hand this request back to the router if it still waits in this
+     /// rank's queue (no pass has started it). Replay cancels it on the rank and asks the policy
+     /// to place it again ([`PlacementPolicy::requeued`]); `Failed` when it already runs, is gone,

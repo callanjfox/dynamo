@@ -1,0 +1,237 @@
+From 9a258c003e3cebc0bebd332871f87bf4bcd87690 Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Fri, 13 Nov 2026 05:07:36 +1000
+Subject: [PATCH 20/38] fix(demote): demote drops only childless blocks, tail
+ first, so it never cuts a cached prefix chain; dropping a middle block
+ truncated the router indexer's node and its later removals and stores under
+ it failed (demote + prefetch stopped the replay). Cached chains are tracked
+ from the KV events with KVCR on
+
+---
+ .../core/src/engine/kv_manager/g1_manager.rs  |  8 +++
+ .../src/engine/kv_manager/vllm_backend.rs     | 53 ++++++++++++++++++-
+ crates/core/src/engine/scheduler/vllm/core.rs | 35 ++++++++----
+ .../src/engine/scheduler/vllm/host_offload.rs | 31 +++++++++--
+ 4 files changed, 113 insertions(+), 14 deletions(-)
+
+diff --git a/crates/core/src/engine/kv_manager/g1_manager.rs b/crates/core/src/engine/kv_manager/g1_manager.rs
+index b37332dad..0d92475c2 100644
+--- a/crates/core/src/engine/kv_manager/g1_manager.rs
++++ b/crates/core/src/engine/kv_manager/g1_manager.rs
+@@ -279,6 +279,14 @@ impl G1Manager {
+         self.inner.has_cached_block(hash)
+     }
+ 
++    pub(crate) fn track_chains(&mut self) {
++        self.inner.track_chains();
++    }
++
++    pub(crate) fn has_cached_child(&self, hash: u64) -> bool {
++        self.inner.has_cached_child(hash)
++    }
++
+     pub(crate) fn prefetch_cached_blocks(
+         &mut self,
+         hashes: &[u64],
+diff --git a/crates/core/src/engine/kv_manager/vllm_backend.rs b/crates/core/src/engine/kv_manager/vllm_backend.rs
+index 53c0341bc..4b4fe157f 100644
+--- a/crates/core/src/engine/kv_manager/vllm_backend.rs
++++ b/crates/core/src/engine/kv_manager/vllm_backend.rs
+@@ -13,6 +13,13 @@ use super::AllocationRequirement;
+ use super::grouped::{GroupedKvPool, GroupedLease};
+ use super::state_cache_manager::{StateCacheManager, StateRequest};
+ use crate::engine::belady::BeladyOracle;
++
++/// Cached prefix chains of one rank's G1, from its KV events.
++#[derive(Debug, Default)]
++pub(crate) struct CachedChains {
++    parent_of: rustc_hash::FxHashMap<SequenceHash, SequenceHash>,
++    children: rustc_hash::FxHashMap<SequenceHash, u32>,
++}
+ pub(crate) use crate::engine::cache::vllm_block_pool::SourceReuseDependency;
+ use crate::engine::cache::vllm_block_pool::{
+     BlockCopyId, BlockReservation, CacheKey, ReserveOutcome, VllmBlockPool,
+@@ -381,6 +388,10 @@ pub(crate) struct VllmKvManager {
+     evicted_log: Option<Vec<SequenceHash>>,
+     /// G1 residency shared with this rank's G2, for retention by value.
+     g1_view: Option<crate::engine::kv_retain::SharedG1View>,
++    /// With KVCR (path B block actions): each cached block's parent in its prefix chain, and how
++    /// many cached children each block has, from the same stored and removed events the router's
++    /// index reads. Demote drops only childless blocks so it never cuts a cached chain.
++    chain: Option<CachedChains>,
+ }
+ 
+ impl VllmKvManager {
+@@ -393,6 +404,18 @@ impl VllmKvManager {
+         self.g1_view = Some(view);
+     }
+ 
++    /// Start tracking cached chains (see `chain`).
++    pub(crate) fn track_chains(&mut self) {
++        self.chain.get_or_insert_with(CachedChains::default);
++    }
++
++    /// Whether a cached block extends `hash` (always false when chains are not tracked).
++    pub(crate) fn has_cached_child(&self, hash: SequenceHash) -> bool {
++        self.chain
++            .as_ref()
++            .is_some_and(|c| c.children.get(&hash).is_some_and(|n| *n > 0))
++    }
++
+     pub(crate) fn take_evicted(&mut self) -> Vec<SequenceHash> {
+         self.evicted_log.as_mut().map(std::mem::take).unwrap_or_default()
+     }
+@@ -439,6 +462,7 @@ impl VllmKvManager {
+             prefix_match_unit: None,
+             evicted_log: None,
+             g1_view: None,
++            chain: None,
+         }
+     }
+ 
+@@ -1726,7 +1750,9 @@ impl VllmKvManager {
+     }
+ 
+     fn materialize_store_events(&self) -> bool {
+-        !self.kv_event_publishers.is_empty() || *kv_cache_trace::KV_CACHE_TRACE_ENABLED
++        !self.kv_event_publishers.is_empty()
++            || *kv_cache_trace::KV_CACHE_TRACE_ENABLED
++            || self.chain.is_some()
+     }
+ 
+     fn publish_store_sequence(
+@@ -1789,6 +1815,31 @@ impl VllmKvManager {
+         if !self.enable_prefix_caching || full_blocks.is_empty() {
+             return;
+         }
++        if let Some(chain) = &mut self.chain {
++            if is_store {
++                let mut parent = parent_hash;
++                for &hash in &full_blocks {
++                    if let Some(p) = parent
++                        && !chain.parent_of.contains_key(&hash)
++                    {
++                        chain.parent_of.insert(hash, p);
++                        *chain.children.entry(p).or_default() += 1;
++                    }
++                    parent = Some(hash);
++                }
++            } else {
++                for hash in &full_blocks {
++                    if let Some(p) = chain.parent_of.remove(hash)
++                        && let Some(n) = chain.children.get_mut(&p)
++                    {
++                        *n -= 1;
++                        if *n == 0 {
++                            chain.children.remove(&p);
++                        }
++                    }
++                }
++            }
++        }
+         if let Some(view) = &self.g1_view {
+             let mut view = view.lock().unwrap();
+             if is_store {
+diff --git a/crates/core/src/engine/scheduler/vllm/core.rs b/crates/core/src/engine/scheduler/vllm/core.rs
+index e62ec017b..aa7ab9859 100644
+--- a/crates/core/src/engine/scheduler/vllm/core.rs
++++ b/crates/core/src/engine/scheduler/vllm/core.rs
+@@ -800,6 +800,7 @@ impl VllmCore {
+     ) -> HostTierHandle {
+         let view = crate::engine::kv_retain::SharedG1View::default();
+         self.kv_manager.set_g1_view(std::sync::Arc::clone(&view));
++        self.kv_manager.track_chains();
+         self.native_host_offload
+             .as_mut()
+             .expect("KVCR requires G2")
+@@ -2594,17 +2595,31 @@ impl VllmCore {
+                 g2,
+                 only_if_in_g2,
+             } => {
+-                let g1_hashes: Vec<u64> = if only_if_in_g2 {
+-                    match adapter {
+-                        Some(adapter) => hashes.iter().copied().filter(|h| adapter.g2_resident(*h)).collect(),
+-                        None => Vec::new(),
+-                    }
+-                } else {
+-                    hashes.clone()
+-                };
+                 let mut affected = Vec::new();
+-                if g1 {
+-                    affected.extend(self.kv_manager.drop_cached_blocks(&g1_hashes));
++                if g1 && only_if_in_g2 {
++                    // Demote: drop only childless blocks, tail first, back to the first block G2
++                    // lacks, G1 cannot drop (in use) or another cached block extends. A block
++                    // dropped from the middle of a cached chain truncates the router indexer's
++                    // node there: the blocks after it leave the index while G1 still holds them,
++                    // and their later removals (or a store under one of them) fail ("Failed to
++                    // find block", "... parent block").
++                    if let Some(adapter) = adapter {
++                        for &hash in hashes.iter().rev() {
++                            if !self.kv_manager.has_cached_block(hash) {
++                                continue;
++                            }
++                            if !adapter.g2_resident(hash) || self.kv_manager.has_cached_child(hash) {
++                                break;
++                            }
++                            let dropped = self.kv_manager.drop_cached_blocks(&[hash]);
++                            if dropped.is_empty() {
++                                break;
++                            }
++                            affected.extend(dropped);
++                        }
++                    }
++                } else if g1 {
++                    affected.extend(self.kv_manager.drop_cached_blocks(&hashes));
+                 }
+                 let g1_count = affected.len();
+                 if let Some(adapter) = self.native_host_offload.as_mut() {
+diff --git a/crates/core/src/engine/scheduler/vllm/host_offload.rs b/crates/core/src/engine/scheduler/vllm/host_offload.rs
+index 2eac01274..d8d8a9931 100644
+--- a/crates/core/src/engine/scheduler/vllm/host_offload.rs
++++ b/crates/core/src/engine/scheduler/vllm/host_offload.rs
+@@ -1310,7 +1310,9 @@ mod tests {
+ 
+     #[test]
+     fn demote_keeps_a_block_g2_lacks() {
+-        // G2 of two blocks: a later one-block prompt evicts one of the first two.
++        // G2 of two blocks: a later one-block prompt evicts one of the first two. Demote drops only
++        // the chain's tail, back to the first block G2 lacks: a block whose next block stays in G1
++        // is kept, or the router's index would lose the blocks after it.
+         let mut core = block_action_core(16, 2, false);
+         let mut now_ms = 0.0;
+         let tokens: Vec<u32> = (1..=8).collect();
+@@ -1321,8 +1323,31 @@ mod tests {
+         let in_g2: Vec<bool> = hashes.iter().map(|hash| core.kv_residency(*hash).1).collect();
+         assert_eq!(in_g2.iter().filter(|held| **held).count(), 1);
+         core.apply_command(drop_blocks(&hashes, true, false, true)).unwrap();
+-        for (hash, held) in hashes.iter().zip(in_g2) {
+-            assert_eq!(core.kv_residency(*hash), (!held, held));
++        let tail_len = in_g2.iter().rev().take_while(|held| **held).count();
++        let first_dropped = hashes.len() - tail_len;
++        for (i, (hash, held)) in hashes.iter().zip(in_g2).enumerate() {
++            assert_eq!(core.kv_residency(*hash), (i < first_dropped, held));
++        }
++    }
++
++    #[test]
++    fn demote_never_drops_a_block_whose_next_block_stays_in_g1() {
++        // G2 of eight: both blocks reach G2. Demote arrives through KVCR, which tracks cached
++        // chains (`VllmCore::set_kvcr`); this core has no KVCR registry, so track them here.
++        let mut core = block_action_core(16, 8, false);
++        core.kv_manager.track_chains();
++        let mut now_ms = 0.0;
++        let tokens: Vec<u32> = (1..=8).collect();
++        let uuid = Uuid::from_u128(47);
++        run_to_completion(&mut core, uuid, tokens.clone(), &mut now_ms);
++        let hashes = prompt_hashes(uuid, tokens);
++        // Asked to demote only the first block: the second stays in G1, so nothing is dropped.
++        core.apply_command(drop_blocks(&hashes[..1], true, false, true)).unwrap();
++        assert_eq!(core.kv_residency(hashes[0]), (true, true));
++        // The whole chain goes, tail first.
++        core.apply_command(drop_blocks(&hashes, true, false, true)).unwrap();
++        for hash in &hashes {
++            assert_eq!(core.kv_residency(*hash), (false, true));
+         }
+     }
+ 

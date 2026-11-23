@@ -1,0 +1,10 @@
+# The plain KV router: classes exist only so requests name a known class; with no busy threshold no class
+# ever queues, so quanta never apply.
+default_policy_class: standard
+policy_classes:
+  - name: priority
+    quantum: 1
+  - name: standard
+    quantum: 1
+  - name: batch
+    quantum: 1

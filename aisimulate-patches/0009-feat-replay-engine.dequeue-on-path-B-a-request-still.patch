@@ -1,0 +1,585 @@
+From 0faa4587991ccdbe94cb862d64a55cf3d553f7b9 Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Thu, 12 Nov 2026 18:32:57 +1000
+Subject: [PATCH 09/38] feat(replay): engine.dequeue on path B: a request still
+ waiting in its rank's queue is handed back and placed again, off unless the
+ policy keeps dispatched requests
+
+KvAction::Dequeue { request_id } (engine.dequeue@1.0). When the placement policy asks for it
+(PlacementPolicy::retains_dispatched), aggregated replay keeps a copy of each dispatched request
+until its prefill completes. A dequeue of a request that is on that rank, not in the rank's
+pending pass, not being tokenized and whose prefill has not completed cancels it on the rank
+(CancelRequest, pending output discarded), reports Done and asks the policy to place it again
+(PlacementPolicy::requeued); the placement is dispatched from the kept copy and the request's
+record takes the new worker. Anything else is Failed. Tests: a waiting request moves to an idle
+rank and starts at once; a request that already ran is not handed back.
+---
+ crates/core/src/replay/agg.rs                 | 347 ++++++++++++++++--
+ crates/core/src/replay/components/engine.rs   |   2 +
+ .../src/replay/components/tokenization.rs     |   5 +
+ crates/core/src/replay/core/mod.rs            |  15 +
+ crates/core/src/replay/replayer.rs            |  14 +
+ crates/core/src/replay/report.rs              |   7 +
+ crates/core/src/replay/state.rs               |  20 +
+ 7 files changed, 388 insertions(+), 22 deletions(-)
+
+diff --git a/crates/core/src/replay/agg.rs b/crates/core/src/replay/agg.rs
+index cf7a27f1d..8c58fb732 100644
+--- a/crates/core/src/replay/agg.rs
++++ b/crates/core/src/replay/agg.rs
+@@ -118,6 +118,8 @@ where
+     profile_cancel_started: bool,
+     profile_canceled_requests: usize,
+     profile_unsettled_requests: usize,
++    /// Requests an `engine.dequeue` handed back, waiting for the policy's new placement.
++    requeued: FxHashMap<Uuid, DirectRequest>,
+ }
+ 
+ impl<PlacementPolicyImpl, Observation, Metadata>
+@@ -187,6 +189,7 @@ where
+             profile_cancel_started: false,
+             profile_canceled_requests: 0,
+             profile_unsettled_requests: 0,
++            requeued: FxHashMap::default(),
+             encoder: None,
+         })
+     }
+@@ -384,14 +387,27 @@ where
+                 placement.cache_sample,
+                 placement.placement_replica_id,
+             );
+-            let request = self
+-                .requests
+-                .get_mut(&uuid)
+-                .ok_or_else(|| {
+-                    anyhow::anyhow!("offline replay missing queued request state for {uuid}")
+-                })?
+-                .take_queued_request(uuid, placement.scheduler_id)?;
++            let retain = self.placement.retains_dispatched();
++            let state = self.requests.get_mut(&uuid).ok_or_else(|| {
++                anyhow::anyhow!("offline replay missing queued request state for {uuid}")
++            })?;
++            let requeued = self.requeued.remove(&uuid);
++            let again = requeued.is_some();
++            let request = if let Some(request) = requeued {
++                // Placed again after an `engine.dequeue`: the kept copy goes.
++                state.redispatched(placement.scheduler_id);
++                request
++            } else {
++                state.take_queued_request(uuid, placement.scheduler_id)?
++            };
++            if retain && !state.prefill_completed && !again {
++                state.retained = Some(request.clone());
++            }
+             self.dispatch_to_worker(request, uuid, placement.scheduler_id, kv_hint)?;
++            if again {
++                self.collector
++                    .on_decode_reassigned(uuid, placement.scheduler_id);
++            }
+         }
+         Ok(())
+     }
+@@ -456,20 +472,17 @@ where
+                     placement.cache_sample,
+                     placement.placement_replica_id,
+                 );
+-                self.requests.insert(
+-                    uuid,
+-                    AggRequestState::new_running(
+-                        input_length,
+-                        output_length,
+-                        placement.scheduler_id,
+-                    ),
+-                );
+-                self.dispatch_to_worker(
+-                    request.into_direct_request(),
+-                    uuid,
++                let mut state = AggRequestState::new_running(
++                    input_length,
++                    output_length,
+                     placement.scheduler_id,
+-                    kv_hint,
+-                )?;
++                );
++                let direct = request.into_direct_request();
++                if self.placement.retains_dispatched() {
++                    state.retained = Some(direct.clone());
++                }
++                self.requests.insert(uuid, state);
++                self.dispatch_to_worker(direct, uuid, placement.scheduler_id, kv_hint)?;
+             }
+             PlacementDecision::Queued => {
+                 self.collector
+@@ -608,16 +621,100 @@ where
+     /// ranks now, and hand the results back at the same virtual time. Returns
+     /// whether any were delivered.
+     fn deliver_kv_actions(&mut self) -> anyhow::Result<bool> {
+-        let messages = self.placement.take_kv_actions();
++        let mut messages = self.placement.take_kv_actions();
+         if messages.is_empty() {
+             return Ok(false);
+         }
+-        let (results, observed) = self.engine.apply_kv_actions(messages, self.now_ms)?;
++        // `engine.dequeue` is a replay action: it needs the request's kept copy.
++        let mut dequeue_results = Vec::new();
++        let mut dequeued = Vec::new();
++        for message in &mut messages {
++            let (dequeues, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut message.actions)
++                .into_iter()
++                .partition(|a| matches!(a.action, crate::replay::core::KvAction::Dequeue { .. }));
++            message.actions = rest;
++            for action in dequeues {
++                let crate::replay::core::KvAction::Dequeue { request_id } = action.action else {
++                    unreachable!("partitioned on Dequeue");
++                };
++                let done = self.dequeue(message.scheduler_id, request_id)?;
++                if done {
++                    dequeued.push(request_id);
++                }
++                dequeue_results.push(crate::replay::core::KvActionResult {
++                    scheduler_id: message.scheduler_id,
++                    message_id: message.message_id,
++                    action_id: action.action_id,
++                    status: if done {
++                        crate::replay::core::KvActionStatus::Done
++                    } else {
++                        crate::replay::core::KvActionStatus::Failed
++                    },
++                    blocks: Vec::new(),
++                });
++            }
++        }
++        messages.retain(|m| !m.actions.is_empty());
++        let (mut results, observed) = if messages.is_empty() {
++            (Vec::new(), Vec::new())
++        } else {
++            self.engine.apply_kv_actions(messages, self.now_ms)?
++        };
++        results.extend(dequeue_results);
+         self.placement.kv_action_results(results, self.now_ms)?;
+         // The blocks those actions dropped or loaded, as KV events for the router.
+         for events in observed {
+             self.apply_engine_observations(events, KvIngestBoundary::SchedulerCommand)?;
+         }
++        for request_id in dequeued {
++            let placements = self.placement.requeued(request_id, self.now_ms)?;
++            self.dispatch_placements(placements)?;
++        }
++        Ok(true)
++    }
++
++    /// `engine.dequeue`: take `request_id` back from rank `scheduler_id` if it still waits
++    /// there (no pass has started it, its prefill has not completed, it is not being tokenized)
++    /// and a copy of it was kept. Cancels it on the rank and keeps the copy for the policy's
++    /// new placement. Returns whether it was taken back.
++    fn dequeue(&mut self, scheduler_id: usize, request_id: Uuid) -> anyhow::Result<bool> {
++        let Some(state) = self.requests.get(&request_id) else {
++            return Ok(false);
++        };
++        if state.scheduler_id() != Some(scheduler_id)
++            || state.prefill_completed
++            || state.retained.is_none()
++        {
++            return Ok(false);
++        }
++        if self
++            .tokenization
++            .as_ref()
++            .is_some_and(|t| t.contains(request_id))
++        {
++            return Ok(false);
++        }
++        if self
++            .engine
++            .request_has_committed_pass(scheduler_id, request_id)?
++        {
++            return Ok(false);
++        }
++        let effects = self.engine.apply_command(
++            scheduler_id,
++            Command::CancelRequest {
++                request_id,
++                discard_pending_output: true,
++            },
++            self.now_ms,
++        )?;
++        self.apply_engine_observations(effects.engine_events, KvIngestBoundary::SchedulerCommand)?;
++        let request = self
++            .requests
++            .get_mut(&request_id)
++            .and_then(|state| state.take_for_requeue())
++            .ok_or_else(|| anyhow::anyhow!("dequeued request {request_id} lost its copy"))?;
++        self.requeued.insert(request_id, request);
+         Ok(true)
+     }
+ 
+@@ -700,6 +797,9 @@ where
+                 anyhow::anyhow!("offline replay missing request state for {}", signal.uuid)
+             })?
+             .prefill_completed = true;
++        if let Some(state) = self.requests.get_mut(&signal.uuid) {
++            state.retained = None;
++        }
+         let placements = self.placement.prefill_completed(signal.uuid, self.now_ms)?;
+         self.dispatch_placements(placements)?;
+ 
+@@ -3259,3 +3359,206 @@ where
+             .with_wall_time_ms(wall_ms))
+     }
+ }
++
++#[cfg(test)]
++mod dequeue_tests {
++    use super::*;
++    use crate::engine::{EngineConfig, TimingModelConfig};
++    use crate::replay::components::NoReplayMetadata;
++    use crate::replay::core::{KvAction, KvActionMessage, KvActionRequest, KvActionResult};
++    use crate::replay::engine::{ReplayEngineConfig, ReplayEngineFactory};
++    use crate::replay::loadgen::ReplayRequestPayload;
++    use crate::replay::{NoEngineEvents, PlacementEffects, WorkerStage};
++    use std::collections::VecDeque;
++
++    const LONG: Uuid = Uuid::from_u128(1);
++    const WAITING: Uuid = Uuid::from_u128(2);
++
++    /// Puts every request on rank 0, then at `ask_ms` asks rank 0 to hand `WAITING` back and
++    /// places it on rank 1.
++    struct DequeueToIdle {
++        ask_ms: f64,
++        asked: bool,
++        outbox: Vec<KvActionMessage>,
++        results: Vec<KvActionResult>,
++        requeued: Vec<Uuid>,
++    }
++
++    fn placement(request_id: Uuid, scheduler_id: usize) -> Placement {
++        Placement {
++            request_id,
++            scheduler_id,
++            reported_overlap_tokens: 0,
++            cache_sample: None,
++            kv_hints: None,
++            placement_replica_id: None,
++        }
++    }
++
++    impl PlacementPolicy<ReplayRequestPayload> for DequeueToIdle {
++        type Metadata = NoReplayMetadata;
++        type Observation = ();
++
++        fn place(
++            &mut self,
++            request: &ReplayRequestPayload,
++            _metadata: Self::Metadata,
++            _session_id: Option<String>,
++            _now_ms: f64,
++        ) -> anyhow::Result<PlacementEffects> {
++            let id = request.metadata().uuid.expect("test ids");
++            Ok(PlacementEffects {
++                decision: PlacementDecision::Immediate(placement(id, 0)),
++                released: Vec::new(),
++            })
++        }
++        fn observe(&mut self, _o: (), _now_ms: f64) -> anyhow::Result<Vec<Placement>> {
++            Ok(Vec::new())
++        }
++        fn advance_clock(&mut self, now_ms: f64) -> anyhow::Result<Vec<Placement>> {
++            if !self.asked && now_ms >= self.ask_ms {
++                self.asked = true;
++                self.outbox.push(KvActionMessage {
++                    scheduler_id: 0,
++                    message_id: 1,
++                    actions: vec![KvActionRequest {
++                        action_id: 1,
++                        action: KvAction::Dequeue { request_id: WAITING },
++                    }],
++                });
++            }
++            Ok(Vec::new())
++        }
++        fn next_wakeup_ms(&self) -> Option<f64> {
++            (!self.asked).then_some(self.ask_ms)
++        }
++        fn take_kv_actions(&mut self) -> Vec<KvActionMessage> {
++            std::mem::take(&mut self.outbox)
++        }
++        fn kv_action_results(&mut self, results: Vec<KvActionResult>, _now_ms: f64) -> anyhow::Result<()> {
++            self.results.extend(results);
++            Ok(())
++        }
++        fn retains_dispatched(&self) -> bool {
++            true
++        }
++        fn requeued(&mut self, request_id: Uuid, _now_ms: f64) -> anyhow::Result<Vec<Placement>> {
++            self.requeued.push(request_id);
++            Ok(vec![placement(request_id, 1)])
++        }
++        fn cancel_pending(&mut self, _request_id: Uuid) -> bool {
++            false
++        }
++        fn request_terminal(&mut self, _id: Uuid, _now_ms: f64) -> anyhow::Result<Vec<Placement>> {
++            Ok(Vec::new())
++        }
++        fn prefill_completed(&mut self, _id: Uuid, _now_ms: f64) -> anyhow::Result<Vec<Placement>> {
++            Ok(Vec::new())
++        }
++        fn pending_count(&self) -> usize {
++            0
++        }
++        fn worker_ready(&mut self, _w: WorkerTopology, _now_ms: f64) -> anyhow::Result<Vec<Placement>> {
++            Ok(Vec::new())
++        }
++        fn worker_draining(&mut self, _w: WorkerTopology, _now_ms: f64) -> anyhow::Result<Vec<Placement>> {
++            Ok(Vec::new())
++        }
++        fn worker_removed(&mut self, _w: WorkerTopology, _now_ms: f64) -> anyhow::Result<Vec<Placement>> {
++            Ok(Vec::new())
++        }
++        fn topology_settled(&mut self, _now_ms: f64) -> anyhow::Result<Vec<Placement>> {
++            Ok(Vec::new())
++        }
++    }
++
++    fn request(uuid: Uuid, at_ms: f64, tokens: Vec<u32>, out: usize) -> DirectRequest {
++        DirectRequest {
++            tokens,
++            max_output_tokens: out,
++            uuid: Some(uuid),
++            arrival_timestamp_ms: Some(at_ms),
++            ..DirectRequest::default()
++        }
++    }
++
++    fn run(ask_ms: f64) -> TraceCollector {
++        let config = ReplayEngineConfig {
++            rank: EngineConfig {
++                num_gpu_blocks: 64,
++                block_size: 4,
++                max_num_seqs: 1,
++                max_num_batched_tokens: 64,
++                enable_prefix_caching: true,
++                timing_model: TimingModelConfig::Fixed {
++                    prefill_ms: 1.0,
++                    decode_ms: 1.0,
++                },
++                ..EngineConfig::default()
++            },
++            ..ReplayEngineConfig::default()
++        };
++        let factory = ReplayEngineFactory::new()
++            .role_factory(&config, WorkerStage::Aggregated, false)
++            .unwrap();
++        let admission = AdmissionQueue::new_requests(
++            VecDeque::from([
++                request(LONG, 0.0, vec![1, 2, 3, 4], 100),
++                request(WAITING, 1.0, vec![5, 6, 7, 8], 2),
++            ]),
++            ReplayMode::Trace,
++        );
++        let runtime = AggRuntimeImpl::<DequeueToIdle, NoEngineEvents, ()>::new_composed(
++            factory,
++            admission,
++            2,
++            None,
++            move |_dp_size, _topology| {
++                Ok(DequeueToIdle {
++                    ask_ms,
++                    asked: false,
++                    outbox: Vec::new(),
++                    results: Vec::new(),
++                    requeued: Vec::new(),
++                })
++            },
++        )
++        .unwrap()
++        .with_per_request_records(true);
++        runtime.run().unwrap().0
++    }
++
++    #[test]
++    fn a_waiting_request_is_handed_back_and_runs_on_another_rank() {
++        let report = run(5.0).finish();
++        assert_eq!(report.request_counts.completed_requests, 2);
++        let waiting = report
++            .per_request
++            .iter()
++            .find(|r| r.uuid == WAITING.to_string())
++            .unwrap();
++        assert_eq!(waiting.decode_worker_idx, Some(1));
++        assert_eq!(waiting.terminal_status, ReplayTerminalStatus::Completed);
++        let long = report
++            .per_request
++            .iter()
++            .find(|r| r.uuid == LONG.to_string())
++            .unwrap();
++        // It ran beside the long request instead of waiting ~100 decode steps behind it.
++        assert!(waiting.first_admit_ms.unwrap() < 10.0, "{:?}", waiting.first_admit_ms);
++        assert!(long.first_admit_ms.unwrap() < 1.0);
++    }
++
++    #[test]
++    fn a_running_request_is_not_handed_back() {
++        // At 200 ms the waiting request has long since run on rank 0.
++        let report = run(200.0).finish();
++        assert_eq!(report.request_counts.completed_requests, 2);
++        let waiting = report
++            .per_request
++            .iter()
++            .find(|r| r.uuid == WAITING.to_string())
++            .unwrap();
++        assert_eq!(waiting.decode_worker_idx, Some(0));
++    }
++}
+diff --git a/crates/core/src/replay/components/engine.rs b/crates/core/src/replay/components/engine.rs
+index 495f03baa..6de63f3bb 100644
+--- a/crates/core/src/replay/components/engine.rs
++++ b/crates/core/src/replay/components/engine.rs
+@@ -741,6 +741,8 @@ where
+                         };
+                         (status, affected)
+                     }
++                    // Replay handles `engine.dequeue` before the engine sees the message.
++                    KvAction::Dequeue { .. } => (KvActionStatus::Unsupported, Vec::new()),
+                     KvAction::ReleaseSource { block_hashes } => {
+                         let tier = self
+                             .factory
+diff --git a/crates/core/src/replay/components/tokenization.rs b/crates/core/src/replay/components/tokenization.rs
+index 104e0be5e..eaeefed31 100644
+--- a/crates/core/src/replay/components/tokenization.rs
++++ b/crates/core/src/replay/components/tokenization.rs
+@@ -72,6 +72,11 @@ impl<T> TokenizationStage<T> {
+         self.pending.len() - self.canceled.len()
+     }
+ 
++    /// Whether `request_id` is still being tokenized.
++    pub(crate) fn contains(&self, request_id: Uuid) -> bool {
++        self.pending_ids.contains(&request_id) && !self.canceled.contains(&request_id)
++    }
++
+     /// Cancel `request_id` if it is still being tokenized.
+     pub(crate) fn cancel(&mut self, request_id: Uuid) -> bool {
+         self.pending_ids.contains(&request_id) && self.canceled.insert(request_id)
+diff --git a/crates/core/src/replay/core/mod.rs b/crates/core/src/replay/core/mod.rs
+index e807cb2f7..2ca1461fd 100644
+--- a/crates/core/src/replay/core/mod.rs
++++ b/crates/core/src/replay/core/mod.rs
+@@ -154,6 +154,11 @@ pub enum KvAction {
+         block_hashes: Vec<u64>,
+         local_hashes: Vec<u64>,
+     },
++    /// `engine.dequeue@1.0`: hand this request back to the router if it still waits in this
++    /// rank's queue (no pass has started it). Replay cancels it on the rank and asks the policy
++    /// to place it again ([`PlacementPolicy::requeued`]); `Failed` when it already runs, is gone,
++    /// or replay kept no copy of it ([`PlacementPolicy::retains_dispatched`]).
++    Dequeue { request_id: Uuid },
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+@@ -271,6 +276,16 @@ pub trait PlacementPolicy<Request> {
+     fn next_wakeup_ms(&self) -> Option<f64> {
+         None
+     }
++    /// Whether replay should keep a copy of each dispatched request until its prefill completes,
++    /// so a path B `engine.dequeue` can hand it back ([`KvAction::Dequeue`]). Off by default.
++    fn retains_dispatched(&self) -> bool {
++        false
++    }
++    /// A request the engine handed back (`engine.dequeue` done): place it again. The placements
++    /// returned are dispatched with the kept copy.
++    fn requeued(&mut self, _request_id: Uuid, _now_ms: f64) -> Result<Vec<Placement>> {
++        Ok(Vec::new())
++    }
+     fn cancel_pending(&mut self, request_id: Uuid) -> bool;
+     /// Discard all request state, including tentative placement state when
+     /// cancellation precedes engine dispatch.
+diff --git a/crates/core/src/replay/replayer.rs b/crates/core/src/replay/replayer.rs
+index 9bf392096..d99cc821e 100644
+--- a/crates/core/src/replay/replayer.rs
++++ b/crates/core/src/replay/replayer.rs
+@@ -132,6 +132,20 @@ where
+             .map_err(placement_boundary)
+     }
+ 
++    fn retains_dispatched(&self) -> bool {
++        self.0.retains_dispatched()
++    }
++
++    fn requeued(
++        &mut self,
++        request_id: Uuid,
++        now_ms: f64,
++    ) -> AnyResult<Vec<crate::replay::core::Placement>> {
++        self.0
++            .requeued(request_id, now_ms)
++            .map_err(placement_boundary)
++    }
++
+     fn cancel_pending(&mut self, request_id: Uuid) -> bool {
+         self.0.cancel_pending(request_id)
+     }
+diff --git a/crates/core/src/replay/report.rs b/crates/core/src/replay/report.rs
+index d110ce48f..d863f35ef 100644
+--- a/crates/core/src/replay/report.rs
++++ b/crates/core/src/replay/report.rs
+@@ -1564,6 +1564,13 @@ impl TraceCollector {
+         }
+     }
+ 
++    /// The request was handed back (`engine.dequeue`) and placed again on `worker_idx`.
++    pub(crate) fn on_decode_reassigned(&mut self, uuid: Uuid, worker_idx: usize) {
++        if let Some(stats) = self.requests.get_mut(&uuid) {
++            stats.decode_worker_idx = Some(worker_idx);
++        }
++    }
++
+     pub fn on_admit(&mut self, uuid: Uuid, admit_time_ms: f64, reused_input_tokens: usize) {
+         self.on_admit_with_tier_attribution(uuid, admit_time_ms, reused_input_tokens, None);
+     }
+diff --git a/crates/core/src/replay/state.rs b/crates/core/src/replay/state.rs
+index efe02b76d..0ce2faef8 100644
+--- a/crates/core/src/replay/state.rs
++++ b/crates/core/src/replay/state.rs
+@@ -24,6 +24,9 @@ pub(crate) struct AggRequestState {
+     pub(crate) prefill_completed: bool,
+     pub(crate) input_tokens: usize,
+     pub(crate) output_tokens: usize,
++    /// A copy of the dispatched request, kept until its prefill completes when the policy may
++    /// dequeue it (`engine.dequeue`).
++    pub(crate) retained: Option<DirectRequest>,
+ }
+ 
+ impl AggRequestState {
+@@ -37,6 +40,7 @@ impl AggRequestState {
+             prefill_completed: false,
+             input_tokens,
+             output_tokens,
++            retained: None,
+         }
+     }
+ 
+@@ -52,9 +56,25 @@ impl AggRequestState {
+             prefill_completed: false,
+             input_tokens,
+             output_tokens,
++            retained: None,
+         }
+     }
+ 
++    /// Hand a dequeued request back: it is placed again from the kept copy.
++    pub(crate) fn take_for_requeue(&mut self) -> Option<DirectRequest> {
++        if self.phase != AggRequestPhase::Running || self.prefill_completed {
++            return None;
++        }
++        let request = self.retained.take()?;
++        self.scheduler_id = None;
++        Some(request)
++    }
++
++    /// The request was placed again on `scheduler_id`.
++    pub(crate) fn redispatched(&mut self, scheduler_id: usize) {
++        self.scheduler_id = Some(scheduler_id);
++    }
++
+     pub(crate) fn take_queued_request(
+         &mut self,
+         uuid: Uuid,

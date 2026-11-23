@@ -1,0 +1,250 @@
+From ca28ba9acf158d09bfe53733026889db8512ac81 Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Wed, 18 Nov 2026 19:48:28 +0000
+Subject: [PATCH 36/38] f48h: engine gauges for placement policies
+ (waiting_tokens, PlacementPolicy::engine_gauges)
+
+---
+ crates/core/src/engine/protocol.rs            |  2 ++
+ crates/core/src/engine/scheduler/mod.rs       |  5 ++++
+ crates/core/src/engine/scheduler/rank.rs      |  1 +
+ crates/core/src/engine/scheduler/vllm/core.rs |  8 +++++++
+ crates/core/src/replay/agg.rs                 | 23 ++++++++++++++++++-
+ crates/core/src/replay/components/engine.rs   |  1 +
+ crates/core/src/replay/core/mod.rs            | 14 +++++++++++
+ crates/core/src/replay/replayer.rs            | 12 ++++++++++
+ crates/core/src/replay/telemetry.rs           |  4 ++++
+ 9 files changed, 69 insertions(+), 1 deletion(-)
+
+diff --git a/crates/core/src/engine/protocol.rs b/crates/core/src/engine/protocol.rs
+index d814e4490..4d7de782b 100644
+--- a/crates/core/src/engine/protocol.rs
++++ b/crates/core/src/engine/protocol.rs
+@@ -410,6 +410,8 @@ pub struct Metrics {
+     /// Host (G2) tier blocks held and the tier's capacity (zero without one).
+     pub host_used_blocks: u64,
+     pub host_capacity_blocks: u64,
++    /// f48h: tokens the waiting queue must reserve (see `MockerMetrics::waiting_tokens`).
++    pub waiting_tokens: u64,
+ }
+ 
+ /// Per-pass scheduling statistics.
+diff --git a/crates/core/src/engine/scheduler/mod.rs b/crates/core/src/engine/scheduler/mod.rs
+index e2bcd8e7f..f5dede585 100644
+--- a/crates/core/src/engine/scheduler/mod.rs
++++ b/crates/core/src/engine/scheduler/mod.rs
+@@ -153,6 +153,10 @@ pub struct MockerMetrics {
+     /// shared pool reports the same totals on every rank.
+     pub host_used_blocks: u64,
+     pub host_capacity_blocks: u64,
++    /// f48h: tokens the waiting queue holds (input plus generated tokens of each waiting,
++    /// preempted or connector-waiting request): what its admissions must reserve in G1. The
++    /// live analogue is the FPM queued sum (`queued_requests.sum_prefill_tokens`). vLLM only.
++    pub waiting_tokens: u64,
+ }
+ 
+ impl MockerMetrics {
+@@ -221,6 +225,7 @@ impl MockerMetrics {
+             sglang_cache_total_tokens,
+             host_used_blocks: 0,
+             host_capacity_blocks: 0,
++            waiting_tokens: 0,
+         }
+     }
+ }
+diff --git a/crates/core/src/engine/scheduler/rank.rs b/crates/core/src/engine/scheduler/rank.rs
+index 8eff705b2..b855fce04 100644
+--- a/crates/core/src/engine/scheduler/rank.rs
++++ b/crates/core/src/engine/scheduler/rank.rs
+@@ -635,6 +635,7 @@ fn map_metrics(metrics: MockerMetrics) -> Metrics {
+         sglang_cache_total_tokens: metrics.sglang_cache_total_tokens,
+         host_used_blocks: metrics.host_used_blocks,
+         host_capacity_blocks: metrics.host_capacity_blocks,
++        waiting_tokens: metrics.waiting_tokens,
+     }
+ }
+ 
+diff --git a/crates/core/src/engine/scheduler/vllm/core.rs b/crates/core/src/engine/scheduler/vllm/core.rs
+index c229cdc07..2c79c8ee7 100644
+--- a/crates/core/src/engine/scheduler/vllm/core.rs
++++ b/crates/core/src/engine/scheduler/vllm/core.rs
+@@ -1967,6 +1967,14 @@ impl VllmCore {
+             metrics.host_used_blocks = used as u64;
+             metrics.host_capacity_blocks = capacity as u64;
+         }
++        metrics.waiting_tokens = self
++            .state
++            .waiting_members
++            .iter()
++            .chain(self.state.connector_waiting_members.iter())
++            .filter_map(|uuid| self.state.requests.get(uuid))
++            .map(|r| (r.sequence.num_input_tokens() + r.sequence.generated_tokens()) as u64)
++            .sum();
+         metrics
+     }
+ 
+diff --git a/crates/core/src/replay/agg.rs b/crates/core/src/replay/agg.rs
+index d4e237dca..e9a07425b 100644
+--- a/crates/core/src/replay/agg.rs
++++ b/crates/core/src/replay/agg.rs
+@@ -120,6 +120,8 @@ where
+     profile_unsettled_requests: usize,
+     /// Requests an `engine.dequeue` handed back, waiting for the policy's new placement.
+     requeued: FxHashMap<Uuid, DirectRequest>,
++    /// f48h: the policy reads the engines' gauges (`PlacementPolicy::wants_engine_gauges`).
++    engine_gauges: bool,
+ }
+ 
+ impl<PlacementPolicyImpl, Observation, Metadata>
+@@ -142,7 +144,7 @@ where
+         );
+         let dp_size = factory.dp_size();
+         let gpus_per_worker = factory.gpus_per_worker()?;
+-        let engine = EngineComponent::<Observation>::new_with_factory(
++        let mut engine = EngineComponent::<Observation>::new_with_factory(
+             SimulationWorkerStage::Aggregated,
+             EnginePassMode::Visible,
+             factory,
+@@ -150,6 +152,12 @@ where
+             startup_time_ms,
+         )?;
+         let placement = create_placement(dp_size, engine.active_topology())?;
++        // f48h: rank gauges are tracked only for a policy that reads them. Tracking them adds
++        // no telemetry output: samples are published only with a telemetry observer installed.
++        let engine_gauges = placement.wants_engine_gauges();
++        if engine_gauges {
++            engine.enable_telemetry();
++        }
+ 
+         // Aggregated replay has a single (decode) pool; record its GPUs/worker
+         // so the report can express GPU-hours from the mocker's own parallelism.
+@@ -191,6 +199,7 @@ where
+             profile_unsettled_requests: 0,
+             requeued: FxHashMap::default(),
+             encoder: None,
++            engine_gauges,
+         })
+     }
+ 
+@@ -417,6 +426,14 @@ where
+     }
+ 
+     /// Admit one external request into the collector, optional router, and worker pool.
++    /// f48h: hand the policy the engines' current gauges, when it reads them.
++    fn send_engine_gauges(&mut self) {
++        if self.engine_gauges {
++            let gauges = self.engine.telemetry_gauges_snapshot();
++            self.placement.engine_gauges(&gauges, self.now_ms);
++        }
++    }
++
+     fn assign_request(
+         &mut self,
+         mut request: ReplayRequestPayload,
+@@ -433,6 +450,7 @@ where
+             request.metadata_mut().arrival_timestamp_ms = Some(arrival_time_ms);
+         }
+ 
++        self.send_engine_gauges();
+         let effects = self
+             .placement
+             .place(&request, metadata, session_id, self.now_ms)?;
+@@ -616,6 +634,7 @@ where
+                 |encoder| Observation::encode_kv_ingest(&events, encoder),
+             )?;
+         }
++        self.send_engine_gauges();
+         let placements = self.placement.observe(events, self.now_ms)?;
+         self.deliver_kv_actions()?;
+         self.dispatch_placements(placements)
+@@ -685,6 +704,7 @@ where
+         results.extend(dequeue_results);
+         self.placement.kv_action_results(results, self.now_ms)?;
+         for request_id in dequeued {
++            self.send_engine_gauges();
+             let placements = self.placement.requeued(request_id, self.now_ms)?;
+             self.dispatch_placements(placements)?;
+         }
+@@ -1200,6 +1220,7 @@ where
+             // Settle idle deadlines first: a completion below may release a
+             // queued placement and submit it to that same idle worker.
+             changed |= self.settle_internal_work(&mut consecutive_internal_steps)?;
++            self.send_engine_gauges();
+             let released = self.placement.advance_clock(self.now_ms)?;
+             changed |= !released.is_empty();
+             // Timed path B actions (a prefetch due now) the clock released.
+diff --git a/crates/core/src/replay/components/engine.rs b/crates/core/src/replay/components/engine.rs
+index 9ba844674..8ffa85536 100644
+--- a/crates/core/src/replay/components/engine.rs
++++ b/crates/core/src/replay/components/engine.rs
+@@ -130,6 +130,7 @@ impl RankMetricsState {
+             waiting_requests: self.latest.waiting_requests,
+             host_used_blocks: self.latest.host_used_blocks,
+             host_capacity_blocks: self.latest.host_capacity_blocks,
++            waiting_tokens: self.latest.waiting_tokens,
+         }
+     }
+ 
+diff --git a/crates/core/src/replay/core/mod.rs b/crates/core/src/replay/core/mod.rs
+index 51fde5e4e..1d46e4856 100644
+--- a/crates/core/src/replay/core/mod.rs
++++ b/crates/core/src/replay/core/mod.rs
+@@ -294,6 +294,20 @@ pub trait PlacementPolicy<Request> {
+     fn requeued(&mut self, _request_id: Uuid, _now_ms: f64) -> Result<Vec<Placement>> {
+         Ok(Vec::new())
+     }
++    /// f48h: whether the policy reads the engines' own gauges (each rank's active and total
++    /// blocks, running and waiting requests, waiting tokens) through [`Self::engine_gauges`].
++    /// Off by default: replay then neither tracks nor sends them.
++    fn wants_engine_gauges(&self) -> bool {
++        false
++    }
++    /// f48h: the engines' gauges as of their last command or pass, sent before each `observe`,
++    /// `place`, `advance_clock` and `requeued` when [`Self::wants_engine_gauges`].
++    fn engine_gauges(
++        &mut self,
++        _gauges: &[crate::replay::ReplaySchedulerMetricsSnapshot],
++        _now_ms: f64,
++    ) {
++    }
+     fn cancel_pending(&mut self, request_id: Uuid) -> bool;
+     /// Discard all request state, including tentative placement state when
+     /// cancellation precedes engine dispatch.
+diff --git a/crates/core/src/replay/replayer.rs b/crates/core/src/replay/replayer.rs
+index d99cc821e..00c11e7f2 100644
+--- a/crates/core/src/replay/replayer.rs
++++ b/crates/core/src/replay/replayer.rs
+@@ -146,6 +146,18 @@ where
+             .map_err(placement_boundary)
+     }
+ 
++    fn wants_engine_gauges(&self) -> bool {
++        self.0.wants_engine_gauges()
++    }
++
++    fn engine_gauges(
++        &mut self,
++        gauges: &[crate::replay::ReplaySchedulerMetricsSnapshot],
++        now_ms: f64,
++    ) {
++        self.0.engine_gauges(gauges, now_ms)
++    }
++
+     fn cancel_pending(&mut self, request_id: Uuid) -> bool {
+         self.0.cancel_pending(request_id)
+     }
+diff --git a/crates/core/src/replay/telemetry.rs b/crates/core/src/replay/telemetry.rs
+index 52bfe37d5..f7fbd6c8d 100644
+--- a/crates/core/src/replay/telemetry.rs
++++ b/crates/core/src/replay/telemetry.rs
+@@ -55,6 +55,10 @@ pub struct ReplaySchedulerMetricsSnapshot {
+     /// same totals on every rank.
+     pub host_used_blocks: u64,
+     pub host_capacity_blocks: u64,
++    /// f48h: tokens the rank's waiting queue must reserve in G1. Not serialized, so telemetry
++    /// output is unchanged; placement policies read it through `PlacementPolicy::engine_gauges`.
++    #[serde(skip)]
++    pub waiting_tokens: u64,
+ }
+ 
+ /// Additive scheduler observations over one telemetry interval for one role.

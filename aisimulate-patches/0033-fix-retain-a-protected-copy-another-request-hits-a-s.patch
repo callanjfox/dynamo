@@ -1,0 +1,133 @@
+From ef4012c50b7445a6cdfa7be50401672f636a1e95 Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Sun, 15 Nov 2026 01:46:28 +1000
+Subject: [PATCH 33/38] fix(retain): a protected copy another request hits (a
+ shared prefix) is protected again when released, and re-protecting a copy
+ moves it to the protected list's tail with the later of its expiries, so the
+ list keeps a chain's tail ahead of its ancestors and an ancestor's expiry is
+ never earlier than a descendant's; with the previous commit,
+ AISIM_CHAIN_CHECK at 128 users, 1 worker, small storage: fixed TTL and TTL
+ until return 0 cuts (3 or more before, 41 with the hit fix alone), today 0;
+ the probe now logs every cut (a backtrace for the first three); unit tests
+
+---
+ .../core/src/engine/cache/vllm_block_pool.rs  | 56 ++++++++++++++++++-
+ .../src/engine/kv_manager/vllm_backend.rs     |  3 +
+ 2 files changed, 56 insertions(+), 3 deletions(-)
+
+diff --git a/crates/core/src/engine/cache/vllm_block_pool.rs b/crates/core/src/engine/cache/vllm_block_pool.rs
+index e64ee0ad6..d92fc7d6c 100644
+--- a/crates/core/src/engine/cache/vllm_block_pool.rs
++++ b/crates/core/src/engine/cache/vllm_block_pool.rs
+@@ -452,7 +452,16 @@ impl VllmBlockPool {
+                 continue;
+             }
+             if self.in_retain_list(id) {
++                // Re-protected: also move it to the list's tail, so the list keeps this
++                // protection's order (a chain's tail first). Left in place, an ancestor
++                // protected earlier stayed ahead of descendants protected now, and a broken
++                // protection evicted it first, cutting the chain.
++                let until_ms = until_ms.max(
++                    self.retain.as_deref().unwrap().until_ms.get(&id).map_or(0.0, |key| f64::from_bits(key.0)),
++                );
++                self.unlink_inactive(id);
+                 self.retain.as_deref_mut().unwrap().set_expiry(id, until_ms);
++                self.link_inactive_tail(id, true);
+                 continue;
+             }
+             if !self.is_linked_inactive(id) {
+@@ -1424,6 +1433,15 @@ impl VllmBlockPool {
+         // Must unlink before bumping pins: list membership is derived from
+         // refs and pins.
+         if self.is_inactive(id) {
++            // A protected copy another request hits (a shared prefix) keeps its protection for
++            // when it is released: in the ordinary LRU it would go before the protected
++            // descendants of its chain and cut it in the router's indexer.
++            if let Some(retain) = self.retain.as_deref_mut()
++                && let Some(&(until_bits, _)) = retain.until_ms.get(&id)
++            {
++                let until = retain.pending.entry(id).or_insert(f64::from_bits(until_bits));
++                *until = until.max(f64::from_bits(until_bits));
++            }
+             self.unlink_inactive(id);
+         }
+         let CopyState::Cached { pins, .. } = &mut self.copies[id].state else {
+@@ -1983,6 +2001,37 @@ mod tests {
+         pool.assert_lru_consistent();
+     }
+ 
++    #[test]
++    fn a_reprotected_ancestor_moves_behind_its_descendants() {
++        // 1 is protected by an earlier turn; the next turn extends it with 2 and protects its chain
++        // tail first ([2, 1]). With no ordinary block left, a broken protection must take 2 before
++        // 1 (1 left ahead of 2 in the list was evicted first and cut the chain).
++        let mut pool = VllmBlockPool::new(2);
++        let ancestor = cache_copy(&mut pool, 1);
++        pool.release(ancestor);
++        pool.protect(&[ancestor], 100.0, 0.0);
++        let descendant = cache_copy(&mut pool, 2);
++        pool.release(descendant);
++        pool.protect(&[descendant, ancestor], 50.0, 1.0);
++        pool.assert_lru_consistent();
++        let pressure = reserve(&mut pool, &[], 2);
++        assert_eq!(pressure.removed, vec![2, 1]);
++        pool.cancel(pressure.reservation);
++        // The ancestor keeps the later of its two expiries.
++        let mut pool = VllmBlockPool::new(2);
++        let ancestor = cache_copy(&mut pool, 1);
++        pool.release(ancestor);
++        pool.protect(&[ancestor], 100.0, 0.0);
++        let descendant = cache_copy(&mut pool, 2);
++        pool.release(descendant);
++        pool.protect(&[descendant, ancestor], 50.0, 1.0);
++        pool.set_now_ms(60.0);
++        let pressure = reserve(&mut pool, &[], 1);
++        assert_eq!(pressure.removed, vec![2]);
++        pool.cancel(pressure.reservation);
++        pool.assert_lru_consistent();
++    }
++
+     #[test]
+     fn a_protected_copy_still_in_use_is_protected_when_released() {
+         // 1 is a shared prefix another request still holds when its owner's protection is applied;
+@@ -2002,14 +2051,15 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn a_retained_copy_that_is_hit_again_leaves_protection() {
++    fn a_retained_copy_that_is_hit_again_stays_protected() {
+         let mut pool = VllmBlockPool::new(3);
+         let kept = cache_copy(&mut pool, 1);
+         pool.release(kept);
+         let other = cache_copy(&mut pool, 2);
+         pool.release(other);
+         pool.protect(&[kept], 100.0, 0.0);
+-        // Reusing 1 takes it out of the retain list; releasing it puts it in the ordinary LRU.
++        // Reusing 1 takes it out of the retain list while it is in use; released, it is protected
++        // again until its expiry (in the ordinary LRU it could go before its chain's protected tail).
+         let mut hit = reserve(&mut pool, &[1], 0).reservation;
+         let copies: Vec<_> = pool.activate_prefix(&mut hit).collect();
+         pool.assert_lru_consistent();
+@@ -2019,7 +2069,7 @@ mod tests {
+         pool.assert_lru_consistent();
+         let pressure = reserve(&mut pool, &[], 3);
+         assert_eq!(pressure.removed, vec![2, 1]);
+-        assert_eq!(pool.take_retain_broken(), 0);
++        assert_eq!(pool.take_retain_broken(), 1);
+         pool.cancel(pressure.reservation);
+     }
+ 
+diff --git a/crates/core/src/engine/kv_manager/vllm_backend.rs b/crates/core/src/engine/kv_manager/vllm_backend.rs
+index 93b2d4c9b..79a1322f6 100644
+--- a/crates/core/src/engine/kv_manager/vllm_backend.rs
++++ b/crates/core/src/engine/kv_manager/vllm_backend.rs
+@@ -1896,6 +1896,9 @@ impl VllmKvManager {
+                                 full_blocks.len(),
+                                 std::backtrace::Backtrace::force_capture()
+                             );
++                        } else {
++                            // Every later cut, one line each, so the count is complete.
++                            eprintln!("CHAIN_CUT rank={} hash={} n={}", self.dp_rank, hash, full_blocks.len());
+                         }
+                     }
+                     if let Some(p) = chain.parent_of.remove(hash) {

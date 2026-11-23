@@ -1,0 +1,1061 @@
+From 9b25450b5e84a4cb3077625b8156a3196a220d1f Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Thu, 12 Nov 2026 16:46:56 +1000
+Subject: [PATCH 13/38] feat(replay): closed-loop users in the agentic driver
+
+N user slots play scheduled copies of play templates (hash ids stored as deltas per
+template), each copy instantiated when its user starts it and freed when it settles,
+with its own block identity range and cp<key>: request ids; the next entry starts after
+a cooldown (a longer one after a failed play); nothing is dispatched at or after the
+horizon. WorkloadDriver::new_agentic_users; off unless used.
+---
+ crates/core/src/replay/loadgen/driver.rs | 323 +++++++++++++-
+ crates/core/src/replay/loadgen/mod.rs    |   2 +
+ crates/core/src/replay/loadgen/users.rs  | 530 +++++++++++++++++++++++
+ 3 files changed, 844 insertions(+), 11 deletions(-)
+ create mode 100644 crates/core/src/replay/loadgen/users.rs
+
+diff --git a/crates/core/src/replay/loadgen/driver.rs b/crates/core/src/replay/loadgen/driver.rs
+index 41bb3490c..666c2cd7a 100644
+--- a/crates/core/src/replay/loadgen/driver.rs
++++ b/crates/core/src/replay/loadgen/driver.rs
+@@ -166,6 +166,9 @@ struct AgenticState {
+     lifecycle: Vec<AgenticLifecycleRecord>,
+     next_lifecycle_ordinal: u64,
+     last_runtime_feedback_at_ms: Option<f64>,
++    // Users runs (`WorkloadDriver::new_agentic_users`): lanes whose play finished, with the time
++    // and whether it failed; the driver starts each user's next entry. `None` otherwise.
++    users_released: Option<Vec<(usize, f64, bool)>>,
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+@@ -320,6 +323,10 @@ enum PromptTokens {
+         slot: u64,
+     },
+     Materialized(Vec<u32>),
++    // A users-run copy's prompt, built from its template at dispatch.
++    Users {
++        input_length: usize,
++    },
+ }
+ 
+ impl PromptTokens {
+@@ -333,9 +340,9 @@ impl PromptTokens {
+ 
+     fn input_length(&self) -> usize {
+         match self {
+-            Self::Deferred { input_length, .. } | Self::Snapshot { input_length, .. } => {
+-                *input_length
+-            }
++            Self::Deferred { input_length, .. }
++            | Self::Snapshot { input_length, .. }
++            | Self::Users { input_length } => *input_length,
+             Self::Materialized(tokens) => tokens.len(),
+         }
+     }
+@@ -346,7 +353,7 @@ impl PromptTokens {
+                 input_length,
+                 hash_ids,
+             } => (*input_length, std::mem::take(hash_ids)),
+-            Self::Snapshot { .. } | Self::Materialized(_) => {
++            Self::Snapshot { .. } | Self::Materialized(_) | Self::Users { .. } => {
+                 unreachable!("full-prompt turns must retain their deferred representation")
+             }
+         }
+@@ -354,7 +361,7 @@ impl PromptTokens {
+ 
+     fn materialized(&self) -> &[u32] {
+         match self {
+-            Self::Deferred { .. } | Self::Snapshot { .. } => {
++            Self::Deferred { .. } | Self::Snapshot { .. } | Self::Users { .. } => {
+                 unreachable!("delta-cumulative prompts are materialized during driver setup")
+             }
+             Self::Materialized(tokens) => tokens,
+@@ -518,6 +525,10 @@ impl AgenticState {
+         event: AgenticLifecycleEventKind,
+         status: Option<ReplayTerminalStatus>,
+     ) {
++        // A users run's lifecycle grows with every copy; it keeps no transcript.
++        if self.users_released.is_some() {
++            return;
++        }
+         let ordinal = self.next_lifecycle_ordinal;
+         self.next_lifecycle_ordinal = self
+             .next_lifecycle_ordinal
+@@ -832,6 +843,10 @@ impl AgenticState {
+         };
+         debug_assert_eq!(self.lanes[lane_index].active_play, Some(play_index));
+         self.lanes[lane_index].active_play = None;
++        if let Some(released) = &mut self.users_released {
++            released.push((lane_index, now_ms, self.plays[play_index].failed));
++            return;
++        }
+         if self.next_pending_play >= self.plays.len() {
+             return;
+         }
+@@ -920,6 +935,7 @@ pub struct WorkloadDriver {
+     in_flight: FxHashMap<Uuid, InFlightTurn>,
+     agentic_settling: FxHashMap<Uuid, usize>,
+     ready_sessions: BinaryHeap<ReadySession>,
++    users: Option<Box<super::users::UsersRuntime>>,
+ }
+ 
+ impl WorkloadDriver {
+@@ -2116,6 +2132,7 @@ impl WorkloadDriver {
+             lifecycle: Vec::new(),
+             next_lifecycle_ordinal: 0,
+             last_runtime_feedback_at_ms: None,
++            users_released: None,
+         };
+         // No lane activation may renormalize the restored initial timers.
+         let mut ready_sessions = BinaryHeap::new();
+@@ -2149,6 +2166,7 @@ impl WorkloadDriver {
+             sessions,
+             in_flight: FxHashMap::default(),
+             agentic_settling: FxHashMap::default(),
++            users: None,
+             ready_sessions,
+         })
+     }
+@@ -2458,6 +2476,7 @@ impl WorkloadDriver {
+             lifecycle: Vec::new(),
+             next_lifecycle_ordinal: 0,
+             last_runtime_feedback_at_ms: None,
++            users_released: None,
+         };
+         let mut ready_sessions = BinaryHeap::new();
+         if state.lanes.is_empty() {
+@@ -2499,6 +2518,7 @@ impl WorkloadDriver {
+             sessions,
+             in_flight: FxHashMap::default(),
+             agentic_settling: FxHashMap::default(),
++            users: None,
+             ready_sessions,
+         })
+     }
+@@ -2625,6 +2645,7 @@ impl WorkloadDriver {
+             sessions,
+             in_flight: FxHashMap::default(),
+             agentic_settling: FxHashMap::default(),
++            users: None,
+             ready_sessions,
+         };
+         if let SchedulingPolicy::Concurrency(state) = &mut driver.policy {
+@@ -2763,6 +2784,9 @@ impl WorkloadDriver {
+             return;
+         };
+         self.apply_resolution(resolution, now_ms);
++        if let Err(error) = self.users_refill() {
++            tracing::error!(%error, "users run could not start a user's next play");
++        }
+     }
+ 
+     pub fn pop_ready(&mut self, now_ms: f64, limit: usize) -> Vec<ReadyTurn> {
+@@ -2803,7 +2827,12 @@ impl WorkloadDriver {
+             let Some(ready_session) = self.ready_sessions.pop() else {
+                 break;
+             };
+-            if ready_session.ready_at_ms > now_ms {
++            if ready_session.ready_at_ms > now_ms
++                || self
++                    .users
++                    .as_ref()
++                    .is_some_and(|users| ready_session.ready_at_ms >= users.horizon_ms())
++            {
+                 self.ready_sessions.push(ready_session);
+                 break;
+             }
+@@ -2849,9 +2878,15 @@ impl WorkloadDriver {
+                 continue;
+             };
+             let request_uuid = self.request_uuid(session_index, turn_index);
+-            let agentic_identity = match &self.policy {
+-                SchedulingPolicy::Agentic(state) => Some(state.identities[session_index].clone()),
+-                SchedulingPolicy::Trace | SchedulingPolicy::Concurrency(_) => None,
++            let agentic_identity = if self.users.is_some() {
++                Some(self.users_prepare_dispatch(session_index))
++            } else {
++                match &self.policy {
++                    SchedulingPolicy::Agentic(state) => {
++                        Some(state.identities[session_index].clone())
++                    }
++                    SchedulingPolicy::Trace | SchedulingPolicy::Concurrency(_) => None,
++                }
+             };
+             let session = &mut self.sessions[session_index];
+             let turn = &mut session.turns[turn_index];
+@@ -3309,6 +3344,7 @@ impl WorkloadDriver {
+         }
+         let node_index = resolution.session_index;
+         self.apply_resolution(resolution, now_ms);
++        self.users_refill()?;
+         if let Some(profile) = &mut self.agentic_profile {
+             let SchedulingPolicy::Agentic(state) = &mut self.policy else {
+                 unreachable!()
+@@ -3351,7 +3387,11 @@ impl WorkloadDriver {
+         let Some(node_index) = self.agentic_settling.remove(&request_uuid) else {
+             bail!("agentic request {request_uuid} became quiescent before its causal terminal");
+         };
+-        state.on_node_quiescent(node_index, now_ms)
++        state.on_node_quiescent(node_index, now_ms)?;
++        if self.users.is_some() {
++            self.users_free_if_settled(node_index);
++        }
++        Ok(())
+     }
+ 
+     fn validate_turn_resolution(
+@@ -3543,6 +3583,14 @@ impl WorkloadDriver {
+                 self.ready_sessions.pop();
+                 continue;
+             }
++            // A users run dispatches nothing at or after its horizon.
++            if self
++                .users
++                .as_ref()
++                .is_some_and(|users| ready_session.ready_at_ms >= users.horizon_ms())
++            {
++                return control_ms;
++            }
+             return Some(control_ms.map_or(ready_session.ready_at_ms, |control| {
+                 control.min(ready_session.ready_at_ms)
+             }));
+@@ -3550,6 +3598,19 @@ impl WorkloadDriver {
+     }
+ 
+     pub fn is_drained(&self) -> bool {
++        if let Some(users) = &self.users {
++            // Requests not yet ready at the horizon never run; blocked ones wait on work that is
++            // in flight or ready.
++            return self.in_flight.is_empty()
++                && self.agentic_settling.is_empty()
++                && self.ready_sessions.peek().is_none_or(|ready| {
++                    let session = &self.sessions[ready.session_index];
++                    ready.ready_at_ms >= users.horizon_ms()
++                        || session.in_flight.is_some()
++                        || session.next_turn_index != ready.turn_index
++                        || session.next_ready_at_ms != Some(ready.ready_at_ms)
++                });
++        }
+         if let Some(preparation) = &self.agentic_preparation {
+             match preparation.transition() {
+                 None => return false,
+@@ -3608,6 +3669,10 @@ impl WorkloadDriver {
+         let SchedulingPolicy::Agentic(state) = &self.policy else {
+             return None;
+         };
++        // A users run frees each copy when it settles; it reports no per-play outcomes.
++        if self.users.is_some() {
++            return None;
++        }
+         Some(state.play_outcomes(&self.sessions))
+     }
+ 
+@@ -3638,6 +3703,240 @@ impl WorkloadDriver {
+     }
+ }
+ 
++
++/// Closed-loop users (`super::users`): copies of play templates started per user, freed when settled.
++impl WorkloadDriver {
++    /// A users run: one lane per user, each starting its first schedule entry at time 0.
++    pub fn new_agentic_users(
++        users: super::users::AgenticUsers,
++        engine_block_size: usize,
++        include_replay_hashes: bool,
++    ) -> Result<Self> {
++        if engine_block_size == 0 {
++            bail!("engine_block_size must be greater than 0");
++        }
++        let engine_block_size_u32 =
++            u32::try_from(engine_block_size).context("engine_block_size does not fit in u32")?;
++        let lanes = users.plans.len();
++        let trace_block_size = users.corpus.block_size;
++        let state = AgenticState {
++            compressed_warmup_timing: false,
++            identities: Vec::new(),
++            node_states: Vec::new(),
++            remaining_dependencies: Vec::new(),
++            authored_not_before_ms: Vec::new(),
++            ready_after_ms: Vec::new(),
++            dispatch_dependents: Vec::new(),
++            completion_dependents: Vec::new(),
++            node_to_play: Vec::new(),
++            plays: Vec::new(),
++            lanes: (0..lanes)
++                .map(|_| AgenticLaneState { active_play: None })
++                .collect(),
++            next_pending_play: 0,
++            lifecycle: Vec::new(),
++            next_lifecycle_ordinal: 0,
++            last_runtime_feedback_at_ms: None,
++            users_released: Some(Vec::new()),
++        };
++        let mut driver = Self {
++            policy: SchedulingPolicy::Agentic(Box::new(state)),
++            prompt_mode: PromptMode::Full,
++            emit_session_metadata: true,
++            trace_block_size,
++            engine_block_size: engine_block_size_u32,
++            include_replay_hashes,
++            agentic_graph_identity: None,
++            agentic_replay_context: None,
++            agentic_snapshots: None,
++            agentic_preparation: None,
++            agentic_profile: None,
++            agentic_speedup: 1.0,
++            sessions: Vec::new(),
++            in_flight: FxHashMap::default(),
++            agentic_settling: FxHashMap::default(),
++            ready_sessions: BinaryHeap::new(),
++            users: Some(Box::new(super::users::UsersRuntime::new(users))),
++        };
++        for user in 0..lanes {
++            driver.users_start_next(user, 0.0)?;
++        }
++        Ok(driver)
++    }
++
++    /// Starts user `user`'s next schedule entry at `start_ms` (its roots become ready then), unless
++    /// the user has none left or the start is at or past the horizon. An empty template is skipped.
++    fn users_start_next(&mut self, user: usize, start_ms: f64) -> Result<()> {
++        let users = self.users.as_mut().expect("users run");
++        if start_ms >= users.horizon_ms() {
++            return Ok(());
++        }
++        let corpus = Arc::clone(&users.spec.corpus);
++        let (position, template_index) = loop {
++            let position = users.next_entry[user];
++            let Some(&template_index) = users.spec.plans[user].get(position) else {
++                users.users_out_of_entries += 1;
++                tracing::warn!(user, position, "users run: a user ran out of schedule entries");
++                return Ok(());
++            };
++            users.next_entry[user] += 1;
++            if !corpus.templates[template_index].nodes.is_empty() {
++                break (position, template_index);
++            }
++        };
++        let template = &corpus.templates[template_index];
++        let token_base = users.reserve_tokens(template_index)?;
++        let SchedulingPolicy::Agentic(state) = &mut self.policy else {
++            unreachable!("users runs are agentic")
++        };
++        let node_offset = self.sessions.len();
++        let play_index = state.plays.len();
++        let count = template.nodes.len();
++        for (k, node) in template.nodes.iter().enumerate() {
++            let ordinal = u128::try_from(node_offset + k + 1)?;
++            self.sessions.push(SessionRuntime {
++                session_id: String::new(),
++                turns: vec![TurnRuntime {
++                    request_id: None,
++                    play_id: None,
++                    replay_key: None,
++                    prompt_tokens: PromptTokens::Users {
++                        input_length: node.input_length,
++                    },
++                    max_output_tokens: node.output_length,
++                    output_token_ids: None,
++                    delay_after_previous_ms: 0.0,
++                    priority: 0,
++                    strict_priority: 0,
++                    policy_class: None,
++                    synthetic_session_id: false,
++                    images: Vec::new(),
++                    deterministic_request_id: Some(Uuid::from_u128(ordinal)),
++                }],
++                cumulative_tokens: Vec::new(),
++                next_turn_index: 0,
++                next_ready_at_ms: None,
++                in_flight: None,
++            });
++            state.node_states.push(AgenticNodeState::Blocked);
++            state.remaining_dependencies.push(node.dependencies.len());
++            state.authored_not_before_ms.push(node.not_before_ms);
++            state.ready_after_ms.push(node.not_before_ms);
++            state.dispatch_dependents.push(Vec::new());
++            state.completion_dependents.push(Vec::new());
++            state.node_to_play.push(play_index);
++        }
++        for (k, node) in template.nodes.iter().enumerate() {
++            for dependency in &node.dependencies {
++                let source = node_offset + dependency.node as usize;
++                let edge = AgenticDependentEdge {
++                    target_node: node_offset + k,
++                    delay_ms: dependency.delay_ms,
++                };
++                if dependency.dispatch {
++                    state.dispatch_dependents[source].push(edge);
++                } else {
++                    state.completion_dependents[source].push(edge);
++                }
++            }
++        }
++        let copy = super::users::UserCopy {
++            user: u32::try_from(user)?,
++            position: u32::try_from(position)?,
++            template: u32::try_from(template_index)?,
++            token_base,
++            node_offset,
++            freed: false,
++        };
++        let mut play = AgenticPlayState::new(
++            format!("users:{}", super::users::UsersRuntime::key(&copy)),
++            (node_offset..node_offset + count).collect(),
++            template.roots.iter().map(|&r| node_offset + r as usize).collect(),
++        );
++        play.lane_index = Some(user);
++        state.plays.push(play);
++        state.lanes[user].active_play = Some(play_index);
++        users.copies.push(copy);
++        state.activate_play(play_index, start_ms, &mut self.sessions, &mut self.ready_sessions);
++        Ok(())
++    }
++
++    /// Starts the next entry of every user whose play finished since the last call.
++    fn users_refill(&mut self) -> Result<()> {
++        let Some(users) = &self.users else {
++            return Ok(());
++        };
++        let (cooldown_ms, loss_ms) = (users.spec.cooldown_ms, users.spec.loss_cooldown_ms);
++        let SchedulingPolicy::Agentic(state) = &mut self.policy else {
++            return Ok(());
++        };
++        let released = std::mem::take(state.users_released.as_mut().expect("users run"));
++        for (user, at_ms, failed) in released {
++            self.users_start_next(user, at_ms + if failed { loss_ms } else { cooldown_ms })?;
++        }
++        Ok(())
++    }
++
++    /// Builds a copy's request at dispatch: identity, prompt blocks and planned output.
++    fn users_prepare_dispatch(&mut self, session_index: usize) -> AgenticRuntimeIdentity {
++        let users = self.users.as_ref().expect("users run");
++        let SchedulingPolicy::Agentic(state) = &self.policy else {
++            unreachable!("users runs are agentic")
++        };
++        let copy = users.copies[state.node_to_play[session_index]];
++        let node = session_index - copy.node_offset;
++        let identity = users.identity(&copy, node);
++        let hash_ids = users.hash_ids(&copy, node);
++        let session = &mut self.sessions[session_index];
++        session.session_id = identity.conversation_id.clone();
++        let turn = &mut session.turns[0];
++        turn.request_id = Some(identity.request_id.clone());
++        turn.play_id = Some(identity.play_id.clone());
++        let mut rng = StdRng::seed_from_u64(
++            SYNTHETIC_OUTPUT_SEED ^ (session_index as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15),
++        );
++        turn.output_token_ids = Some(planned_output_token_ids(
++            None,
++            turn.max_output_tokens,
++            &mut rng,
++        ));
++        turn.prompt_tokens = PromptTokens::Deferred {
++            input_length: turn.prompt_tokens.input_length(),
++            hash_ids,
++        };
++        identity
++    }
++
++    /// Frees a copy's nodes once its play has settled (client finished, every request quiescent).
++    fn users_free_if_settled(&mut self, node_index: usize) {
++        let SchedulingPolicy::Agentic(state) = &mut self.policy else {
++            return;
++        };
++        let play_index = state.node_to_play[node_index];
++        let users = self.users.as_mut().expect("users run");
++        let copy = &mut users.copies[play_index];
++        if copy.freed || !state.plays[play_index].quiescent {
++            return;
++        }
++        copy.freed = true;
++        let nodes = std::mem::take(&mut state.plays[play_index].nodes);
++        state.plays[play_index].root_nodes = Vec::new();
++        for index in nodes {
++            let session = &mut self.sessions[index];
++            session.session_id = String::new();
++            session.turns = Vec::new();
++            session.next_ready_at_ms = None;
++            state.dispatch_dependents[index] = Vec::new();
++            state.completion_dependents[index] = Vec::new();
++        }
++    }
++
++    /// Users that ran out of schedule entries before the horizon (users runs only).
++    pub fn users_out_of_entries(&self) -> Option<usize> {
++        self.users.as_ref().map(|users| users.users_out_of_entries)
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -3757,7 +4056,9 @@ mod tests {
+             .iter()
+             .map(|session| match &session.turns[0].prompt_tokens {
+                 PromptTokens::Deferred { hash_ids, .. } => hash_ids.clone(),
+-                PromptTokens::Snapshot { .. } | PromptTokens::Materialized(_) => {
++                PromptTokens::Snapshot { .. }
++                | PromptTokens::Materialized(_)
++                | PromptTokens::Users { .. } => {
+                     panic!("agentic prompts stay deferred")
+                 }
+             })
+diff --git a/crates/core/src/replay/loadgen/mod.rs b/crates/core/src/replay/loadgen/mod.rs
+index 718316bfd..436900010 100644
+--- a/crates/core/src/replay/loadgen/mod.rs
++++ b/crates/core/src/replay/loadgen/mod.rs
+@@ -12,6 +12,7 @@ mod snapshot;
+ mod steppable;
+ mod trace;
+ mod types;
++mod users;
+ mod weka;
+ 
+ use rand::Rng;
+@@ -29,6 +30,7 @@ pub use phase::{
+     AgenticPhaseLane, AgenticPhaseRequest, AgenticPreparationTransition, AgenticReplayPhase,
+     AgenticWarmupPolicy,
+ };
++pub use users::{AgenticUsers, UsersCorpus};
+ pub use profile::{AgenticIdleShift, AgenticProfileOptions, AgenticProfileReport};
+ pub use snapshot::{
+     AGENTIC_SNAPSHOT_SCHEMA_V1, AgenticPlaySnapshot, AgenticPrimer, AgenticReplayContext,
+diff --git a/crates/core/src/replay/loadgen/users.rs b/crates/core/src/replay/loadgen/users.rs
+new file mode 100644
+index 000000000..b849bc76f
+--- /dev/null
++++ b/crates/core/src/replay/loadgen/users.rs
+@@ -0,0 +1,530 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++//! Closed-loop users for agentic replay: N user slots, each playing a scheduled sequence of play
++//! templates, one after another, for a fixed horizon.
++//!
++//! Finite agentic replay preloads every request of every play as a graph node and runs each play
++//! once. A users run instead keeps each play's requests once as a template (hash IDs stored as a
++//! delta on an earlier request of the same play) and instantiates a copy of a template only when a
++//! user starts it, freeing the copy's nodes when it settles. Each copy gets its own block identity
++//! range, so copies never share KV, and its own request, session and play identity
++//! (`cp<key>:<template request id>`, key = user and position, six digits each).
++//!
++//! The schedule (which template each user plays at each position, its class) is drawn outside,
++//! once, so another simulator can run the same plays. A user starts its next entry when its play's
++//! client work finishes (after `cooldown_s`, or `loss_cooldown_s` when the play failed); nothing is
++//! dispatched at or after the horizon.
++
++use std::io::{BufRead, BufReader};
++use std::path::Path;
++use std::sync::Arc;
++
++use anyhow::{Context, Result, bail, ensure};
++use serde::Deserialize;
++
++use super::AgenticDependencyRelation;
++use crate::replay::AgenticRuntimeIdentity;
++
++const NO_BASE: u32 = u32::MAX;
++
++#[derive(Debug)]
++pub(super) struct TemplateDependency {
++    pub(super) node: u32,
++    pub(super) dispatch: bool,
++    pub(super) delay_ms: f64,
++}
++
++#[derive(Debug)]
++pub(super) struct TemplateNode {
++    pub(super) request_id: String,
++    pub(super) session_id: String,
++    pub(super) input_length: usize,
++    pub(super) output_length: usize,
++    pub(super) not_before_ms: f64,
++    pub(super) dependencies: Vec<TemplateDependency>,
++    /// The request whose spawn started this one (a subagent's first request).
++    pub(super) spawn_parent: Option<u32>,
++    base: u32,
++    prefix: u32,
++    new_ranks: Vec<u32>,
++}
++
++#[derive(Debug)]
++pub(super) struct PlayTemplate {
++    pub(super) nodes: Vec<TemplateNode>,
++    pub(super) roots: Vec<u32>,
++    /// Distinct play-local block ranks (each copy reserves this many block identities).
++    pub(super) blocks: u32,
++}
++
++impl PlayTemplate {
++    /// The play-local block ranks of node `index`'s prompt.
++    fn ranks(&self, index: usize) -> Vec<u32> {
++        let node = &self.nodes[index];
++        let mut need = node.prefix as usize + node.new_ranks.len();
++        let mut segments: Vec<(usize, usize)> = Vec::new();
++        let mut cur = index;
++        loop {
++            let n = &self.nodes[cur];
++            let prefix = n.prefix as usize;
++            if need > prefix {
++                segments.push((cur, need - prefix));
++                need = prefix;
++            }
++            if need == 0 {
++                break;
++            }
++            cur = n.base as usize;
++        }
++        let mut out = Vec::with_capacity(node.prefix as usize + node.new_ranks.len());
++        for (at, take) in segments.into_iter().rev() {
++            out.extend_from_slice(&self.nodes[at].new_ranks[..take]);
++        }
++        out
++    }
++}
++
++/// Play templates, loaded once (`templates.jsonl` from the users exporter).
++#[derive(Debug)]
++pub struct UsersCorpus {
++    pub(super) templates: Vec<PlayTemplate>,
++    pub(super) block_size: usize,
++}
++
++#[derive(Deserialize)]
++struct TemplatesHeader {
++    schema: String,
++    block_size: usize,
++    templates: usize,
++}
++
++#[derive(Deserialize)]
++struct TemplateRow {
++    i: usize,
++    blocks: u32,
++    nodes: Vec<NodeRow>,
++}
++
++// [request_id, session_id, input_length, output_length, not_before_ms, deps, base, prefix, new_ranks];
++// deps: [node, trigger (0 dispatch, 1 completion), delay_ms, relation (0 sequence, 1 spawn, 2 join, 3 barrier)].
++#[derive(Deserialize)]
++struct NodeRow(
++    String,
++    String,
++    usize,
++    usize,
++    f64,
++    Vec<(u32, u8, f64, u8)>,
++    i64,
++    u32,
++    Vec<u32>,
++);
++
++impl UsersCorpus {
++    pub fn load(path: &Path) -> Result<Self> {
++        let file = std::fs::File::open(path)
++            .with_context(|| format!("opening users templates {}", path.display()))?;
++        let mut lines = BufReader::new(file).lines();
++        let header: TemplatesHeader = serde_json::from_str(
++            &lines
++                .next()
++                .context("users templates file is empty")??,
++        )?;
++        ensure!(
++            header.schema == "dynosim.users.templates",
++            "unknown users templates schema {}",
++            header.schema
++        );
++        let mut templates = Vec::with_capacity(header.templates);
++        for (number, line) in lines.enumerate() {
++            let line = line?;
++            if line.trim().is_empty() {
++                continue;
++            }
++            let row: TemplateRow = serde_json::from_str(&line)
++                .with_context(|| format!("{}:{}", path.display(), number + 2))?;
++            ensure!(row.i == templates.len(), "templates must be numbered in order");
++            templates.push(Self::template(row, header.block_size)?);
++        }
++        ensure!(
++            templates.len() == header.templates,
++            "users templates header announces {} templates, file has {}",
++            header.templates,
++            templates.len()
++        );
++        Ok(Self {
++            templates,
++            block_size: header.block_size,
++        })
++    }
++
++    fn template(row: TemplateRow, block_size: usize) -> Result<PlayTemplate> {
++        let count = row.nodes.len();
++        let mut lengths = Vec::with_capacity(count);
++        let mut nodes = Vec::with_capacity(count);
++        let mut roots = Vec::new();
++        for (index, NodeRow(request_id, session_id, input, output, not_before, deps, base, prefix, new_ranks)) in
++            row.nodes.into_iter().enumerate()
++        {
++            let (base, prefix) = if base < 0 {
++                ensure!(prefix == 0, "{request_id}: a prefix needs a base request");
++                (NO_BASE, 0)
++            } else {
++                let base = usize::try_from(base)?;
++                ensure!(base < index, "{request_id}: a base must be an earlier request");
++                ensure!(
++                    prefix as usize <= lengths[base],
++                    "{request_id}: prefix longer than its base"
++                );
++                (u32::try_from(base)?, prefix)
++            };
++            ensure!(
++                new_ranks.iter().all(|&r| r < row.blocks),
++                "{request_id}: block rank outside the template"
++            );
++            let total = prefix as usize + new_ranks.len();
++            super::trace::validate_synthesizable_prompt_len(input, total, block_size)
++                .with_context(|| request_id.clone())?;
++            lengths.push(total);
++            ensure!(
++                not_before.is_finite() && not_before >= 0.0,
++                "{request_id}: invalid not_before_ms"
++            );
++            let mut dependencies = Vec::with_capacity(deps.len());
++            let mut spawn_parent = None;
++            for (node, trigger, delay_ms, relation) in deps {
++                ensure!((node as usize) < count, "{request_id}: unknown dependency");
++                ensure!(
++                    delay_ms.is_finite() && delay_ms >= 0.0,
++                    "{request_id}: invalid dependency delay"
++                );
++                let relation = match relation {
++                    0 => AgenticDependencyRelation::Sequence,
++                    1 => AgenticDependencyRelation::Spawn,
++                    2 => AgenticDependencyRelation::Join,
++                    3 => AgenticDependencyRelation::ReplayBarrier,
++                    other => bail!("{request_id}: unknown dependency relation {other}"),
++                };
++                if relation == AgenticDependencyRelation::Spawn {
++                    spawn_parent = Some(spawn_parent.map_or(node, |p: u32| p.min(node)));
++                }
++                dependencies.push(TemplateDependency {
++                    node,
++                    dispatch: trigger == 0,
++                    delay_ms,
++                });
++            }
++            if dependencies.is_empty() {
++                roots.push(u32::try_from(index)?);
++            }
++            nodes.push(TemplateNode {
++                request_id,
++                session_id,
++                input_length: input,
++                output_length: output,
++                not_before_ms: not_before,
++                dependencies,
++                spawn_parent,
++                base,
++                prefix,
++                new_ranks,
++            });
++        }
++        ensure!(count == 0 || !roots.is_empty(), "a template needs a root request");
++        Ok(PlayTemplate {
++            nodes,
++            roots,
++            blocks: row.blocks,
++        })
++    }
++}
++
++#[derive(Deserialize)]
++struct ScheduleFile {
++    schema: String,
++    horizon_s: f64,
++    #[serde(default)]
++    cooldown_s: f64,
++    #[serde(default)]
++    loss_cooldown_s: f64,
++    templates: String,
++    plan: Vec<PlanUser>,
++}
++
++#[derive(Deserialize)]
++struct PlanUser {
++    #[allow(dead_code)]
++    cls: String,
++    entries: Vec<PlanEntry>,
++}
++
++#[derive(Deserialize)]
++struct PlanEntry {
++    tmpl: usize,
++}
++
++/// A users run: templates, each user's entries (template indexes), the horizon and cooldowns.
++#[derive(Debug)]
++pub struct AgenticUsers {
++    pub(super) corpus: Arc<UsersCorpus>,
++    pub(super) plans: Vec<Vec<usize>>,
++    pub(super) horizon_ms: f64,
++    pub(super) cooldown_ms: f64,
++    pub(super) loss_cooldown_ms: f64,
++}
++
++impl AgenticUsers {
++    /// Reads a schedule file (`schedule.json` from the users exporter) and its templates.
++    pub fn load(schedule: &Path) -> Result<Self> {
++        let text = std::fs::read_to_string(schedule)
++            .with_context(|| format!("reading users schedule {}", schedule.display()))?;
++        let file: ScheduleFile = serde_json::from_str(&text)
++            .with_context(|| format!("parsing users schedule {}", schedule.display()))?;
++        ensure!(
++            file.schema == "dynosim.users.schedule",
++            "unknown users schedule schema {}",
++            file.schema
++        );
++        let templates = Path::new(&file.templates);
++        let templates = if templates.is_absolute() {
++            templates.to_path_buf()
++        } else {
++            schedule
++                .parent()
++                .unwrap_or_else(|| Path::new("."))
++                .join(templates)
++        };
++        let corpus = Arc::new(UsersCorpus::load(&templates)?);
++        let plans = file
++            .plan
++            .into_iter()
++            .map(|user| user.entries.into_iter().map(|e| e.tmpl).collect::<Vec<_>>())
++            .collect::<Vec<_>>();
++        Self::new(
++            corpus,
++            plans,
++            file.horizon_s,
++            file.cooldown_s,
++            file.loss_cooldown_s,
++        )
++    }
++
++    pub(super) fn new(
++        corpus: Arc<UsersCorpus>,
++        plans: Vec<Vec<usize>>,
++        horizon_s: f64,
++        cooldown_s: f64,
++        loss_cooldown_s: f64,
++    ) -> Result<Self> {
++        ensure!(!plans.is_empty(), "a users run needs at least one user");
++        ensure!(
++            plans.len() < 1_000_000,
++            "copy keys allow fewer than 1,000,000 users"
++        );
++        for entries in &plans {
++            ensure!(
++                entries.len() < 1_000_000,
++                "copy keys allow fewer than 1,000,000 entries per user"
++            );
++            for &t in entries {
++                ensure!(t < corpus.templates.len(), "schedule names unknown template {t}");
++            }
++        }
++        for (name, v) in [
++            ("horizon_s", horizon_s),
++            ("cooldown_s", cooldown_s),
++            ("loss_cooldown_s", loss_cooldown_s),
++        ] {
++            ensure!(v.is_finite() && v >= 0.0, "{name} must be finite and >= 0");
++        }
++        Ok(Self {
++            corpus,
++            plans,
++            horizon_ms: horizon_s * 1000.0,
++            cooldown_ms: cooldown_s * 1000.0,
++            loss_cooldown_ms: loss_cooldown_s * 1000.0,
++        })
++    }
++}
++
++/// One instantiated copy of a template (one per agentic play of a users run).
++#[derive(Debug, Clone, Copy)]
++pub(super) struct UserCopy {
++    pub(super) user: u32,
++    pub(super) position: u32,
++    pub(super) template: u32,
++    pub(super) token_base: u32,
++    pub(super) node_offset: usize,
++    pub(super) freed: bool,
++}
++
++#[derive(Debug)]
++pub(super) struct UsersRuntime {
++    pub(super) spec: AgenticUsers,
++    /// Next schedule position per user.
++    pub(super) next_entry: Vec<usize>,
++    /// By agentic play index.
++    pub(super) copies: Vec<UserCopy>,
++    next_token_base: u64,
++    pub(super) users_out_of_entries: usize,
++}
++
++impl UsersRuntime {
++    pub(super) fn new(spec: AgenticUsers) -> Self {
++        let users = spec.plans.len();
++        Self {
++            spec,
++            next_entry: vec![0; users],
++            copies: Vec::new(),
++            next_token_base: 0,
++            users_out_of_entries: 0,
++        }
++    }
++
++    pub(super) fn horizon_ms(&self) -> f64 {
++        self.spec.horizon_ms
++    }
++
++    /// Reserves the block identity range of a new copy of template `template`.
++    pub(super) fn reserve_tokens(&mut self, template: usize) -> Result<u32> {
++        let base = self.next_token_base;
++        let blocks = u64::from(self.spec.corpus.templates[template].blocks.max(1));
++        let end = base + blocks;
++        if end > u64::from(u32::MAX) {
++            bail!("users run exhausted the u32 block identity space after {} copies", self.copies.len());
++        }
++        self.next_token_base = end;
++        Ok(base as u32)
++    }
++
++    pub(super) fn key(copy: &UserCopy) -> String {
++        format!("{:06}{:06}", copy.user, copy.position)
++    }
++
++    /// The prompt's block identities for node `node` of copy `copy`.
++    pub(super) fn hash_ids(&self, copy: &UserCopy, node: usize) -> Vec<u32> {
++        let mut ids = self.spec.corpus.templates[copy.template as usize].ranks(node);
++        for id in &mut ids {
++            *id += copy.token_base;
++        }
++        ids
++    }
++
++    /// Request id, play id, conversation id and identity of node `node` of copy `copy`.
++    pub(super) fn identity(&self, copy: &UserCopy, node: usize) -> AgenticRuntimeIdentity {
++        let template = &self.spec.corpus.templates[copy.template as usize];
++        let n = &template.nodes[node];
++        let key = Self::key(copy);
++        AgenticRuntimeIdentity {
++            request_id: format!("cp{key}:{}", n.request_id),
++            play_id: format!("users:{key}"),
++            conversation_id: format!("cp{key}:{}", n.session_id),
++            lane_id: Some(format!("lane:{}", copy.user)),
++            root_id: None,
++            parent_id: n
++                .spawn_parent
++                .map(|p| format!("cp{key}:{}", template.nodes[p as usize].request_id)),
++            cache_id: None,
++            lineage: None,
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::replay::loadgen::WorkloadDriver;
++
++    // Template 0: r0 (2 blocks), then r1 after r0 completes plus 1 s (r0's 2 blocks plus 1 new).
++    // Template 1: one request of 1 block.
++    fn corpus() -> Arc<UsersCorpus> {
++        let rows = [
++            r#"{"i":0,"blocks":3,"nodes":[["t0:r0","t0:s",8,2,0.0,[],-1,0,[0,1]],["t0:r1","t0:s",12,2,0.0,[[0,1,1000.0,0]],0,2,[2]]]}"#,
++            r#"{"i":1,"blocks":1,"nodes":[["t1:r0","t1:s",4,1,0.0,[],-1,0,[0]]]}"#,
++        ];
++        let templates = rows
++            .iter()
++            .map(|r| UsersCorpus::template(serde_json::from_str(r).unwrap(), 4).unwrap())
++            .collect();
++        Arc::new(UsersCorpus {
++            templates,
++            block_size: 4,
++        })
++    }
++
++    fn driver(horizon_s: f64) -> WorkloadDriver {
++        let users = AgenticUsers::new(corpus(), vec![vec![0, 1], vec![1, 0]], horizon_s, 2.0, 120.0)
++            .unwrap();
++        WorkloadDriver::new_agentic_users(users, 4, true).unwrap()
++    }
++
++    fn id(turn: &crate::replay::loadgen::ReadyTurn) -> String {
++        turn.authored_request_id.clone().unwrap()
++    }
++
++    #[test]
++    fn templates_rebuild_prompts_from_deltas() {
++        let c = corpus();
++        assert_eq!(c.templates[0].ranks(0), vec![0, 1]);
++        assert_eq!(c.templates[0].ranks(1), vec![0, 1, 2]);
++        assert_eq!(c.templates[0].roots, vec![0]);
++    }
++
++    #[test]
++    fn users_play_their_entries_in_order_with_cooldown_and_own_blocks() {
++        let mut d = driver(3600.0);
++        let mut first = d.pop_ready(0.0, usize::MAX);
++        first.sort_by_key(id);
++        let ids = first.iter().map(id).collect::<Vec<_>>();
++        assert_eq!(ids, vec!["cp000000000000:t0:r0", "cp000001000000:t1:r0"]);
++        // Copies of different templates (and of the same one, below) never share blocks.
++        let a0 = first[0].request.tokens.clone();
++        let b0 = first[1].request.tokens.clone();
++        assert!(a0.iter().all(|t| !b0.contains(t)));
++        // User 1's play ends at 5 s; its next entry (template 0) starts after the 2 s cooldown.
++        d.on_complete(first[1].request_uuid, 5000.0).unwrap();
++        assert_eq!(d.next_ready_time_ms(), Some(7000.0));
++        assert!(d.pop_ready(6999.0, usize::MAX).is_empty());
++        let second = d.pop_ready(7000.0, usize::MAX);
++        assert_eq!(second.iter().map(id).collect::<Vec<_>>(), vec!["cp000001000001:t0:r0"]);
++        let c0 = second[0].request.tokens.clone();
++        assert!(c0.iter().all(|t| !a0.contains(t)), "two copies of one template share no blocks");
++        // Within a copy, the next request extends the previous prompt (released 1 s after completion).
++        d.on_complete(first[0].request_uuid, 10_000.0).unwrap();
++        assert!(d.pop_ready(10_999.0, usize::MAX).is_empty());
++        let next = d.pop_ready(11_000.0, usize::MAX);
++        assert_eq!(id(&next[0]), "cp000000000000:t0:r1");
++        let a1 = next[0].request.tokens.clone();
++        assert_eq!(&a1[..a0.len()], &a0[..]);
++        assert_eq!(a1.len(), 12);
++    }
++
++    #[test]
++    fn nothing_is_dispatched_at_or_after_the_horizon() {
++        let mut d = driver(10.0);
++        let mut first = d.pop_ready(0.0, usize::MAX);
++        first.sort_by_key(id);
++        // User 0's second request would be ready at 9.5 s + 1 s, past the 10 s horizon.
++        d.on_complete(first[0].request_uuid, 9500.0).unwrap();
++        // User 1's next play would start at 9 s + 2 s.
++        d.on_complete(first[1].request_uuid, 9000.0).unwrap();
++        assert_eq!(d.next_ready_time_ms(), None);
++        assert!(d.pop_ready(20_000.0, usize::MAX).is_empty());
++        assert!(d.is_drained());
++    }
++
++    #[test]
++    fn a_failed_play_waits_the_loss_cooldown() {
++        let mut d = driver(3600.0);
++        let mut first = d.pop_ready(0.0, usize::MAX);
++        first.sort_by_key(id);
++        d.on_terminal(
++            first[1].request_uuid,
++            1000.0,
++            crate::replay::ReplayTerminalStatus::Rejected,
++        )
++        .unwrap();
++        assert_eq!(d.next_ready_time_ms(), Some(121_000.0));
++    }
++}

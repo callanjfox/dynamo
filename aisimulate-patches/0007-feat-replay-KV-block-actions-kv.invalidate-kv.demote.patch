@@ -1,0 +1,1227 @@
+From 60c11d4dc4f2411b5e806663738893d19792904e Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Thu, 12 Nov 2026 14:24:52 +1000
+Subject: [PATCH 07/38] feat(replay): KV block actions (kv.invalidate,
+ kv.demote, kv.prefetch) as rank commands on path B, fetch without retain on
+ path A, and G2 write-back (exclusive tiers), each off by default
+
+---
+ .../core/src/engine/cache/vllm_block_pool.rs  |  38 +++
+ crates/core/src/engine/config.rs              |  10 +
+ .../core/src/engine/kv_manager/g1_manager.rs  |  25 ++
+ .../src/engine/kv_manager/vllm_backend.rs     |  57 ++++
+ crates/core/src/engine/kvcr.rs                |  81 +++++
+ crates/core/src/engine/mod.rs                 |   2 +-
+ crates/core/src/engine/protocol.rs            |  24 ++
+ crates/core/src/engine/scheduler/rank.rs      |   5 +-
+ .../core/src/engine/scheduler/sglang/core.rs  |   1 +
+ .../core/src/engine/scheduler/source_holds.rs |   2 +
+ crates/core/src/engine/scheduler/vllm/core.rs | 131 ++++++++
+ .../src/engine/scheduler/vllm/host_offload.rs | 287 +++++++++++++++++-
+ crates/core/src/engine/scheduler/vllm/kvcr.rs |   1 +
+ crates/core/src/replay/agg.rs                 |  18 +-
+ crates/core/src/replay/components/engine.rs   |  73 ++++-
+ crates/core/src/replay/core/mod.rs            |  19 ++
+ .../src/aisimulate/config/engine.py           |   4 +-
+ 17 files changed, 765 insertions(+), 13 deletions(-)
+
+diff --git a/crates/core/src/engine/cache/vllm_block_pool.rs b/crates/core/src/engine/cache/vllm_block_pool.rs
+index 17999101a..daa2ff737 100644
+--- a/crates/core/src/engine/cache/vllm_block_pool.rs
++++ b/crates/core/src/engine/cache/vllm_block_pool.rs
+@@ -448,6 +448,39 @@ impl VllmBlockPool {
+         protected
+     }
+ 
++    /// Drop the inactive cached copies of `hashes` (`kv.invalidate`, demote): copies a live
++    /// request references or pins stay. Freed capacity returns to the free pool. Returns the
++    /// hashes no longer cached, for `Removed` KV events.
++    pub(crate) fn drop_inactive(&mut self, hashes: &[SequenceHash]) -> Vec<SequenceHash> {
++        assert!(
++            self.belady.is_none(),
++            "targeted drops do not combine with the Belady eviction policy"
++        );
++        let mut removed = Vec::new();
++        for &hash in hashes {
++            loop {
++                let Some(id) = self.by_hash.get(&hash).and_then(|copies| {
++                    copies
++                        .iter()
++                        .find(|id| self.is_inactive(*id) && !self.holds_source(*id))
++                }) else {
++                    break;
++                };
++                let evicted = self.remove_inactive_copy(id);
++                if let Some(hash) = evicted.removed_hash {
++                    removed.push(hash);
++                }
++                self.free.push(evicted.source_reuse);
++            }
++        }
++        removed
++    }
++
++    /// Whether a cached copy of `hash` is resident in G1.
++    pub(crate) fn has_cached(&self, hash: SequenceHash) -> bool {
++        self.by_hash.contains_key(&hash)
++    }
++
+     /// Protected copies evicted before their TTL ran out, since the last call.
+     pub(crate) fn take_retain_broken(&mut self) -> u64 {
+         self.retain
+@@ -1773,6 +1806,11 @@ impl VllmBlockPool {
+         let Some(id) = victim else {
+             panic!("prechecked inactive capacity disappeared")
+         };
++        self.remove_inactive_copy(id)
++    }
++
++    /// Remove one inactive cached copy (an eviction victim or a targeted drop).
++    fn remove_inactive_copy(&mut self, id: BlockCopyId) -> EvictedCapacity {
+         if self.inactive_head == Some(id) || self.retain.as_deref().is_some_and(|r| r.head == Some(id)) {
+             let CopyState::Cached { inactive_prev, .. } = &self.copies[id].state else {
+                 panic!("inactive LRU points to a private copy")
+diff --git a/crates/core/src/engine/config.rs b/crates/core/src/engine/config.rs
+index ad1376c15..020e2204c 100644
+--- a/crates/core/src/engine/config.rs
++++ b/crates/core/src/engine/config.rs
+@@ -532,6 +532,11 @@ pub struct NativeHostOffloadConfig {
+     /// cluster-shared pools; ranks may join one pool only with an equal identity.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub kv_layout_id: Option<String>,
++    /// Write-back (exclusive tiers): a block is written to G2 when G1 evicts
++    /// it, not as it is computed, and a load from G2 into G1 leaves no G2
++    /// copy. Private (`dp_rank_local`) G2 only.
++    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
++    pub write_back: bool,
+ }
+ 
+ impl NativeHostOffloadConfig {
+@@ -545,6 +550,7 @@ impl NativeHostOffloadConfig {
+             shared_h2d_bandwidth_gbps: DEFAULT_SHARED_HOST_OFFLOAD_BANDWIDTH_GBPS,
+             latency_to_first_byte_ms: 0.0,
+             kv_layout_id: None,
++            write_back: false,
+         }
+     }
+ 
+@@ -586,6 +592,10 @@ impl NativeHostOffloadConfig {
+                 "cluster_shared native_host_offload requires a nonempty kv_layout_id"
+             );
+         }
++        ensure!(
++            !self.write_back || self.scope == G2Scope::DpRankLocal,
++            "native_host_offload.write_back requires dp_rank_local scope"
++        );
+         Ok(())
+     }
+ }
+diff --git a/crates/core/src/engine/kv_manager/g1_manager.rs b/crates/core/src/engine/kv_manager/g1_manager.rs
+index 42e24cfa2..1b2027091 100644
+--- a/crates/core/src/engine/kv_manager/g1_manager.rs
++++ b/crates/core/src/engine/kv_manager/g1_manager.rs
+@@ -271,10 +271,35 @@ impl G1Manager {
+         self.inner.set_now_ms(now_ms);
+     }
+ 
++    pub(crate) fn drop_cached_blocks(&mut self, hashes: &[u64]) -> Vec<u64> {
++        self.inner.drop_cached_blocks(hashes)
++    }
++
++    pub(crate) fn has_cached_block(&self, hash: u64) -> bool {
++        self.inner.has_cached_block(hash)
++    }
++
++    pub(crate) fn prefetch_cached_blocks(
++        &mut self,
++        hashes: &[u64],
++        local_hashes: &[crate::engine::common::hashing::BlockHash],
++        parent: Option<u64>,
++    ) -> Vec<u64> {
++        self.inner.prefetch_cached_blocks(hashes, local_hashes, parent)
++    }
++
+     pub(crate) fn take_retain_broken(&mut self) -> u64 {
+         self.inner.take_retain_broken()
+     }
+ 
++    pub(crate) fn log_evictions(&mut self) {
++        self.inner.log_evictions();
++    }
++
++    pub(crate) fn take_evicted(&mut self) -> Vec<u64> {
++        self.inner.take_evicted()
++    }
++
+     pub(crate) fn get_native_prefill_cost(
+         &self,
+         sequence: &RequestSequence,
+diff --git a/crates/core/src/engine/kv_manager/vllm_backend.rs b/crates/core/src/engine/kv_manager/vllm_backend.rs
+index d1c860ed2..1b6fe8d5a 100644
+--- a/crates/core/src/engine/kv_manager/vllm_backend.rs
++++ b/crates/core/src/engine/kv_manager/vllm_backend.rs
+@@ -377,9 +377,20 @@ pub(crate) struct VllmKvManager {
+     grouped: Option<GroupedKvPool>,
+     state_cache: Option<StateCacheManager>,
+     prefix_match_unit: Option<usize>,
++    /// G2 write-back: cached blocks G1 evicted since the last take.
++    evicted_log: Option<Vec<SequenceHash>>,
+ }
+ 
+ impl VllmKvManager {
++    /// Log the cached blocks G1 evicts (not targeted drops), for G2 write-back.
++    pub(crate) fn log_evictions(&mut self) {
++        self.evicted_log.get_or_insert_with(Vec::new);
++    }
++
++    pub(crate) fn take_evicted(&mut self) -> Vec<SequenceHash> {
++        self.evicted_log.as_mut().map(std::mem::take).unwrap_or_default()
++    }
++
+     pub(crate) fn set_grouped_cache(&mut self, grouped: GroupedKvPool) {
+         assert!(!self.enable_prefix_caching);
+         self.grouped = Some(grouped);
+@@ -420,6 +431,7 @@ impl VllmKvManager {
+             grouped: None,
+             state_cache: None,
+             prefix_match_unit: None,
++            evicted_log: None,
+         }
+     }
+ 
+@@ -1366,6 +1378,48 @@ impl VllmKvManager {
+         self.pool.set_now_ms(now_ms);
+     }
+ 
++    /// Path B: drop the idle cached copies of `hashes` and publish their removal.
++    pub(crate) fn drop_cached_blocks(&mut self, hashes: &[SequenceHash]) -> Vec<SequenceHash> {
++        let removed = self.pool.drop_inactive(hashes);
++        // A targeted drop is not an eviction: write-back does not save it.
++        if !removed.is_empty() {
++            self.publish_kv_event(removed.clone(), &[], None, false, None, None);
++        }
++        removed
++    }
++
++    /// Whether G1 holds a cached copy of `hash`.
++    pub(crate) fn has_cached_block(&self, hash: SequenceHash) -> bool {
++        self.pool.has_cached(hash)
++    }
++
++    /// Path B prefetch: put `hashes` (a run of one prefix chain after `parent`) into G1 as
++    /// idle cached blocks, evicting ordinary LRU blocks for room, and publish them as stored.
++    /// Returns the blocks loaded; none when there is no room.
++    pub(crate) fn prefetch_cached_blocks(
++        &mut self,
++        hashes: &[SequenceHash],
++        local_hashes: &[BlockHash],
++        parent: Option<SequenceHash>,
++    ) -> Vec<SequenceHash> {
++        if hashes.is_empty() {
++            return Vec::new();
++        }
++        let Some(mut outcome) = self.pool.reserve(&[], hashes.len()) else {
++            return Vec::new();
++        };
++        self.publish_removed(std::mem::take(&mut outcome.removed));
++        let mut loaded = Vec::with_capacity(hashes.len());
++        for &hash in hashes {
++            let (copy, _) = self.pool.allocate_cached(&mut outcome.reservation, hash);
++            self.pool.release(copy);
++            loaded.push(hash);
++        }
++        self.pool.cancel(outcome.reservation);
++        self.publish_kv_event(loaded.clone(), local_hashes, parent, true, None, None);
++        loaded
++    }
++
+     pub(crate) fn take_retain_broken(&mut self) -> u64 {
+         self.pool.take_retain_broken()
+     }
+@@ -1698,6 +1752,9 @@ impl VllmKvManager {
+ 
+     fn publish_removed(&mut self, hashes: Vec<SequenceHash>) {
+         if !hashes.is_empty() {
++            if let Some(log) = &mut self.evicted_log {
++                log.extend_from_slice(&hashes);
++            }
+             self.publish_kv_event(hashes, &[], None, false, None, None);
+         }
+     }
+diff --git a/crates/core/src/engine/kvcr.rs b/crates/core/src/engine/kvcr.rs
+index 980d4e1a0..05129723b 100644
+--- a/crates/core/src/engine/kvcr.rs
++++ b/crates/core/src/engine/kvcr.rs
+@@ -68,6 +68,18 @@ pub struct KvcrStats {
+     /// Protected blocks evicted before their TTL ran out (nothing else was left).
+     #[serde(skip_serializing_if = "is_zero")]
+     pub retain_broken: u64,
++    /// Blocks dropped by `kv.invalidate` (G1 and G2 copies counted separately).
++    #[serde(skip_serializing_if = "is_zero")]
++    pub invalidated_blocks: u64,
++    /// G1 blocks dropped by `kv.demote` (G2 keeps them).
++    #[serde(skip_serializing_if = "is_zero")]
++    pub demoted_blocks: u64,
++    /// Blocks loaded back into G1 by `kv.prefetch`.
++    #[serde(skip_serializing_if = "is_zero")]
++    pub prefetched_blocks: u64,
++    /// Pulled G2 copies dropped when their request finished (fetch without retain).
++    #[serde(skip_serializing_if = "is_zero")]
++    pub no_retain_dropped_blocks: u64,
+ }
+ 
+ /// Path A per-request KV actions a router attached to placements (`kv.retain`),
+@@ -76,6 +88,10 @@ pub struct KvcrStats {
+ #[derive(Debug, Default)]
+ pub(crate) struct KvActionTable {
+     retain_ms: FxHashMap<uuid::Uuid, u64>,
++    /// Requests whose `kv.fetch` keeps no G2 copy on the target.
++    fetch_no_retain: rustc_hash::FxHashSet<uuid::Uuid>,
++    /// The G2 keys each such request pulled, dropped when it finishes.
++    pulled: FxHashMap<uuid::Uuid, Vec<crate::engine::HostBlockKey>>,
+ }
+ 
+ struct Rank {
+@@ -124,6 +140,8 @@ pub(crate) struct KvcrRegistry {
+     stats: KvcrStats,
+     actions: KvActionTable,
+     retain_state: crate::engine::kv_retain::SharedRetainState,
++    /// The blocks the last path B block command affected on its rank (read back at once).
++    kv_command_result: Option<Vec<u64>>,
+ }
+ 
+ impl KvcrRegistry {
+@@ -145,6 +163,7 @@ impl KvcrRegistry {
+             stats: KvcrStats::default(),
+             actions: KvActionTable::default(),
+             retain_state: crate::engine::kv_retain::RetainState::shared(),
++            kv_command_result: None,
+         }))
+     }
+ 
+@@ -246,6 +265,50 @@ impl KvcrRegistry {
+         Arc::clone(&self.retain_state)
+     }
+ 
++    pub(crate) fn set_kv_command_result(&mut self, affected: Vec<u64>) {
++        self.kv_command_result = Some(affected);
++    }
++
++    pub(crate) fn take_kv_command_result(&mut self) -> Option<Vec<u64>> {
++        self.kv_command_result.take()
++    }
++
++    pub(crate) fn note_invalidated(&mut self, blocks: usize) {
++        self.stats.invalidated_blocks += blocks as u64;
++    }
++
++    pub(crate) fn note_demoted(&mut self, blocks: usize) {
++        self.stats.demoted_blocks += blocks as u64;
++    }
++
++    pub(crate) fn note_prefetched(&mut self, blocks: usize) {
++        self.stats.prefetched_blocks += blocks as u64;
++    }
++
++    /// Record a placement's `kv.fetch` that keeps no G2 copy on the target.
++    pub(crate) fn note_fetch_no_retain(&mut self, request: uuid::Uuid) {
++        self.actions.fetch_no_retain.insert(request);
++    }
++
++    /// Record the keys `owner` pulled, if its fetch keeps no copy.
++    pub(crate) fn note_pulled(&mut self, owner: uuid::Uuid, keys: &[crate::engine::HostBlockKey]) {
++        if self.actions.fetch_no_retain.contains(&owner) {
++            self.actions.pulled.entry(owner).or_default().extend_from_slice(keys);
++        }
++    }
++
++    /// The keys a finished `owner` pulled without keeping a copy; forgets `owner`.
++    pub(crate) fn take_no_retain_pulled(&mut self, owner: uuid::Uuid) -> Vec<crate::engine::HostBlockKey> {
++        if !self.actions.fetch_no_retain.remove(&owner) {
++            return Vec::new();
++        }
++        self.actions.pulled.remove(&owner).unwrap_or_default()
++    }
++
++    pub(crate) fn note_no_retain_dropped(&mut self, blocks: usize) {
++        self.stats.no_retain_dropped_blocks += blocks as u64;
++    }
++
+     /// Record a placement's path A `kv.retain` for `request`.
+     pub(crate) fn note_retain(&mut self, request: uuid::Uuid, ttl_ms: u64) {
+         self.actions.retain_ms.insert(request, ttl_ms);
+@@ -518,6 +581,24 @@ mod tests {
+         registry.register_worker(worker_id, handles, 1).unwrap();
+     }
+ 
++    #[test]
++    fn fetch_without_retain_tracks_only_marked_requests_pulls() {
++        let shared = registry(1.0, 1.0);
++        let mut r = shared.lock().unwrap();
++        let (marked, other) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
++        let keys = [crate::engine::HostBlockKey::new(10), crate::engine::HostBlockKey::new(11)];
++        r.note_fetch_no_retain(marked);
++        r.note_pulled(marked, &keys[..1]);
++        r.note_pulled(marked, &keys[1..]);
++        r.note_pulled(other, &keys);
++        assert_eq!(r.take_no_retain_pulled(other), Vec::new());
++        assert_eq!(r.take_no_retain_pulled(marked), keys.to_vec());
++        // Taken once: the request is forgotten.
++        assert_eq!(r.take_no_retain_pulled(marked), Vec::new());
++        r.note_no_retain_dropped(2);
++        assert_eq!(r.stats().no_retain_dropped_blocks, 2);
++    }
++
+     #[test]
+     fn a_pull_waits_for_the_source_pass_then_latency_then_bytes() {
+         let shared = registry(1.0, 1.0);
+diff --git a/crates/core/src/engine/mod.rs b/crates/core/src/engine/mod.rs
+index 2b09660bc..4aad0205e 100644
+--- a/crates/core/src/engine/mod.rs
++++ b/crates/core/src/engine/mod.rs
+@@ -51,7 +51,7 @@ pub use kvcr::{KvcrPullCounts, KvcrStats};
+ pub use protocol::{
+     Admission, CacheTierAttribution, Command, CommandEffects, CommandResult, DecodeAcceptance,
+     EncoderShape, ForwardPassMetrics, ImageSpec, KvBlock, KvEvent, KvEventData, KvEventTier,
+-    KvHintSource, LifecycleEvent, Metrics, Output, PassCompletionEffects, PassStartEffects,
++    KvBlockCommand, KvHintSource, LifecycleEvent, Metrics, Output, PassCompletionEffects, PassStartEffects,
+     PressureEvent, PressureKind, PressureState, Request, StoredBlocks, TtftMilestone,
+ };
+ pub use runtime::{Engine, EngineFactory};
+diff --git a/crates/core/src/engine/protocol.rs b/crates/core/src/engine/protocol.rs
+index 7c2ae5fa6..f804aa21c 100644
+--- a/crates/core/src/engine/protocol.rs
++++ b/crates/core/src/engine/protocol.rs
+@@ -94,9 +94,33 @@ pub struct Request {
+     pub policy_class: Option<String>,
+ }
+ 
++/// A rank's KV blocks by sequence hash, for the router's out-of-band KV actions
++/// (path B, `kv_actions`): drop or load cached blocks outside any request.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum KvBlockCommand {
++    /// Drop cached copies of `hashes`: from G1 (`g1`) and/or G2 (`g2`). With
++    /// `only_if_in_g2`, G1 copies are dropped only where G2 holds the block
++    /// (a demote to DRAM). Copies a live request references or pins stay.
++    Drop {
++        hashes: Vec<u64>,
++        g1: bool,
++        g2: bool,
++        only_if_in_g2: bool,
++    },
++    /// Load into G1, as idle cached blocks, the blocks of a prefix chain that
++    /// G2 holds and G1 lacks (a prefetch). `local_hashes` are the blocks'
++    /// token hashes, for the KV events.
++    Prefetch {
++        hashes: Vec<u64>,
++        local_hashes: Vec<u64>,
++    },
++}
++
+ /// Commands supported by the standalone scheduler.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum Command {
++    /// Out-of-band KV block actions (path B).
++    KvBlocks(KvBlockCommand),
+     /// Submit one request.
+     Submit(Request),
+     /// Submit a request whose completed prefill KV must remain source-held.
+diff --git a/crates/core/src/engine/scheduler/rank.rs b/crates/core/src/engine/scheduler/rank.rs
+index 72cf22524..43b19db0f 100644
+--- a/crates/core/src/engine/scheduler/rank.rs
++++ b/crates/core/src/engine/scheduler/rank.rs
+@@ -154,6 +154,7 @@ impl SchedulerRank {
+             Command::CancelDestination { handoff_id } => {
+                 CoreCommand::CancelDestination { handoff_id }
+             }
++            Command::KvBlocks(command) => CoreCommand::KvBlocks(command),
+         }
+     }
+ 
+@@ -422,7 +423,9 @@ fn handoff_tracking_update(command: &Command) -> HandoffTrackingUpdate {
+         Command::CancelRequest { request_id, .. } => {
+             HandoffTrackingUpdate::RemoveRequest(*request_id)
+         }
+-        Command::Submit(_) | Command::ActivateDestination { .. } => HandoffTrackingUpdate::None,
++        Command::Submit(_) | Command::ActivateDestination { .. } | Command::KvBlocks(_) => {
++            HandoffTrackingUpdate::None
++        }
+     }
+ }
+ 
+diff --git a/crates/core/src/engine/scheduler/sglang/core.rs b/crates/core/src/engine/scheduler/sglang/core.rs
+index 9a30b70e8..e488232a9 100644
+--- a/crates/core/src/engine/scheduler/sglang/core.rs
++++ b/crates/core/src/engine/scheduler/sglang/core.rs
+@@ -450,6 +450,7 @@ impl SglangCore {
+                 self.prebuilt_ready.push_back(request);
+                 Ok(self.effects_after_capacity_change(SchedulerCommandResult::Applied))
+             }
++            SchedulerCommand::KvBlocks(_) => Ok(SchedulerCommandEffects::new(SchedulerCommandResult::Noop)),
+             SchedulerCommand::CancelDestination { handoff_id } => {
+                 if let Some((request_id, _)) = self.pending_destinations.remove(handoff_id) {
+                     self.bump_capacity_generation();
+diff --git a/crates/core/src/engine/scheduler/source_holds.rs b/crates/core/src/engine/scheduler/source_holds.rs
+index 504a57020..0fefc5078 100644
+--- a/crates/core/src/engine/scheduler/source_holds.rs
++++ b/crates/core/src/engine/scheduler/source_holds.rs
+@@ -40,6 +40,8 @@ pub enum SchedulerCommand {
+     CancelDestination {
+         handoff_id: HandoffId,
+     },
++    /// Out-of-band KV block actions (path B); engines without support answer `Noop`.
++    KvBlocks(crate::engine::KvBlockCommand),
+ }
+ 
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+diff --git a/crates/core/src/engine/scheduler/vllm/core.rs b/crates/core/src/engine/scheduler/vllm/core.rs
+index baa80c1fe..5a40a08f3 100644
+--- a/crates/core/src/engine/scheduler/vllm/core.rs
++++ b/crates/core/src/engine/scheduler/vllm/core.rs
+@@ -941,6 +941,12 @@ impl VllmCore {
+             // reference on the G1 blocks it copies until the copy completes.
+             kv_manager.hold_native_store_sources();
+         }
++        if native_host_offload
++            .as_ref()
++            .is_some_and(VllmHostOffloadAdapter::writes_back)
++        {
++            kv_manager.log_evictions();
++        }
+         if !args.kv_cache_groups.is_empty() {
+             kv_manager.set_grouped_cache(GroupedKvPool::new(
+                 args.kv_cache_groups.clone(),
+@@ -1001,6 +1007,17 @@ impl VllmCore {
+         }
+     }
+ 
++    /// Whether G1 and G2 hold a cached copy of `hash`.
++    #[cfg(test)]
++    pub(crate) fn kv_residency(&self, hash: u64) -> (bool, bool) {
++        (
++            self.kv_manager.has_cached_block(hash),
++            self.native_host_offload
++                .as_ref()
++                .is_some_and(|adapter| adapter.g2_resident(hash)),
++        )
++    }
++
+     #[cfg(test)]
+     pub(crate) fn request_uses_flat_tokens(&self, uuid: Uuid) -> bool {
+         self.state
+@@ -1213,6 +1230,24 @@ impl VllmCore {
+                     mutation_now_ms,
+                 ))
+             }
++            SchedulerCommand::KvBlocks(command) => {
++                let now_ms = mutation_now_ms.or(command_now_ms).unwrap_or_else(|| {
++                    self.native_host_offload
++                        .as_ref()
++                        .map_or(0.0, |adapter| adapter.current_time_ms())
++                });
++                let affected = self.apply_kv_blocks(command, now_ms);
++                let result = if affected.is_empty() {
++                    SchedulerCommandResult::Noop
++                } else {
++                    SchedulerCommandResult::Applied
++                };
++                if let Some(adapter) = self.native_host_offload.as_ref() {
++                    adapter.note_kv_command_result(affected);
++                }
++                self.bump_capacity_generation();
++                Ok(self.effects_after_capacity_change(result, mutation_now_ms))
++            }
+             SchedulerCommand::CancelDestination { handoff_id } => {
+                 if let Some((request_id, _)) = self.pending_destinations.remove(handoff_id) {
+                     self.bump_capacity_generation();
+@@ -1672,6 +1707,9 @@ impl VllmCore {
+         let Some(adapter) = self.native_host_offload.as_mut() else {
+             return;
+         };
++        if adapter.writes_back() {
++            adapter.write_back_evicted(self.kv_manager.take_evicted(), now_ms);
++        }
+         let progress = adapter.advance(&mut self.kv_manager, now_ms);
+         self.apply_host_progress(progress);
+     }
+@@ -1680,6 +1718,9 @@ impl VllmCore {
+         let Some(adapter) = self.native_host_offload.as_mut() else {
+             return;
+         };
++        if adapter.writes_back() {
++            adapter.write_back_evicted(self.kv_manager.take_evicted(), now_ms);
++        }
+         let progress = adapter.complete_engine_boundary(&mut self.kv_manager, now_ms);
+         self.apply_host_progress(progress);
+     }
+@@ -2489,6 +2530,96 @@ impl VllmCore {
+         })
+     }
+ 
++    /// Path B block actions on this rank (`kv.invalidate`, `kv.demote`, `kv.prefetch`).
++    /// Returns the blocks affected.
++    fn apply_kv_blocks(&mut self, command: crate::engine::KvBlockCommand, now_ms: f64) -> Vec<u64> {
++        use crate::engine::KvBlockCommand;
++        let adapter = self.native_host_offload.as_ref();
++        match command {
++            KvBlockCommand::Drop {
++                hashes,
++                g1,
++                g2,
++                only_if_in_g2,
++            } => {
++                let g1_hashes: Vec<u64> = if only_if_in_g2 {
++                    match adapter {
++                        Some(adapter) => hashes.iter().copied().filter(|h| adapter.g2_resident(*h)).collect(),
++                        None => Vec::new(),
++                    }
++                } else {
++                    hashes.clone()
++                };
++                let mut affected = Vec::new();
++                if g1 {
++                    affected.extend(self.kv_manager.drop_cached_blocks(&g1_hashes));
++                }
++                let g1_count = affected.len();
++                if let Some(adapter) = self.native_host_offload.as_mut() {
++                    adapter.forget_g1_blocks(&affected);
++                }
++                if g2 && let Some(adapter) = self.native_host_offload.as_ref() {
++                    affected.extend(adapter.g2_drop(&hashes, now_ms));
++                }
++                if let Some(adapter) = self.native_host_offload.as_ref() {
++                    if only_if_in_g2 {
++                        adapter.note_kv_counts(0, g1_count, 0);
++                    } else {
++                        adapter.note_kv_counts(affected.len(), 0, 0);
++                    }
++                }
++                affected
++            }
++            KvBlockCommand::Prefetch {
++                hashes,
++                local_hashes,
++            } => {
++                let Some(adapter) = adapter else {
++                    return Vec::new();
++                };
++                // The chain's leading blocks: runs G2 holds and G1 lacks, each after a parent
++                // G1 holds, up to the first block neither tier holds (past it nothing can hit).
++                let mut affected = Vec::new();
++                let mut run: (Vec<u64>, Vec<u64>, Option<u64>) = (Vec::new(), Vec::new(), None);
++                let mut parent = None;
++                let mut runs = Vec::new();
++                for (index, &hash) in hashes.iter().enumerate() {
++                    if self.kv_manager.has_cached_block(hash) {
++                        if !run.0.is_empty() {
++                            runs.push(std::mem::take(&mut run));
++                        }
++                    } else if adapter.g2_resident(hash) {
++                        if run.0.is_empty() {
++                            run.2 = parent;
++                        }
++                        run.0.push(hash);
++                        run.1.push(local_hashes.get(index).copied().unwrap_or_default());
++                    } else {
++                        break;
++                    }
++                    parent = Some(hash);
++                }
++                if !run.0.is_empty() {
++                    runs.push(run);
++                }
++                for (run_hashes, run_locals, run_parent) in runs {
++                    affected.extend(
++                        self.kv_manager
++                            .prefetch_cached_blocks(&run_hashes, &run_locals, run_parent),
++                    );
++                }
++                if let Some(adapter) = self.native_host_offload.as_mut() {
++                    adapter.note_kv_counts(0, 0, affected.len());
++                    // The loads' room came from G1 evictions: write them back now.
++                    if adapter.writes_back() {
++                        adapter.write_back_evicted(self.kv_manager.take_evicted(), now_ms);
++                    }
++                }
++                affected
++            }
++        }
++    }
++
+     fn drop_request_at(
+         &mut self,
+         uuid: Uuid,
+diff --git a/crates/core/src/engine/scheduler/vllm/host_offload.rs b/crates/core/src/engine/scheduler/vllm/host_offload.rs
+index c9f5e2050..d0c7b666f 100644
+--- a/crates/core/src/engine/scheduler/vllm/host_offload.rs
++++ b/crates/core/src/engine/scheduler/vllm/host_offload.rs
+@@ -219,6 +219,9 @@ pub(super) struct VllmHostOffloadAdapter {
+     /// Present only for detailed artifact capture. Ordinary runs neither retain
+     /// request-local mapping state nor allocate mapping payloads.
+     observer: Option<Arc<dyn HostOffloadObserver>>,
++    /// Write-back (exclusive tiers): G2 takes a block when G1 evicts it. The
++    /// router identity of each G1 prompt block it may write, by key.
++    write_back: Option<FxHashMap<HostBlockKey, Option<HostBlockMeta>>>,
+ }
+ 
+ impl VllmHostOffloadAdapter {
+@@ -257,11 +260,54 @@ impl VllmHostOffloadAdapter {
+         self.kvcr.as_ref()?.registry().lock().unwrap().retain_ms(owner)
+     }
+ 
++    /// Record the blocks the last path B block command affected, for the replay to answer with.
++    pub(super) fn note_kv_command_result(&self, affected: Vec<u64>) {
++        if let Some(kvcr) = &self.kvcr {
++            kvcr.registry().lock().unwrap().set_kv_command_result(affected);
++        }
++    }
++
++    /// Whether this rank's G2 holds `hash` resident.
++    pub(super) fn g2_resident(&self, hash: u64) -> bool {
++        matches!(
++            self.host.lock().lookup(crate::engine::HostBlockKey::new(hash)),
++            Lookup::Hit
++        )
++    }
++
++    /// Drop this rank's resident, unpinned G2 copies of `hashes`; returns those dropped.
++    pub(super) fn g2_drop(&self, hashes: &[u64], now_ms: f64) -> Vec<u64> {
++        let keys: Vec<_> = hashes.iter().copied().map(crate::engine::HostBlockKey::new).collect();
++        self.host
++            .lock()
++            .drop_resident(&keys, now_ms)
++            .into_iter()
++            .map(crate::engine::HostBlockKey::sequence_hash)
++            .collect()
++    }
++
++    pub(super) fn note_kv_counts(&self, invalidated: usize, demoted: usize, prefetched: usize) {
++        if let Some(kvcr) = &self.kvcr {
++            let mut registry = kvcr.registry().lock().unwrap();
++            registry.note_invalidated(invalidated);
++            registry.note_demoted(demoted);
++            registry.note_prefetched(prefetched);
++        }
++    }
++
+     /// A request finished: its session's retention value now counts down to its next turn.
+     pub(super) fn note_finished(&self, owner: Uuid, now_ms: f64) {
+         if let Some(kvcr) = &self.kvcr {
+-            let state = kvcr.registry().lock().unwrap().retain_state();
++            let (state, pulled) = {
++                let mut registry = kvcr.registry().lock().unwrap();
++                (registry.retain_state(), registry.take_no_retain_pulled(owner))
++            };
+             state.lock().unwrap().note_finished(owner, now_ms);
++            // Fetch without retain: the prefix this request pulled leaves this rank's G2.
++            if !pulled.is_empty() {
++                let dropped = self.host.lock().drop_resident(&pulled, now_ms).len();
++                kvcr.registry().lock().unwrap().note_no_retain_dropped(dropped);
++            }
+         }
+     }
+ 
+@@ -318,9 +364,76 @@ impl VllmHostOffloadAdapter {
+             load_by_key: FxHashMap::default(),
+             compute_not_before_ms: 0.0,
+             observer: None,
++            write_back: config.write_back.then(FxHashMap::default),
+         })
+     }
+ 
++    pub(super) fn writes_back(&self) -> bool {
++        self.write_back.is_some()
++    }
++
++    /// Write-back: put the prompt blocks G1 evicted into G2 (instantly; the
++    /// D2H copy of an eviction is not modelled), evicting G2's LRU for room.
++    /// Blocks with no recorded identity (output blocks) are not written, as
++    /// write-through stores prompt blocks only.
++    pub(super) fn write_back_evicted(&mut self, evicted: Vec<u64>, now_ms: f64) {
++        let Some(known) = self.write_back.as_mut() else {
++            return;
++        };
++        let mut keys = Vec::new();
++        let mut meta = Vec::new();
++        for hash in evicted {
++            let key = HostBlockKey::new(hash);
++            if let Some(identity) = known.remove(&key) {
++                keys.push(key);
++                meta.push(identity);
++            }
++        }
++        if keys.is_empty() {
++            return;
++        }
++        let mut tier = self.host.lock();
++        let mut plan = tier.plan_external(&keys, now_ms);
++        let mut written = Vec::new();
++        let mut written_meta = Vec::new();
++        for (key, identity) in keys.into_iter().zip(meta) {
++            if tier.planned_lookup(Some(&plan), key) != Lookup::Miss {
++                continue;
++            }
++            if !tier.plan_reserve(&mut plan, key) {
++                break;
++            }
++            written.push(key);
++            written_meta.push(identity);
++        }
++        if written.is_empty() {
++            return;
++        }
++        let meta = written_meta
++            .iter()
++            .all(Option::is_some)
++            .then(|| written_meta.into_iter().flatten().collect());
++        let id = tier.reserve_planned(self.host.id(), Uuid::nil(), plan, meta, now_ms);
++        tier.complete_external(id);
++    }
++
++    /// Write-back: G1 now holds these prompt blocks; forget them if dropped.
++    pub(super) fn note_g1_blocks(&mut self, keys: &[HostBlockKey], meta: Option<&[HostBlockMeta]>) {
++        if let Some(known) = self.write_back.as_mut() {
++            for (index, key) in keys.iter().enumerate() {
++                known.insert(*key, meta.and_then(|meta| meta.get(index)).cloned());
++            }
++        }
++    }
++
++    pub(super) fn forget_g1_blocks(&mut self, hashes: &[u64]) {
++        if let Some(known) = self.write_back.as_mut() {
++            for hash in hashes {
++                known.remove(&HostBlockKey::new(*hash));
++            }
++        }
++    }
++
+     /// A cluster-shared pool: router metadata is retained and D2H completion
+     /// times are not fixed.
+     pub(super) fn is_shared(&self) -> bool {
+@@ -622,6 +735,21 @@ impl VllmHostOffloadAdapter {
+             "H2D completed before its destination dependencies"
+         );
+         kv_manager.activate_native_destination(uuid, sequence, lease, load.reservation);
++        if self.write_back.is_some() && !load.keys.is_empty() {
++            // Exclusive tiers: the loaded blocks leave G2 for G1, which writes
++            // them back when it evicts them.
++            let start = request
++                .prompt_keys
++                .iter()
++                .position(|key| *key == load.keys[0])
++                .expect("a G2 load is a run of its request's prompt blocks");
++            let end = start + load.keys.len();
++            assert_eq!(request.prompt_keys[start..end], load.keys[..]);
++            let meta = request.prompt_meta.as_ref().map(|meta| meta[start..end].to_vec());
++            self.note_g1_blocks(&load.keys, meta.as_deref());
++            let now_ms = self.current_time_ms();
++            self.host.lock().drop_resident(&load.keys, now_ms);
++        }
+         request.load = Some(LoadState::Activated(ActivatedPrefix {
+             original_g1_tokens: load.original_g1_tokens,
+             loaded_prefix_blocks: load.loaded_prefix_blocks,
+@@ -696,6 +824,15 @@ impl VllmHostOffloadAdapter {
+             return;
+         }
+         let start = request.next_store_block;
++        if self.write_back.is_some() {
++            // Write-back: nothing is stored as it is computed; G2 takes the
++            // block when G1 evicts it.
++            let keys = request.prompt_keys[start..end].to_vec();
++            let meta = request.prompt_meta.as_ref().map(|meta| meta[start..end].to_vec());
++            self.note_g1_blocks(&keys, meta.as_deref());
++            request.next_store_block = end;
++            return;
++        }
+         let mut tier = self.host.lock();
+         let missing_indices = (start..end)
+             .filter(|index| matches!(tier.lookup(request.prompt_keys[*index]), Lookup::Miss))
+@@ -869,6 +1006,7 @@ mod tests {
+     use crate::engine::host_offload::C;
+     use crate::engine::kv_manager::NativeAllocation;
+     use crate::engine::scheduler::vllm::core::VllmCore;
++    use crate::engine::scheduler::{SchedulerCommand, SchedulerCommandResult};
+     use crate::engine::trace::TraceCollector;
+     use crate::engine::{HostOffloadObservation, HostOffloadObservationData};
+ 
+@@ -969,6 +1107,153 @@ mod tests {
+         }
+     }
+ 
++    /// A prefix-caching core with G2 and instant transfers.
++    fn block_action_core(g1_blocks: usize, g2_blocks: usize, write_back: bool) -> VllmCore {
++        let mut host = NativeHostOffloadConfig::new(g2_blocks).with_bandwidths(0.0, 0.0);
++        host.write_back = write_back;
++        let args = MockEngineArgs::builder()
++            .num_gpu_blocks(g1_blocks)
++            .block_size(4)
++            .max_num_seqs(Some(4))
++            .max_num_batched_tokens(Some(64))
++            .enable_prefix_caching(true)
++            .kv_cache_bytes_per_token(Some(250_000))
++            .native_host_offload(Some(host))
++            .speedup_ratio(0.0)
++            .build()
++            .unwrap();
++        VllmCore::new(args)
++    }
++
++    fn run_to_completion(core: &mut VllmCore, uuid: Uuid, tokens: Vec<u32>, now_ms: &mut f64) {
++        let mut collector = TraceCollector::default();
++        core.receive(DirectRequest {
++            tokens,
++            max_output_tokens: 0,
++            uuid: Some(uuid),
++            arrival_timestamp_ms: Some(*now_ms),
++            ..Default::default()
++        });
++        for _ in 0..8 {
++            let pass = core.execute_pass(&mut collector, *now_ms);
++            *now_ms = pass.end_ms;
++            core.complete_engine_boundary(*now_ms);
++            if core.is_empty() {
++                core.process_internal_work(*now_ms);
++                return;
++            }
++        }
++        panic!("request did not complete");
++    }
++
++    fn prompt_hashes(uuid: Uuid, tokens: Vec<u32>) -> Vec<u64> {
++        let (_, _, host) = request(uuid, tokens);
++        host.prompt_keys.iter().map(|key| key.sequence_hash()).collect()
++    }
++
++    fn drop_blocks(hashes: &[u64], g1: bool, g2: bool, only_if_in_g2: bool) -> SchedulerCommand {
++        SchedulerCommand::KvBlocks(crate::engine::KvBlockCommand::Drop {
++            hashes: hashes.to_vec(),
++            g1,
++            g2,
++            only_if_in_g2,
++        })
++    }
++
++    fn prefetch_blocks(hashes: &[u64]) -> SchedulerCommand {
++        SchedulerCommand::KvBlocks(crate::engine::KvBlockCommand::Prefetch {
++            hashes: hashes.to_vec(),
++            local_hashes: vec![0; hashes.len()],
++        })
++    }
++
++    #[test]
++    fn demote_prefetch_and_invalidate_move_idle_blocks_between_tiers() {
++        let mut core = block_action_core(16, 8, false);
++        let mut now_ms = 0.0;
++        let tokens: Vec<u32> = (1..=8).collect();
++        let uuid = Uuid::from_u128(40);
++        run_to_completion(&mut core, uuid, tokens.clone(), &mut now_ms);
++        let [a, b] = prompt_hashes(uuid, tokens)[..] else {
++            panic!("two prompt blocks")
++        };
++        // Write-through: both tiers hold both blocks.
++        assert_eq!([core.kv_residency(a), core.kv_residency(b)], [(true, true); 2]);
++
++        // Demote frees G1 only where G2 holds the block.
++        let result = core.apply_command(drop_blocks(&[a, b], true, false, true)).unwrap();
++        assert_eq!(result, SchedulerCommandResult::Applied);
++        assert_eq!([core.kv_residency(a), core.kv_residency(b)], [(false, true); 2]);
++
++        // Prefetch loads the chain back into G1, keeping G2's copy.
++        core.apply_command(prefetch_blocks(&[a, b])).unwrap();
++        assert_eq!([core.kv_residency(a), core.kv_residency(b)], [(true, true); 2]);
++
++        // Invalidate drops every copy of the dead block, on both tiers.
++        core.apply_command(drop_blocks(&[b], true, true, false)).unwrap();
++        assert_eq!([core.kv_residency(a), core.kv_residency(b)], [(true, true), (false, false)]);
++
++        // A prefetch stops at the first block neither tier holds: nothing past
++        // it could be hit.
++        core.apply_command(drop_blocks(&[a], true, true, false)).unwrap();
++        let result = core.apply_command(prefetch_blocks(&[a, b])).unwrap();
++        assert_eq!(result, SchedulerCommandResult::Noop);
++        assert_eq!(core.kv_residency(a), (false, false));
++    }
++
++    #[test]
++    fn demote_keeps_a_block_g2_lacks() {
++        // G2 of two blocks: a later one-block prompt evicts one of the first two.
++        let mut core = block_action_core(16, 2, false);
++        let mut now_ms = 0.0;
++        let tokens: Vec<u32> = (1..=8).collect();
++        let uuid = Uuid::from_u128(41);
++        run_to_completion(&mut core, uuid, tokens.clone(), &mut now_ms);
++        run_to_completion(&mut core, Uuid::from_u128(45), (21..=24).collect(), &mut now_ms);
++        let hashes = prompt_hashes(uuid, tokens);
++        let in_g2: Vec<bool> = hashes.iter().map(|hash| core.kv_residency(*hash).1).collect();
++        assert_eq!(in_g2.iter().filter(|held| **held).count(), 1);
++        core.apply_command(drop_blocks(&hashes, true, false, true)).unwrap();
++        for (hash, held) in hashes.iter().zip(in_g2) {
++            assert_eq!(core.kv_residency(*hash), (!held, held));
++        }
++    }
++
++    #[test]
++    fn write_back_writes_g1_evictions_to_g2_and_loads_exclusively() {
++        // G1 of two blocks, G2 of eight.
++        let mut core = block_action_core(2, 8, true);
++        let mut now_ms = 0.0;
++        let first: Vec<u32> = (1..=4).collect();
++        let a_id = Uuid::from_u128(42);
++        run_to_completion(&mut core, a_id, first.clone(), &mut now_ms);
++        let [a] = prompt_hashes(a_id, first.clone())[..] else {
++            panic!("one prompt block")
++        };
++        // Nothing is written as it is computed.
++        assert_eq!(core.kv_residency(a), (true, false));
++
++        // A two-block prompt evicts `a` from G1, which writes it to G2.
++        let second: Vec<u32> = (11..=18).collect();
++        let b_id = Uuid::from_u128(43);
++        run_to_completion(&mut core, b_id, second.clone(), &mut now_ms);
++        assert_eq!(core.kv_residency(a), (false, true));
++        let second_hashes = prompt_hashes(b_id, second);
++        assert!(second_hashes.iter().all(|hash| core.kv_residency(*hash) == (true, false)));
++
++        // `a` again: it loads from G2 and leaves it; the G1 block it displaced
++        // is written back instead.
++        run_to_completion(&mut core, Uuid::from_u128(44), first, &mut now_ms);
++        assert_eq!(core.kv_residency(a), (true, false));
++        assert_eq!(
++            second_hashes
++                .iter()
++                .filter(|hash| core.kv_residency(**hash) == (false, true))
++                .count(),
++            1
++        );
++    }
++
+     #[test]
+     fn exhausted_pass_budget_does_not_touch_a_waiting_requests_host_prefix() {
+         let args = MockEngineArgs::builder()
+diff --git a/crates/core/src/engine/scheduler/vllm/kvcr.rs b/crates/core/src/engine/scheduler/vllm/kvcr.rs
+index 5b1d215a8..c07248311 100644
+--- a/crates/core/src/engine/scheduler/vllm/kvcr.rs
++++ b/crates/core/src/engine/scheduler/vllm/kvcr.rs
+@@ -135,6 +135,7 @@ impl VllmKvcrAdapter {
+         src.pin_external(&pulled);
+         drop(src);
+         let id = registry.submit(self.rank, source, pulled.len(), partial, now);
++        registry.note_pulled(owner, &pulled);
+         if restore.record_round(self.rank_progress) {
+             registry.note_bypassed();
+             tracing::warn!(
+diff --git a/crates/core/src/replay/agg.rs b/crates/core/src/replay/agg.rs
+index 58015702a..cf7a27f1d 100644
+--- a/crates/core/src/replay/agg.rs
++++ b/crates/core/src/replay/agg.rs
+@@ -605,14 +605,20 @@ where
+     }
+ 
+     /// Path B: deliver the out-of-band KV actions the policy queued to their
+-    /// ranks now, and hand the results back at the same virtual time.
+-    fn deliver_kv_actions(&mut self) -> anyhow::Result<()> {
++    /// ranks now, and hand the results back at the same virtual time. Returns
++    /// whether any were delivered.
++    fn deliver_kv_actions(&mut self) -> anyhow::Result<bool> {
+         let messages = self.placement.take_kv_actions();
+         if messages.is_empty() {
+-            return Ok(());
++            return Ok(false);
+         }
+-        let results = self.engine.apply_kv_actions(messages, self.now_ms);
+-        self.placement.kv_action_results(results, self.now_ms)
++        let (results, observed) = self.engine.apply_kv_actions(messages, self.now_ms)?;
++        self.placement.kv_action_results(results, self.now_ms)?;
++        // The blocks those actions dropped or loaded, as KV events for the router.
++        for events in observed {
++            self.apply_engine_observations(events, KvIngestBoundary::SchedulerCommand)?;
++        }
++        Ok(true)
+     }
+ 
+     /// Consume one output signal, updating router state, collector state, and completion counts.
+@@ -1076,6 +1082,8 @@ where
+             changed |= self.settle_internal_work(&mut consecutive_internal_steps)?;
+             let released = self.placement.advance_clock(self.now_ms)?;
+             changed |= !released.is_empty();
++            // Timed path B actions (a prefetch due now) the clock released.
++            changed |= self.deliver_kv_actions()?;
+             self.dispatch_placements(released)?;
+             let completed = self.apply_worker_completions()?;
+             changed |= completed;
+diff --git a/crates/core/src/replay/components/engine.rs b/crates/core/src/replay/components/engine.rs
+index 2714add8d..495f03baa 100644
+--- a/crates/core/src/replay/components/engine.rs
++++ b/crates/core/src/replay/components/engine.rs
+@@ -630,6 +630,14 @@ where
+         let Some(fetch) = hints.fetch else {
+             return Ok(None);
+         };
++        if !fetch.retain_copy
++            && let Some(registry) = &self.factory.kvcr
++        {
++            registry
++                .lock()
++                .unwrap()
++                .note_fetch_no_retain(placement.request_id);
++        }
+         let source = fetch.source_scheduler_id;
+         ensure!(
+             source < self.scheduler_owners.len(),
+@@ -651,14 +659,21 @@ where
+     /// Path B: execute out-of-band KV actions on their ranks (the engine's
+     /// `kv_actions` endpoint) and answer one result per action. Without KVCR in
+     /// this pool (no G2 handle per rank) every action is `Unsupported`.
++    ///
++    /// Block actions (`Invalidate`, `Demote`, `Prefetch`) run as a rank command,
++    /// so the KV events they cause come back for the router to observe.
+     pub(crate) fn apply_kv_actions(
+-        &self,
++        &mut self,
+         messages: Vec<crate::replay::core::KvActionMessage>,
+         now_ms: f64,
+-    ) -> Vec<crate::replay::core::KvActionResult> {
+-        use crate::engine::HostBlockKey;
++    ) -> Result<(
++        Vec<crate::replay::core::KvActionResult>,
++        Vec<Observation::Batch>,
++    )> {
++        use crate::engine::{HostBlockKey, KvBlockCommand};
+         use crate::replay::core::{KvAction, KvActionResult, KvActionStatus};
+         let mut results = Vec::new();
++        let mut observed = Vec::new();
+         for message in messages {
+             let rank = self
+                 .rank_identity(message.scheduler_id)
+@@ -676,6 +691,56 @@ where
+                             (KvActionStatus::Done, Vec::new())
+                         }
+                     },
++                    KvAction::Invalidate { .. } | KvAction::Demote { .. } | KvAction::Prefetch { .. }
++                        if self.factory.kvcr.is_none() || rank.is_none() =>
++                    {
++                        (KvActionStatus::Unsupported, Vec::new())
++                    }
++                    KvAction::Invalidate { block_hashes }
++                    | KvAction::Demote { block_hashes }
++                    | KvAction::Prefetch { block_hashes, .. } => {
++                        let command = match &request.action {
++                            KvAction::Invalidate { .. } => KvBlockCommand::Drop {
++                                hashes: block_hashes.clone(),
++                                g1: true,
++                                g2: true,
++                                only_if_in_g2: false,
++                            },
++                            KvAction::Demote { .. } => KvBlockCommand::Drop {
++                                hashes: block_hashes.clone(),
++                                g1: true,
++                                g2: false,
++                                only_if_in_g2: true,
++                            },
++                            KvAction::Prefetch { local_hashes, .. } => KvBlockCommand::Prefetch {
++                                hashes: block_hashes.clone(),
++                                local_hashes: local_hashes.clone(),
++                            },
++                            _ => unreachable!("matched block actions only"),
++                        };
++                        let effects = self.apply_command(
++                            message.scheduler_id,
++                            Command::KvBlocks(command),
++                            now_ms,
++                        )?;
++                        observed.push(effects.engine_events);
++                        let affected = self
++                            .factory
++                            .kvcr
++                            .as_ref()
++                            .and_then(|registry| registry.lock().unwrap().take_kv_command_result())
++                            .unwrap_or_default();
++                        let status = if affected.is_empty() {
++                            KvActionStatus::Failed
++                        } else if matches!(request.action, KvAction::Prefetch { .. })
++                            || affected.len() >= block_hashes.len()
++                        {
++                            KvActionStatus::Done
++                        } else {
++                            KvActionStatus::Partial
++                        };
++                        (status, affected)
++                    }
+                     KvAction::ReleaseSource { block_hashes } => {
+                         let tier = self
+                             .factory
+@@ -718,7 +783,7 @@ where
+                 });
+             }
+         }
+-        results
++        Ok((results, observed))
+     }
+ 
+     /// Drop a hint resolved before a delay (such as tokenization) whose source
+diff --git a/crates/core/src/replay/core/mod.rs b/crates/core/src/replay/core/mod.rs
+index 2283d18a9..e807cb2f7 100644
+--- a/crates/core/src/replay/core/mod.rs
++++ b/crates/core/src/replay/core/mod.rs
+@@ -89,6 +89,7 @@ impl KvHints {
+         Self {
+             fetch: Some(KvFetchAction {
+                 source_scheduler_id,
++                retain_copy: true,
+             }),
+             retain: None,
+         }
+@@ -104,6 +105,10 @@ impl KvHints {
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub struct KvFetchAction {
+     pub source_scheduler_id: usize,
++    /// The target keeps its G2 copy of the pulled prefix after the request
++    /// finishes. `false` (fetch without retain): the copy is dropped then, so
++    /// the fetched prefix lives on only in the target's G1.
++    pub retain_copy: bool,
+ }
+ 
+ /// Path B: KV actions a router sends out of band to one engine rank's
+@@ -135,6 +140,20 @@ pub enum KvAction {
+     /// rank's G2 (off is plain LRU), e.g. when KV memory demand crosses the
+     /// router's pressure guard.
+     RetainMode { enabled: bool },
++    /// `kv.invalidate@1.0`: these blocks will never be read again (e.g. the
++    /// context they hold was compacted away). Drop every idle copy on this
++    /// rank, G1 and G2. Copies a live request references or a transfer pins stay.
++    Invalidate { block_hashes: Vec<u64> },
++    /// `kv.demote@1.0`: free G1 for the session's think time. Drop the idle G1
++    /// copies of these blocks that G2 already holds; G2 keeps them for a reload.
++    Demote { block_hashes: Vec<u64> },
++    /// `kv.prefetch@1.0`: load back into G1, as idle cached blocks, the leading
++    /// blocks of this chain that G2 holds and G1 lacks, before the session's
++    /// predicted return. `local_hashes` are the blocks' token hashes.
++    Prefetch {
++        block_hashes: Vec<u64>,
++        local_hashes: Vec<u64>,
++    },
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+diff --git a/python/aisimulate/src/aisimulate/config/engine.py b/python/aisimulate/src/aisimulate/config/engine.py
+index 28d8df209..594acb32b 100644
+--- a/python/aisimulate/src/aisimulate/config/engine.py
++++ b/python/aisimulate/src/aisimulate/config/engine.py
+@@ -182,6 +182,8 @@ class HostOffloadConfig(StrictModel):
+     shared_d2h_bandwidth_gbps: NonNegativeFloat = 80.0
+     shared_h2d_bandwidth_gbps: NonNegativeFloat = 80.0
+     latency_to_first_byte_ms: NonNegativeFloat = 0.0
++    # Write-back (exclusive tiers): G2 takes a block when G1 evicts it, and a load leaves no G2 copy.
++    write_back: bool = False
+ 
+     @field_validator("scope", mode="before")
+     @classmethod
+@@ -196,7 +198,7 @@ class HostOffloadConfig(StrictModel):
+     def _omit_default_scope_controls(self, handler: Any) -> dict[str, Any]:
+         # Keep the pre-scope descriptor shape unless these controls are used.
+         payload = handler(self)
+-        for name in ("scope", "shared_d2h_bandwidth_gbps", "shared_h2d_bandwidth_gbps", "latency_to_first_byte_ms"):
++        for name in ("scope", "shared_d2h_bandwidth_gbps", "shared_h2d_bandwidth_gbps", "latency_to_first_byte_ms", "write_back"):
+             if payload.get(name) == type(self).model_fields[name].default:
+                 payload.pop(name)
+         return payload

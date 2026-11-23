@@ -1,0 +1,190 @@
+From 9a02a46872831f89c4c9f9394fb0eca140d0e2d7 Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Fri, 13 Nov 2026 23:57:57 +1000
+Subject: [PATCH 29/38] fix(prefetch): pin the run's ancestors (the chain's
+ blocks before it) while room is made and release them after the run, tail
+ first, as a request's prefix hit does; unpinned, an ancestor kept its old
+ recency and G1 evicted it before the prefetched run below it, so the router's
+ indexer truncated the chain there and a later removal failed (kitchen sink v1
+ stopped: Failed to find block); a run loads only when G1 holds every
+ ancestor. Probe AISIM_CHAIN_CHECK prints the first three G1 removals that cut
+ a cached chain, with a backtrace. Unit test
+
+---
+ .../core/src/engine/kv_manager/g1_manager.rs  |  4 +-
+ .../src/engine/kv_manager/vllm_backend.rs     | 44 +++++++++++++------
+ crates/core/src/engine/scheduler/vllm/core.rs | 18 ++++----
+ .../src/engine/scheduler/vllm/host_offload.rs | 26 +++++++++++
+ 4 files changed, 68 insertions(+), 24 deletions(-)
+
+diff --git a/crates/core/src/engine/kv_manager/g1_manager.rs b/crates/core/src/engine/kv_manager/g1_manager.rs
+index 0d92475c2..202ac0ade 100644
+--- a/crates/core/src/engine/kv_manager/g1_manager.rs
++++ b/crates/core/src/engine/kv_manager/g1_manager.rs
+@@ -291,9 +291,9 @@ impl G1Manager {
+         &mut self,
+         hashes: &[u64],
+         local_hashes: &[crate::engine::common::hashing::BlockHash],
+-        parent: Option<u64>,
++        ancestors: &[u64],
+     ) -> Vec<u64> {
+-        self.inner.prefetch_cached_blocks(hashes, local_hashes, parent)
++        self.inner.prefetch_cached_blocks(hashes, local_hashes, ancestors)
+     }
+ 
+     pub(crate) fn take_retain_broken(&mut self) -> u64 {
+diff --git a/crates/core/src/engine/kv_manager/vllm_backend.rs b/crates/core/src/engine/kv_manager/vllm_backend.rs
+index 8ef478ae5..c53b5023c 100644
+--- a/crates/core/src/engine/kv_manager/vllm_backend.rs
++++ b/crates/core/src/engine/kv_manager/vllm_backend.rs
+@@ -1424,29 +1424,29 @@ impl VllmKvManager {
+         self.pool.has_cached(hash)
+     }
+ 
+-    /// Path B prefetch: put `hashes` (a run of one prefix chain after `parent`) into G1 as
+-    /// idle cached blocks, evicting ordinary LRU blocks for room, and publish them as stored.
+-    /// Returns the blocks loaded; none when there is no room.
++    /// Path B prefetch: put `hashes` (a run of one prefix chain after `ancestors`, the chain's
++    /// blocks before the run, root first) into G1 as idle cached blocks, evicting ordinary LRU
++    /// blocks for room, and publish them as stored. Returns the blocks loaded; none when there is
++    /// no room or G1 lacks an ancestor.
+     pub(crate) fn prefetch_cached_blocks(
+         &mut self,
+         hashes: &[SequenceHash],
+         local_hashes: &[BlockHash],
+-        parent: Option<SequenceHash>,
++        ancestors: &[SequenceHash],
+     ) -> Vec<SequenceHash> {
+-        if hashes.is_empty() {
++        if hashes.is_empty() || !ancestors.iter().all(|hash| self.pool.has_cached(*hash)) {
+             return Vec::new();
+         }
+-        let Some(mut outcome) = self.pool.reserve(&[], hashes.len()) else {
++        let parent = ancestors.last().copied();
++        // The ancestors are pinned while room is made, so it never comes from evicting them, and
++        // released after the run, tail first, as a request's prefix hit does: the chain stays
++        // ordered for eviction from its tail. Unpinned, an ancestor kept its old recency, was
++        // evicted before the run below it, and the router's indexer truncated the chain there
++        // (kitchen sink v1 stopped: "failed to apply replay KV event ... Failed to find block").
++        let Some(mut outcome) = self.pool.reserve(ancestors, hashes.len()) else {
+             return Vec::new();
+         };
+         self.publish_removed(std::mem::take(&mut outcome.removed));
+-        // The room may have come from evicting the run's parent (an idle cached block). A run
+-        // published under a parent the router's indexer no longer holds cannot attach there, and
+-        // its later removals name blocks the indexer never stored: load nothing then.
+-        if parent.is_some_and(|parent| !self.pool.has_cached(parent)) {
+-            self.pool.cancel(outcome.reservation);
+-            return Vec::new();
+-        }
+         // The room may be capacity a pending transfer still reads (a G2 store of the blocks
+         // evicted for it). A prefetch loads at once and cannot wait behind that transfer, as a
+         // request's load does (`native_destination_pending_dependencies`): load nothing then.
+@@ -1848,6 +1848,24 @@ impl VllmKvManager {
+                 }
+             } else {
+                 for hash in &full_blocks {
++                    // Probe (AISIM_CHAIN_CHECK set): report the first three G1 removals that cut a
++                    // cached chain (a block removed while a cached block still extends it; the
++                    // router's indexer truncates the chain there), with a backtrace.
++                    if chain.children.get(hash).is_some_and(|n| *n > 0)
++                        && std::env::var_os("AISIM_CHAIN_CHECK").is_some()
++                    {
++                        static ONCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
++                        if ONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
++                            eprintln!(
++                                "CHAIN_CUT rank={} hash={} children={:?} n={}\n{}",
++                                self.dp_rank,
++                                hash,
++                                chain.children.get(hash),
++                                full_blocks.len(),
++                                std::backtrace::Backtrace::force_capture()
++                            );
++                        }
++                    }
+                     if let Some(p) = chain.parent_of.remove(hash)
+                         && let Some(n) = chain.children.get_mut(&p)
+                     {
+diff --git a/crates/core/src/engine/scheduler/vllm/core.rs b/crates/core/src/engine/scheduler/vllm/core.rs
+index ee3f91ec3..8c1437c3a 100644
+--- a/crates/core/src/engine/scheduler/vllm/core.rs
++++ b/crates/core/src/engine/scheduler/vllm/core.rs
+@@ -2683,8 +2683,8 @@ impl VllmCore {
+                 // The chain's leading blocks: runs G2 holds and G1 lacks, each after a parent
+                 // G1 holds, up to the first block neither tier holds (past it nothing can hit).
+                 let mut affected = Vec::new();
+-                let mut run: (Vec<u64>, Vec<u64>, Option<u64>) = (Vec::new(), Vec::new(), None);
+-                let mut parent = None;
++                // Each run keeps the index it starts at: the blocks before it are its ancestors.
++                let mut run: (Vec<u64>, Vec<u64>, usize) = (Vec::new(), Vec::new(), 0);
+                 let mut runs = Vec::new();
+                 for (index, &hash) in hashes.iter().enumerate() {
+                     if self.kv_manager.has_cached_block(hash) {
+@@ -2693,23 +2693,23 @@ impl VllmCore {
+                         }
+                     } else if adapter.g2_resident(hash) {
+                         if run.0.is_empty() {
+-                            run.2 = parent;
++                            run.2 = index;
+                         }
+                         run.0.push(hash);
+                         run.1.push(local_hashes.get(index).copied().unwrap_or_default());
+                     } else {
+                         break;
+                     }
+-                    parent = Some(hash);
+                 }
+                 if !run.0.is_empty() {
+                     runs.push(run);
+                 }
+-                for (run_hashes, run_locals, run_parent) in runs {
+-                    affected.extend(
+-                        self.kv_manager
+-                            .prefetch_cached_blocks(&run_hashes, &run_locals, run_parent),
+-                    );
++                for (run_hashes, run_locals, start) in runs {
++                    affected.extend(self.kv_manager.prefetch_cached_blocks(
++                        &run_hashes,
++                        &run_locals,
++                        &hashes[..start],
++                    ));
+                 }
+                 if let Some(adapter) = self.native_host_offload.as_mut() {
+                     adapter.note_kv_counts(0, 0, affected.len());
+diff --git a/crates/core/src/engine/scheduler/vllm/host_offload.rs b/crates/core/src/engine/scheduler/vllm/host_offload.rs
+index 1660b0f6d..b3026df08 100644
+--- a/crates/core/src/engine/scheduler/vllm/host_offload.rs
++++ b/crates/core/src/engine/scheduler/vllm/host_offload.rs
+@@ -1378,6 +1378,32 @@ mod tests {
+         assert!(a_hashes.iter().all(|hash| core.kv_residency(*hash) == (true, true)));
+     }
+ 
++    #[test]
++    fn a_prefetch_refreshes_the_run_s_ancestors_so_eviction_never_cuts_the_chain() {
++        // G1 of four blocks. A's last two blocks are demoted; B then makes A's head the oldest
++        // idle block. Prefetching A's run must leave its head newer than the run: a later prompt
++        // evicts B first, never A's head with A's run still below it (the router's indexer
++        // truncated the chain there; kitchen sink v1 stopped on "Failed to find block").
++        let mut core = block_action_core(4, 8, false);
++        let mut now_ms = 0.0;
++        let tokens: Vec<u32> = (1..=12).collect();
++        let a = Uuid::from_u128(52);
++        run_to_completion(&mut core, a, tokens.clone(), &mut now_ms);
++        let hashes = prompt_hashes(a, tokens);
++        core.apply_command(drop_blocks(&hashes[1..], true, false, true)).unwrap();
++        assert_eq!(core.kv_residency(hashes[0]), (true, true));
++        assert!(hashes[1..].iter().all(|hash| core.kv_residency(*hash) == (false, true)));
++        let b_tokens: Vec<u32> = (31..=34).collect();
++        let b = Uuid::from_u128(53);
++        run_to_completion(&mut core, b, b_tokens.clone(), &mut now_ms);
++        core.apply_command(prefetch_blocks(&hashes)).unwrap();
++        assert!(hashes.iter().all(|hash| core.kv_residency(*hash).0), "the run loaded");
++        run_to_completion(&mut core, Uuid::from_u128(54), (41..=44).collect(), &mut now_ms);
++        let in_g1: Vec<bool> = hashes.iter().map(|hash| core.kv_residency(*hash).0).collect();
++        assert!(in_g1[0], "A's head outlives the run below it: {in_g1:?}");
++        assert!(!core.kv_residency(prompt_hashes(b, b_tokens)[0]).0, "B went first");
++    }
++
+     #[test]
+     fn a_prefetched_run_is_evicted_tail_first() {
+         // G1 of four blocks, G2 of eight. A three-block chain is demoted, then prefetched back as

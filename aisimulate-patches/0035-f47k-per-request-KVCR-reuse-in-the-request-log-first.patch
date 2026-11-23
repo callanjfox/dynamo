@@ -1,0 +1,375 @@
+From 0f5909c7296be4303a9413d0925d63abb72aa2f2 Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Wed, 18 Nov 2026 11:38:55 +0000
+Subject: [PATCH 35/38] f47k: per-request KVCR reuse in the request log
+ (first_admission_kvcr_reused_input_tokens)
+
+---
+ crates/core/src/engine/host_offload/tier.rs   | 26 ++++++----
+ crates/core/src/engine/mod.rs                 | 13 +++++
+ crates/core/src/engine/protocol.rs            |  3 ++
+ crates/core/src/engine/scheduler/vllm/core.rs | 11 ++++-
+ .../src/engine/scheduler/vllm/host_offload.rs | 48 +++++++++++++++----
+ crates/core/src/replay/components/engine.rs   |  1 +
+ crates/core/src/replay/report.rs              | 14 ++++++
+ crates/core/tests/agentx_qualification.rs     | 10 ++++
+ crates/core/tests/kvcr_replay.rs              | 10 ++--
+ crates/tests/public-api/src/lib.rs            |  2 +
+ 10 files changed, 115 insertions(+), 23 deletions(-)
+
+diff --git a/crates/core/src/engine/host_offload/tier.rs b/crates/core/src/engine/host_offload/tier.rs
+index 1bc37466e..428a011b9 100644
+--- a/crates/core/src/engine/host_offload/tier.rs
++++ b/crates/core/src/engine/host_offload/tier.rs
+@@ -1015,16 +1015,24 @@ impl HostTier {
+ 
+     /// Count the `keys` a KVCR peer fetch filled and clear their mark, so each
+     /// pulled block counts once, at its first load.
++    #[cfg(test)]
+     pub(crate) fn take_kvcr_origin(&mut self, keys: &[HostBlockKey]) -> usize {
+-        let mut count = 0;
+-        for key in keys {
+-            if let Some(entry) = self.entries.get_mut(key)
+-                && std::mem::take(&mut entry.kvcr_origin)
+-            {
+-                count += 1;
+-            }
+-        }
+-        count
++        self.take_kvcr_origin_flags(keys)
++            .into_iter()
++            .filter(|pulled| *pulled)
++            .count()
++    }
++
++    /// For each of `keys`, whether a KVCR peer fetch filled it; clears the
++    /// marks, so each pulled block counts once, at its first load.
++    pub(crate) fn take_kvcr_origin_flags(&mut self, keys: &[HostBlockKey]) -> Vec<bool> {
++        keys.iter()
++            .map(|key| {
++                self.entries
++                    .get_mut(key)
++                    .is_some_and(|entry| std::mem::take(&mut entry.kvcr_origin))
++            })
++            .collect()
+     }
+ 
+     /// Roll back an unsubmitted reservation.
+diff --git a/crates/core/src/engine/mod.rs b/crates/core/src/engine/mod.rs
+index 8dbc36f92..7de3fa4d2 100644
+--- a/crates/core/src/engine/mod.rs
++++ b/crates/core/src/engine/mod.rs
+@@ -26,6 +26,19 @@ pub fn class_preemption_enabled() -> bool {
+ pub fn set_class_preemption_enabled(on: bool) {
+     CLASS_PREEMPTION.store(on, std::sync::atomic::Ordering::Relaxed);
+ }
++
++static KVCR_REUSE_FIELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++
++/// Whether request records carry `first_admission_kvcr_reused_input_tokens` (off by default, so
++/// request logs are unchanged; dynosim's replay turns it on with `DYNAMO_REPLAY_KVCR_FIELD=1`);
++/// process-wide.
++pub fn kvcr_reuse_field() -> bool {
++    KVCR_REUSE_FIELD.load(std::sync::atomic::Ordering::Relaxed)
++}
++
++pub fn set_kvcr_reuse_field(on: bool) {
++    KVCR_REUSE_FIELD.store(on, std::sync::atomic::Ordering::Relaxed);
++}
+ pub(crate) mod kvcr;
+ mod launch;
+ mod offload_lru;
+diff --git a/crates/core/src/engine/protocol.rs b/crates/core/src/engine/protocol.rs
+index 378af90ad..d814e4490 100644
+--- a/crates/core/src/engine/protocol.rs
++++ b/crates/core/src/engine/protocol.rs
+@@ -295,6 +295,9 @@ pub struct CacheTierAttribution {
+     pub g1_reused_input_tokens: usize,
+     /// Additional reused prompt tokens restored from the native host tier.
+     pub host_reused_input_tokens: usize,
++    /// Part of `host_reused_input_tokens` whose G2 blocks a KVCR peer pull
++    /// filled for this request; `None` unless the rank has KVCR configured.
++    pub kvcr_reused_input_tokens: Option<usize>,
+ }
+ 
+ /// Request admission exposed at pass start.
+diff --git a/crates/core/src/engine/scheduler/vllm/core.rs b/crates/core/src/engine/scheduler/vllm/core.rs
+index 67f423161..c229cdc07 100644
+--- a/crates/core/src/engine/scheduler/vllm/core.rs
++++ b/crates/core/src/engine/scheduler/vllm/core.rs
+@@ -3489,6 +3489,10 @@ impl VllmCore {
+         *token_budget = token_budget.saturating_sub(tokens_used);
+ 
+         let admission = if from_waiting {
++            let kvcr_configured = self
++                .native_host_offload
++                .as_ref()
++                .is_some_and(|adapter| adapter.kvcr_worker().is_some());
+             let request =
+                 self.state.requests.get_mut(&uuid).unwrap_or_else(|| {
+                     panic!("schedule_request: {uuid} removed mid-pass (admission)")
+@@ -3506,9 +3510,12 @@ impl VllmCore {
+             Some(AdmissionEvent {
+                 uuid,
+                 reused_input_tokens: cached_prefix_tokens,
+-                cache_tier_attribution: attribution.map(|(g1, host)| CacheTierAttribution {
++                cache_tier_attribution: attribution.map(|(g1, host, kvcr)| CacheTierAttribution {
+                     g1_reused_input_tokens: g1,
+                     host_reused_input_tokens: host,
++                    kvcr_reused_input_tokens: (kvcr_configured
++                        && crate::engine::kvcr_reuse_field())
++                    .then_some(kvcr),
+                 }),
+             })
+         } else {
+@@ -5327,6 +5334,7 @@ mod shared_g2_hold_tests {
+         let g1 = CacheTierAttribution {
+             g1_reused_input_tokens: 4,
+             host_reused_input_tokens: 0,
++            kvcr_reused_input_tokens: None,
+         };
+         assert_eq!(admissions(&run(&mut core, 0.0)), [(request, 4, Some(g1))]);
+     }
+@@ -5381,6 +5389,7 @@ mod shared_g2_hold_tests {
+         let g2 = CacheTierAttribution {
+             g1_reused_input_tokens: 0,
+             host_reused_input_tokens: 8,
++            kvcr_reused_input_tokens: None,
+         };
+         assert_eq!(admissions(&admitted), [(waiting, 8, Some(g2))]);
+     }
+diff --git a/crates/core/src/engine/scheduler/vllm/host_offload.rs b/crates/core/src/engine/scheduler/vllm/host_offload.rs
+index 426502e44..f5375da5d 100644
+--- a/crates/core/src/engine/scheduler/vllm/host_offload.rs
++++ b/crates/core/src/engine/scheduler/vllm/host_offload.rs
+@@ -29,14 +29,18 @@ use crate::engine::{HostOffloadObserver, KvHintSource, NativeHostOffloadConfig};
+ struct LoadingPrefix {
+     transfer_id: TransferId,
+     keys: Vec<HostBlockKey>,
++    /// Per key, whether a KVCR pull filled it; empty without KVCR.
++    kvcr_origin: Vec<bool>,
+     reservation: DestinationReservation,
+     original_g1_tokens: usize,
+     loaded_prefix_blocks: usize,
+     request_footprint_blocks: usize,
+ }
+ 
+-#[derive(Clone, Copy)]
++#[derive(Clone)]
+ struct ActivatedPrefix {
++    /// Per loaded block, whether a KVCR pull filled it; empty without KVCR.
++    kvcr_origin: Vec<bool>,
+     original_g1_tokens: usize,
+     loaded_prefix_blocks: usize,
+     loaded_blocks: usize,
+@@ -150,8 +154,8 @@ impl VllmHostRequestState {
+         }
+     }
+ 
+-    fn activated(&self) -> Option<ActivatedPrefix> {
+-        match self.load {
++    fn activated(&self) -> Option<&ActivatedPrefix> {
++        match &self.load {
+             Some(LoadState::Activated(load)) => Some(load),
+             _ => None,
+         }
+@@ -735,9 +739,13 @@ impl VllmHostOffloadAdapter {
+                     return StartLoad::Retry;
+                 }
+             };
+-        if let Some(kvcr) = &self.kvcr {
+-            kvcr.note_loaded(tier.take_kvcr_origin(&hit.keys));
+-        }
++        let kvcr_origin = if let Some(kvcr) = &self.kvcr {
++            let origin = tier.take_kvcr_origin_flags(&hit.keys);
++            kvcr.note_loaded(origin.iter().filter(|pulled| **pulled).count());
++            origin
++        } else {
++            Vec::new()
++        };
+         drop(tier);
+ 
+         for key in &hit.keys {
+@@ -753,6 +761,7 @@ impl VllmHostOffloadAdapter {
+         request.load = Some(LoadState::Loading(LoadingPrefix {
+             transfer_id,
+             keys: hit.keys,
++            kvcr_origin,
+             reservation,
+             original_g1_tokens: hit.original_g1_tokens,
+             loaded_prefix_blocks: hit.base_g1_blocks + hashes.len(),
+@@ -871,6 +880,7 @@ impl VllmHostOffloadAdapter {
+             self.host.lock().drop_resident(&load.keys, now_ms);
+         }
+         request.load = Some(LoadState::Activated(ActivatedPrefix {
++            kvcr_origin: load.kvcr_origin,
+             original_g1_tokens: load.original_g1_tokens,
+             loaded_prefix_blocks: load.loaded_prefix_blocks,
+             loaded_blocks: load.keys.len(),
+@@ -898,12 +908,14 @@ impl VllmHostOffloadAdapter {
+         cost
+     }
+ 
+-    /// Advance the persistent store cursor and return first-admission tier attribution.
++    /// Advance the persistent store cursor and return first-admission tier
++    /// attribution: (G1 tokens, host tokens, the part of the host tokens whose
++    /// blocks a KVCR pull filled).
+     pub(super) fn on_admitted(
+         request: &mut VllmHostRequestState,
+         reused_tokens: usize,
+         block_size: usize,
+-    ) -> Option<(usize, usize)> {
++    ) -> Option<(usize, usize, usize)> {
+         request.restore_rounds.reset();
+         let attribution = match request.load.take() {
+             Some(LoadState::Activated(load)) => {
+@@ -912,10 +924,26 @@ impl VllmHostOffloadAdapter {
+                 let g2 = reused_tokens - g1;
+                 assert!(g2 <= load.loaded_blocks * block_size);
+                 request.next_store_block = reused_tokens / block_size;
+-                (g1, g2)
++                // Loaded blocks follow the G1 prefix; count each KVCR-filled
++                // block's tokens inside the admitted host range [g1, reused).
++                let first_loaded_block = load.loaded_prefix_blocks - load.loaded_blocks;
++                let kvcr: usize = load
++                    .kvcr_origin
++                    .iter()
++                    .enumerate()
++                    .filter(|(_, pulled)| **pulled)
++                    .map(|(offset, _)| {
++                        let start = (first_loaded_block + offset) * block_size;
++                        (start + block_size)
++                            .min(reused_tokens)
++                            .saturating_sub(start.max(g1))
++                    })
++                    .sum();
++                assert!(kvcr <= g2);
++                (g1, g2, kvcr)
+             }
+             Some(LoadState::Loading(_)) => panic!("loading request cannot be admitted"),
+-            None => (reused_tokens, 0),
++            None => (reused_tokens, 0, 0),
+         };
+         if request.first_admission_recorded {
+             None
+diff --git a/crates/core/src/replay/components/engine.rs b/crates/core/src/replay/components/engine.rs
+index 0ea3518a1..9ba844674 100644
+--- a/crates/core/src/replay/components/engine.rs
++++ b/crates/core/src/replay/components/engine.rs
+@@ -1962,6 +1962,7 @@ mod tests {
+         let restored = Some(crate::engine::CacheTierAttribution {
+             g1_reused_input_tokens: 0,
+             host_reused_input_tokens: 4,
++            kvcr_reused_input_tokens: None,
+         });
+ 
+         // Worker 1 computes the block; scale-in marks it while its D2H runs.
+diff --git a/crates/core/src/replay/report.rs b/crates/core/src/replay/report.rs
+index d863f35ef..445e6351c 100644
+--- a/crates/core/src/replay/report.rs
++++ b/crates/core/src/replay/report.rs
+@@ -988,6 +988,10 @@ pub struct PerRequestRecord {
+     pub first_admission_g1_reused_input_tokens: Option<usize>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub first_admission_host_reused_input_tokens: Option<usize>,
++    /// Part of `first_admission_host_reused_input_tokens` whose G2 blocks a
++    /// KVCR peer pull filled for this request; absent unless KVCR is configured.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub first_admission_kvcr_reused_input_tokens: Option<usize>,
+     pub prefill_worker_idx: Option<usize>,
+     pub decode_worker_idx: Option<usize>,
+     pub prefill_admit_ms: Option<f64>,
+@@ -1590,6 +1594,12 @@ impl TraceCollector {
+                 Some(reused_input_tokens),
+                 "G1 and host attribution must sum to total reuse"
+             );
++            assert!(
++                attribution
++                    .kvcr_reused_input_tokens
++                    .is_none_or(|kvcr| kvcr <= attribution.host_reused_input_tokens),
++                "KVCR attribution must be part of host reuse"
++            );
+         }
+         if let Some(stats) = self.requests.get_mut(&uuid) {
+             if stats.first_admit_ms.is_none() {
+@@ -2303,6 +2313,9 @@ impl TraceCollector {
+                 first_admission_host_reused_input_tokens: detail
+                     .first_admission_cache_tier_attribution
+                     .map(|value| value.host_reused_input_tokens),
++                first_admission_kvcr_reused_input_tokens: detail
++                    .first_admission_cache_tier_attribution
++                    .and_then(|value| value.kvcr_reused_input_tokens),
+                 prefill_worker_idx: stats.prefill_worker_idx,
+                 decode_worker_idx: stats.decode_worker_idx,
+                 prefill_admit_ms: detail.prefill_admit_ms,
+@@ -3303,6 +3316,7 @@ mod tests {
+             Some(CacheTierAttribution {
+                 g1_reused_input_tokens: 12,
+                 host_reused_input_tokens: 8,
++                kvcr_reused_input_tokens: None,
+             }),
+         );
+         collector.on_decode_assigned(uuid, 0);
+diff --git a/crates/core/tests/agentx_qualification.rs b/crates/core/tests/agentx_qualification.rs
+index 1a728e6f9..c97595e32 100644
+--- a/crates/core/tests/agentx_qualification.rs
++++ b/crates/core/tests/agentx_qualification.rs
+@@ -385,6 +385,16 @@ fn agentx_g2_restores_evicted_parent_after_tool_gap_and_join(
+     let restored = g2_request(&offload, "restore");
+     assert_eq!(restored.first_admission_g1_reused_input_tokens, Some(0));
+     assert_eq!(restored.first_admission_host_reused_input_tokens, Some(8));
++    assert_eq!(restored.first_admission_kvcr_reused_input_tokens, None);
++    let json = serde_json::to_value(restored).unwrap();
++    assert!(
++        json.get("first_admission_host_reused_input_tokens")
++            .is_some()
++    );
++    assert!(
++        json.get("first_admission_kvcr_reused_input_tokens")
++            .is_none()
++    );
+     assert_eq!(g2_request(&hbm, "restore").reused_input_tokens, 0);
+     assert_eq!(
+         g2_request(&too_small, "restore").first_admission_host_reused_input_tokens,
+diff --git a/crates/core/tests/kvcr_replay.rs b/crates/core/tests/kvcr_replay.rs
+index 49fa0b09e..484fb8051 100644
+--- a/crates/core/tests/kvcr_replay.rs
++++ b/crates/core/tests/kvcr_replay.rs
+@@ -425,6 +425,8 @@ fn prefill_ranks_pull_from_each_other_in_pd() {
+ 
+ #[test]
+ fn a_landed_pull_does_not_block_a_later_g2_hit_that_holds_g1() {
++    // The KVCR reuse field is off by default; this test binary turns it on.
++    aisimulate_core::engine::set_kvcr_reuse_field(true);
+     // DP rank 0 is the source and DP rank 1 the target. Each rank has five
+     // 4-token G1 blocks and enough G2 to keep every prompt; H2D moves a 1 MB
+     // block in 10 ms.
+@@ -462,10 +464,12 @@ fn a_landed_pull_does_not_block_a_later_g2_hit_that_holds_g1() {
+         (
+             record.first_admit_ms,
+             record.first_admission_host_reused_input_tokens,
++            record.first_admission_kvcr_reused_input_tokens,
+         )
+     };
+     // B runs once its load lands and finishes at 122; A then loads its three
+-    // blocks over [122, 152).
+-    assert_eq!(admitted("b"), (Some(121.0), Some(8)));
+-    assert_eq!(admitted("a"), (Some(152.0), Some(12)));
++    // blocks over [122, 152). B's blocks are its own offloads, A's the pull.
++    // (The field is on for this test binary: set at the start of this test.)
++    assert_eq!(admitted("b"), (Some(121.0), Some(8), Some(0)));
++    assert_eq!(admitted("a"), (Some(152.0), Some(12), Some(12)));
+ }
+diff --git a/crates/tests/public-api/src/lib.rs b/crates/tests/public-api/src/lib.rs
+index a6aefd22e..49b7c441b 100644
+--- a/crates/tests/public-api/src/lib.rs
++++ b/crates/tests/public-api/src/lib.rs
+@@ -1161,6 +1161,8 @@ pub fn rebuild_replay_report_literals(
+             first_admission_g1_reused_input_tokens: record.first_admission_g1_reused_input_tokens,
+             first_admission_host_reused_input_tokens: record
+                 .first_admission_host_reused_input_tokens,
++            first_admission_kvcr_reused_input_tokens: record
++                .first_admission_kvcr_reused_input_tokens,
+             prefill_worker_idx: record.prefill_worker_idx,
+             decode_worker_idx: record.decode_worker_idx,
+             prefill_admit_ms: record.prefill_admit_ms,

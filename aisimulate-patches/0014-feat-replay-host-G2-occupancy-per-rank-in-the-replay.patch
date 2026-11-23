@@ -1,0 +1,147 @@
+From d8e9b5768ab049e4b3d5456399a16d7a199ea47a Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Thu, 12 Nov 2026 18:31:43 +1000
+Subject: [PATCH 14/38] feat(replay): host G2 occupancy per rank in the replay
+ telemetry (host_used_blocks, host_capacity_blocks)
+
+---
+ crates/core/src/engine/host_offload/tier.rs           | 5 +++++
+ crates/core/src/engine/protocol.rs                    | 3 +++
+ crates/core/src/engine/scheduler/mod.rs               | 7 +++++++
+ crates/core/src/engine/scheduler/rank.rs              | 2 ++
+ crates/core/src/engine/scheduler/vllm/core.rs         | 5 +++++
+ crates/core/src/engine/scheduler/vllm/host_offload.rs | 6 ++++++
+ crates/core/src/replay/components/engine.rs           | 2 ++
+ crates/core/src/replay/telemetry.rs                   | 5 +++++
+ 8 files changed, 35 insertions(+)
+
+diff --git a/crates/core/src/engine/host_offload/tier.rs b/crates/core/src/engine/host_offload/tier.rs
+index 77b240aa3..a5c919267 100644
+--- a/crates/core/src/engine/host_offload/tier.rs
++++ b/crates/core/src/engine/host_offload/tier.rs
+@@ -1445,6 +1445,11 @@ impl HostTier {
+         self.config.block_bytes
+     }
+ 
++    /// Blocks held, including pending destinations (constant time).
++    pub(crate) fn used_blocks_total(&self) -> usize {
++        self.entries.len()
++    }
++
+     /// `(resident, used)` blocks; used includes pending destinations.
+     pub(crate) fn occupancy(&self) -> (usize, usize) {
+         let resident = self
+diff --git a/crates/core/src/engine/protocol.rs b/crates/core/src/engine/protocol.rs
+index 7b7d8a12c..378af90ad 100644
+--- a/crates/core/src/engine/protocol.rs
++++ b/crates/core/src/engine/protocol.rs
+@@ -404,6 +404,9 @@ pub struct Metrics {
+     /// Total SGLang prefill tokens considered by the most recently completed
+     /// pass. Backends without an equivalent pass-local metric report zero.
+     pub sglang_cache_total_tokens: u64,
++    /// Host (G2) tier blocks held and the tier's capacity (zero without one).
++    pub host_used_blocks: u64,
++    pub host_capacity_blocks: u64,
+ }
+ 
+ /// Per-pass scheduling statistics.
+diff --git a/crates/core/src/engine/scheduler/mod.rs b/crates/core/src/engine/scheduler/mod.rs
+index 0fdb11894..e2bcd8e7f 100644
+--- a/crates/core/src/engine/scheduler/mod.rs
++++ b/crates/core/src/engine/scheduler/mod.rs
+@@ -148,6 +148,11 @@ pub struct MockerMetrics {
+     pub vllm_preemptions_total: u64,
+     pub sglang_cache_hit_tokens: u64,
+     pub sglang_cache_total_tokens: u64,
++    /// Host (G2) tier blocks this rank's pool holds, including pending
++    /// destinations, and the pool's capacity. Zero without a host tier; a
++    /// shared pool reports the same totals on every rank.
++    pub host_used_blocks: u64,
++    pub host_capacity_blocks: u64,
+ }
+ 
+ impl MockerMetrics {
+@@ -214,6 +219,8 @@ impl MockerMetrics {
+             vllm_preemptions_total,
+             sglang_cache_hit_tokens,
+             sglang_cache_total_tokens,
++            host_used_blocks: 0,
++            host_capacity_blocks: 0,
+         }
+     }
+ }
+diff --git a/crates/core/src/engine/scheduler/rank.rs b/crates/core/src/engine/scheduler/rank.rs
+index 43b19db0f..8eff705b2 100644
+--- a/crates/core/src/engine/scheduler/rank.rs
++++ b/crates/core/src/engine/scheduler/rank.rs
+@@ -633,6 +633,8 @@ fn map_metrics(metrics: MockerMetrics) -> Metrics {
+         preemptions_total: metrics.vllm_preemptions_total,
+         sglang_cache_hit_tokens: metrics.sglang_cache_hit_tokens,
+         sglang_cache_total_tokens: metrics.sglang_cache_total_tokens,
++        host_used_blocks: metrics.host_used_blocks,
++        host_capacity_blocks: metrics.host_capacity_blocks,
+     }
+ }
+ 
+diff --git a/crates/core/src/engine/scheduler/vllm/core.rs b/crates/core/src/engine/scheduler/vllm/core.rs
+index d400b3628..897e92187 100644
+--- a/crates/core/src/engine/scheduler/vllm/core.rs
++++ b/crates/core/src/engine/scheduler/vllm/core.rs
+@@ -1951,6 +1951,11 @@ impl VllmCore {
+             metrics.gpu_cache_usage_perc = pool.used_bytes() as f64 / pool.capacity_bytes() as f64;
+             metrics.physical_gpu_cache_usage_perc = metrics.gpu_cache_usage_perc;
+         }
++        if let Some(host) = &self.native_host_offload {
++            let (used, capacity) = host.occupancy();
++            metrics.host_used_blocks = used as u64;
++            metrics.host_capacity_blocks = capacity as u64;
++        }
+         metrics
+     }
+ 
+diff --git a/crates/core/src/engine/scheduler/vllm/host_offload.rs b/crates/core/src/engine/scheduler/vllm/host_offload.rs
+index b4387e44a..4826a9ab2 100644
+--- a/crates/core/src/engine/scheduler/vllm/host_offload.rs
++++ b/crates/core/src/engine/scheduler/vllm/host_offload.rs
+@@ -411,6 +411,12 @@ impl VllmHostOffloadAdapter {
+         }
+     }
+ 
++    /// `(used, capacity)` blocks of this rank's host pool, for telemetry.
++    pub(super) fn occupancy(&self) -> (usize, usize) {
++        let tier = self.host.lock();
++        (tier.used_blocks_total(), tier.capacity_blocks())
++    }
++
+     pub(super) fn set_observer(&mut self, observer: Arc<dyn HostOffloadObserver>) {
+         self.host.lock().set_observer(Arc::clone(&observer));
+         self.observer = Some(observer);
+diff --git a/crates/core/src/replay/components/engine.rs b/crates/core/src/replay/components/engine.rs
+index daafb9e0a..0ea3518a1 100644
+--- a/crates/core/src/replay/components/engine.rs
++++ b/crates/core/src/replay/components/engine.rs
+@@ -128,6 +128,8 @@ impl RankMetricsState {
+             physical_cache_usage: self.latest.physical_cache_usage,
+             running_requests: self.latest.running_requests,
+             waiting_requests: self.latest.waiting_requests,
++            host_used_blocks: self.latest.host_used_blocks,
++            host_capacity_blocks: self.latest.host_capacity_blocks,
+         }
+     }
+ 
+diff --git a/crates/core/src/replay/telemetry.rs b/crates/core/src/replay/telemetry.rs
+index 07be8d8db..52bfe37d5 100644
+--- a/crates/core/src/replay/telemetry.rs
++++ b/crates/core/src/replay/telemetry.rs
+@@ -50,6 +50,11 @@ pub struct ReplaySchedulerMetricsSnapshot {
+     pub physical_cache_usage: f64,
+     pub running_requests: u64,
+     pub waiting_requests: u64,
++    /// Host (G2) tier blocks held (including pending destinations) and the
++    /// tier's capacity; zero without a host tier. A shared pool reports the
++    /// same totals on every rank.
++    pub host_used_blocks: u64,
++    pub host_capacity_blocks: u64,
+ }
+ 
+ /// Additive scheduler observations over one telemetry interval for one role.

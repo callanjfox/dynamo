@@ -1,0 +1,426 @@
+From 7c391387ee7be527537154dc14f1566bf7635956 Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Thu, 19 Nov 2026 23:32:41 +0000
+Subject: [PATCH 38/38] f49q3: f49o3 keep preempt
+
+---
+ crates/core/src/engine/mod.rs                 |  38 ++++
+ crates/core/src/engine/scheduler/vllm/core.rs |  82 ++++++--
+ crates/core/src/replay/warm_kv.rs             | 178 ++++++++++++++++++
+ 3 files changed, 279 insertions(+), 19 deletions(-)
+ create mode 100644 crates/core/src/replay/warm_kv.rs
+
+diff --git a/crates/core/src/engine/mod.rs b/crates/core/src/engine/mod.rs
+index 7de3fa4d2..89ac680e6 100644
+--- a/crates/core/src/engine/mod.rs
++++ b/crates/core/src/engine/mod.rs
+@@ -39,6 +39,44 @@ pub fn kvcr_reuse_field() -> bool {
+ pub fn set_kvcr_reuse_field(on: bool) {
+     KVCR_REUSE_FIELD.store(on, std::sync::atomic::Ordering::Relaxed);
+ }
++
++static BATCH_YIELD_LEVEL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++static BATCH_YIELD_RANK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
++static BATCH_YIELD_FINISH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
++static BATCH_YIELD_STEP_ASIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++
++/// f49o: a router's batch-yield signal (its `admission.batch_yield`), process-wide like class
++/// preemption: while `level > 0`, classes ranked at or above `protect_rank` under
++/// `class_scheduling` preempt lower classes for room (sparing one with at most `finish_tokens`
++/// output left) and, with `step_aside`, are protected by the class step limits.
++#[derive(Debug, Clone, Copy, PartialEq)]
++pub struct BatchYield {
++    pub level: f64,
++    pub protect_rank: usize,
++    pub finish_tokens: usize,
++    pub step_aside: bool,
++}
++
++pub fn set_batch_yield(level: f64, protect_rank: Option<usize>, finish_tokens: usize, step_aside: bool) {
++    use std::sync::atomic::Ordering::Relaxed;
++    BATCH_YIELD_LEVEL.store(level.max(0.0).to_bits(), Relaxed);
++    BATCH_YIELD_RANK.store(protect_rank.unwrap_or(usize::MAX), Relaxed);
++    BATCH_YIELD_FINISH.store(finish_tokens, Relaxed);
++    BATCH_YIELD_STEP_ASIDE.store(step_aside, Relaxed);
++}
++
++/// The batch-yield signal while it is up (`None` at level 0 or without a protected rank).
++pub fn batch_yield() -> Option<BatchYield> {
++    use std::sync::atomic::Ordering::Relaxed;
++    let level = f64::from_bits(BATCH_YIELD_LEVEL.load(Relaxed));
++    let rank = BATCH_YIELD_RANK.load(Relaxed);
++    (level > 0.0 && rank != usize::MAX).then(|| BatchYield {
++        level,
++        protect_rank: rank,
++        finish_tokens: BATCH_YIELD_FINISH.load(Relaxed),
++        step_aside: BATCH_YIELD_STEP_ASIDE.load(Relaxed),
++    })
++}
+ pub(crate) mod kvcr;
+ mod launch;
+ mod offload_lru;
+diff --git a/crates/core/src/engine/scheduler/vllm/core.rs b/crates/core/src/engine/scheduler/vllm/core.rs
+index 97c9c47a0..f9bbf44e9 100644
+--- a/crates/core/src/engine/scheduler/vllm/core.rs
++++ b/crates/core/src/engine/scheduler/vllm/core.rs
+@@ -717,6 +717,8 @@ pub(crate) struct VllmCore {
+     /// lower classes and lower-class decodes still allowed (`None`: no limit).
+     pass_low_prefill_budget: Option<usize>,
+     pass_low_decode_allow: Option<usize>,
++    /// f49o: this pass's protected rank (`protect_max_rank`, or batch yield's with step-aside).
++    pass_protect_rank: Option<usize>,
+     /// Lower-class prefills cut to nothing, and lower-class decodes left out, by those limits.
+     pub(crate) prefill_pauses_total: u64,
+     pub(crate) decode_yields_total: u64,
+@@ -977,6 +979,7 @@ impl VllmCore {
+             class_preemptions_total: 0,
+             pass_low_prefill_budget: None,
+             pass_low_decode_allow: None,
++            pass_protect_rank: None,
+             prefill_pauses_total: 0,
+             decode_yields_total: 0,
+             capacity_generation: 0,
+@@ -2931,6 +2934,12 @@ impl VllmCore {
+     /// Under `class_scheduling`, the running request to preempt: the lowest class, the newest
+     /// within it. With `below`, only requests ranked strictly below that rank qualify.
+     fn class_victim(&self, below: Option<usize>) -> Option<Uuid> {
++        self.class_victim_sparing(below, 0)
++    }
++
++    /// [`Self::class_victim`] skipping a request with at most `finish_tokens` output left
++    /// (f49o batch yield's finish rule; 0 spares nothing).
++    fn class_victim_sparing(&self, below: Option<usize>, finish_tokens: usize) -> Option<Uuid> {
+         let mut best: Option<(usize, Uuid)> = None;
+         for uuid in self.state.running.iter().rev().copied() {
+             let Some(request) = self.state.requests.get(&uuid) else {
+@@ -2942,6 +2951,15 @@ impl VllmCore {
+             if below.is_some_and(|rank| request.class_rank <= rank) {
+                 continue;
+             }
++            if finish_tokens > 0
++                && request
++                    .sequence
++                    .max_output_tokens()
++                    .saturating_sub(request.sequence.generated_tokens())
++                    <= finish_tokens
++            {
++                continue;
++            }
+             if best.is_none_or(|(rank, _)| request.class_rank > rank) {
+                 best = Some((request.class_rank, uuid));
+             }
+@@ -2954,15 +2972,31 @@ impl VllmCore {
+     /// in free blocks and a sequence slot, as the JS model's `preemptFor`. A request that would
+     /// not fit even with every lower-class request gone is left waiting. Returns preemptions made.
+     fn class_preempt_for_waiting(&mut self, at_ms: f64) -> usize {
+-        if !crate::engine::class_preemption_enabled() {
+-            return 0;
+-        }
+-        let Some(max_rank) = self
++        // f49o batch yield: with the router's signal up, the protected classes take room from the
++        // rest even without `preempt_max_rank`, sparing a victim about to finish.
++        let by = self
+             .args
+             .class_scheduling
+             .as_ref()
+-            .and_then(|c| c.preempt_max_rank)
+-        else {
++            .and(crate::engine::batch_yield());
++        let configured = if crate::engine::class_preemption_enabled() {
++            self.args
++                .class_scheduling
++                .as_ref()
++                .and_then(|c| c.preempt_max_rank)
++        } else {
++            None
++        };
++        let finish_tokens = by.map_or(0, |b| b.finish_tokens);
++        // While yielding, requests up to the deeper of the two ranks may preempt; each takes the
++        // victims its own rank allows (f49o3): one the configured rank covers keeps the base rule,
++        // one only batch yield covers takes yield-class victims below the protected rank, sparing
++        // one about to finish (so a running standard turn is preempted only as the base allows).
++        let max_rank = match (configured, by) {
++            (Some(c), Some(b)) => Some(c.max(b.protect_rank)),
++            (c, b) => c.or(b.map(|b| b.protect_rank)),
++        };
++        let Some(max_rank) = max_rank else {
+             return 0;
+         };
+         if !policy::allows_preemption(self.args.scheduling_policy()) {
+@@ -2971,7 +3005,7 @@ impl VllmCore {
+         let block_size = self.args.block_size.max(1);
+         let total_blocks = self.args.num_gpu_blocks;
+         let max_seqs = self.args.max_num_seqs.unwrap_or(usize::MAX);
+-        let candidates: Vec<(Uuid, usize)> = self
++        let candidates: Vec<(Uuid, usize, usize)> = self
+             .state
+             .waiting
+             .iter()
+@@ -2979,12 +3013,21 @@ impl VllmCore {
+             .filter(|uuid| self.state.waiting_members.contains(uuid))
+             .filter_map(|uuid| {
+                 let request = self.state.requests.get(&uuid)?;
+-                (request.class_rank <= max_rank)
+-                    .then(|| (uuid, (request.sequence.len() + 1).div_ceil(block_size)))
++                (request.class_rank <= max_rank).then(|| {
++                    (
++                        uuid,
++                        (request.sequence.len() + 1).div_ceil(block_size),
++                        request.class_rank,
++                    )
++                })
+             })
+             .collect();
+         let mut made = 0;
+-        for (_uuid, need) in candidates {
++        for (_uuid, need, rank) in candidates {
++            let (below, finish) = match configured {
++                Some(c) if rank <= c => (c, 0),
++                _ => (max_rank, finish_tokens),
++            };
+             let mut pinned = 0usize;
+             let mut lower = 0usize;
+             for running in self.state.running.iter() {
+@@ -2994,7 +3037,7 @@ impl VllmCore {
+                 if !self.state.running_members.contains(running) || request.status != RequestStatus::Running {
+                     continue;
+                 }
+-                if request.class_rank <= max_rank {
++                if request.class_rank <= below {
+                     pinned += request.sequence.lease.resident_block_count();
+                 } else {
+                     lower += 1;
+@@ -3010,7 +3053,7 @@ impl VllmCore {
+                 if free >= need && self.state.running_members.len() < max_seqs {
+                     break;
+                 }
+-                let Some(victim) = self.class_victim(Some(max_rank)) else {
++                let Some(victim) = self.class_victim_sparing(Some(below), finish) else {
+                     return made;
+                 };
+                 if self.preempt_selected(victim, at_ms).is_none() {
+@@ -3031,12 +3074,16 @@ impl VllmCore {
+     fn set_class_step_limits(&mut self, now_ms: f64) -> anyhow::Result<()> {
+         self.pass_low_prefill_budget = None;
+         self.pass_low_decode_allow = None;
++        self.pass_protect_rank = None;
+         let Some(cfg) = self.args.class_scheduling.clone() else {
+             return Ok(());
+         };
+-        let Some(protect) = cfg.protect_max_rank else {
++        // f49o batch yield with step-aside: the protected rank and decode yielding while it is up.
++        let by = crate::engine::batch_yield().filter(|b| b.step_aside);
++        let Some(protect) = cfg.protect_max_rank.or(by.map(|b| b.protect_rank)) else {
+             return Ok(());
+         };
++        self.pass_protect_rank = Some(protect);
+         let mut cap = f64::INFINITY;
+         let (mut n_hi, mut ctx_hi) = (0usize, 0usize);
+         let mut low_decodes: Vec<usize> = Vec::new();
+@@ -3075,7 +3122,7 @@ impl VllmCore {
+         let lim = cap.max(decode_ms(n_hi, ctx_hi)?);
+         let (mut n_dec, mut ctx_dec) = (n_hi, ctx_hi);
+         let mut decode_allow = None;
+-        if cfg.yield_decodes {
++        if cfg.yield_decodes || by.is_some() {
+             let mut allow = 0;
+             for ctx in &low_decodes {
+                 if decode_ms(n_dec + 1, ctx_dec + ctx)? > lim {
+@@ -3343,11 +3390,8 @@ impl VllmCore {
+ 
+         let request_len = request.sequence.len();
+         let class_rank = request.class_rank;
+-        let protected_rank = self
+-            .args
+-            .class_scheduling
+-            .as_ref()
+-            .and_then(|c| c.protect_max_rank);
++        // f49o: the pass's protected rank (the configured one, or batch yield's).
++        let protected_rank = self.pass_protect_rank;
+         let low_class = protected_rank.is_some_and(|rank| class_rank > rank);
+         let is_prefill = prompt_remaining > 0;
+         if low_class && !is_prefill && self.pass_low_decode_allow == Some(0) {
+diff --git a/crates/core/src/replay/warm_kv.rs b/crates/core/src/replay/warm_kv.rs
+new file mode 100644
+index 000000000..920866509
+--- /dev/null
++++ b/crates/core/src/replay/warm_kv.rs
+@@ -0,0 +1,178 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++//! Warm KV for closed-loop users runs (`DYNAMO_REPLAY_WARM_KV`).
++//!
++//! A warm-start users session joins mid-conversation. Its first request, the primer (request id
++//! ending in `:primer`, one output token), carries the session's whole context, which is
++//! otherwise prefilled uncached on the GPU. With `g2`, just before a primer is submitted to the
++//! worker the router placed it on, its complete prompt blocks are made resident in that worker's
++//! host tier (G2), as if the worker had offloaded them during the session's earlier turns. The
++//! primer then finds them in G2 and loads them host to device instead of prefilling them.
++
++use std::collections::BTreeMap;
++
++use anyhow::{Result, bail};
++use rustc_hash::FxHashSet;
++use uuid::Uuid;
++
++use crate::replay::protocol::DirectRequest;
++
++pub(crate) const WARM_KV_ENV: &str = "DYNAMO_REPLAY_WARM_KV";
++
++/// How a warm-start session's context starts out.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub(crate) enum WarmKv {
++    /// Unset or `off`: a primer prefills its context like any other request.
++    #[default]
++    Off,
++    /// `g2`: a primer's prompt blocks start resident in its worker's G2.
++    G2,
++}
++
++impl WarmKv {
++    pub(crate) fn from_env() -> Result<Self> {
++        match std::env::var(WARM_KV_ENV) {
++            Ok(value) => Self::parse(&value),
++            Err(std::env::VarError::NotPresent) => Ok(Self::Off),
++            Err(error) => bail!("{WARM_KV_ENV}: {error}"),
++        }
++    }
++
++    pub(crate) fn parse(value: &str) -> Result<Self> {
++        match value.trim() {
++            "" | "off" => Ok(Self::Off),
++            "g2" => Ok(Self::G2),
++            other if other.starts_with("g2+hbm:") => bail!(
++                "{WARM_KV_ENV}={other}: seeding a share of the prefix in HBM is not implemented; use g2"
++            ),
++            other => bail!("{WARM_KV_ENV}={other}: expected off or g2"),
++        }
++    }
++}
++
++/// Whether `request` is a users-run primer: its request id ends in `:primer`.
++pub(crate) fn is_primer(request: &DirectRequest) -> bool {
++    request.replay_context.as_ref().is_some_and(|context| {
++        context.authored_id.ends_with(":primer")
++            || context
++                .agentic
++                .as_ref()
++                .is_some_and(|identity| identity.request_id.ends_with(":primer"))
++    })
++}
++
++/// Seeds of one worker.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub(crate) struct WorkerSeeds {
++    /// Primers whose seed made at least one block resident.
++    pub(crate) primers: u64,
++    /// Primers whose seed found nothing to add (no G2 on the worker, or every block present).
++    pub(crate) unchanged: u64,
++    /// Prompt tokens of the primers in `primers`.
++    pub(crate) prompt_tokens: u64,
++}
++
++/// Which primers were seeded, once each, and the per-worker counts.
++#[derive(Debug, Default)]
++pub(crate) struct WarmKvSeeds {
++    claimed: FxHashSet<Uuid>,
++    by_worker: BTreeMap<usize, WorkerSeeds>,
++}
++
++impl WarmKvSeeds {
++    /// True the first time primer `uuid` is about to be submitted. A primer placed again after
++    /// an `engine.dequeue` is not seeded again.
++    pub(crate) fn claim(&mut self, uuid: Uuid) -> bool {
++        self.claimed.insert(uuid)
++    }
++
++    pub(crate) fn record(&mut self, worker: usize, prompt_tokens: usize, seeded: bool) {
++        let counts = self.by_worker.entry(worker).or_default();
++        if seeded {
++            counts.primers += 1;
++            counts.prompt_tokens += prompt_tokens as u64;
++        } else {
++            counts.unchanged += 1;
++        }
++    }
++
++    #[cfg(test)]
++    pub(crate) fn by_worker(&self) -> &BTreeMap<usize, WorkerSeeds> {
++        &self.by_worker
++    }
++
++    /// One tracing line per worker that received a primer.
++    pub(crate) fn log_summary(&self) {
++        for (worker, counts) in &self.by_worker {
++            tracing::info!(
++                worker,
++                seeded_primers = counts.primers,
++                unchanged_primers = counts.unchanged,
++                seeded_prompt_tokens = counts.prompt_tokens,
++                "warm KV: primer prefixes seeded into G2"
++            );
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::replay::protocol::ReplayRequestContext;
++
++    fn with_id(authored_id: &str) -> DirectRequest {
++        DirectRequest {
++            replay_context: Some(ReplayRequestContext {
++                authored_id: authored_id.to_owned(),
++                ..ReplayRequestContext::default()
++            }),
++            ..DirectRequest::default()
++        }
++    }
++
++    #[test]
++    fn warm_kv_parses_off_and_g2_and_rejects_the_rest() {
++        assert_eq!(WarmKv::parse("").unwrap(), WarmKv::Off);
++        assert_eq!(WarmKv::parse("off").unwrap(), WarmKv::Off);
++        assert_eq!(WarmKv::parse(" g2 ").unwrap(), WarmKv::G2);
++        assert!(WarmKv::parse("g2+hbm:0.5").is_err());
++        assert!(WarmKv::parse("on").is_err());
++        assert_eq!(WarmKv::default(), WarmKv::Off);
++    }
++
++    #[test]
++    fn only_requests_whose_id_ends_in_primer_are_primers() {
++        assert!(is_primer(&with_id("cp000003000000:t7:primer")));
++        assert!(!is_primer(&with_id("cp000003000000:t7:r0")));
++        assert!(!is_primer(&with_id("cp000003000000:primer:r1")));
++        assert!(!is_primer(&DirectRequest::default()));
++    }
++
++    #[test]
++    fn each_primer_is_claimed_once_and_counted_by_worker() {
++        let mut seeds = WarmKvSeeds::default();
++        let primer = Uuid::from_u128(7);
++        assert!(seeds.claim(primer));
++        assert!(!seeds.claim(primer));
++        seeds.record(1, 160, true);
++        seeds.record(1, 80, true);
++        seeds.record(0, 40, false);
++        assert_eq!(
++            seeds.by_worker()[&1],
++            WorkerSeeds {
++                primers: 2,
++                unchanged: 0,
++                prompt_tokens: 240,
++            }
++        );
++        assert_eq!(
++            seeds.by_worker()[&0],
++            WorkerSeeds {
++                primers: 0,
++                unchanged: 1,
++                prompt_tokens: 0,
++            }
++        );
++    }
++}

@@ -1,0 +1,198 @@
+From 587f133508d53d5fa63899fe627750486d28cbd5 Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Sun, 15 Nov 2026 01:22:24 +1000
+Subject: [PATCH 32/38] fix(retain): TTL protection never evicts a chain's
+ ancestor before a cached descendant: a protected copy whose TTL runs out
+ rejoins the ordinary LRU at its newest end, tail first (it was evicted ahead
+ of the LRU, where a later unprotected request's blocks below it still
+ waited), and a copy a protection names while another request still holds it
+ (a shared prefix) is protected when released (it entered the ordinary LRU
+ ahead of its protected descendants); both cut the chain in the router's
+ indexer and stopped the replay (Failed to find block, ttl_return at 1,040
+ users); AISIM_CHAIN_CHECK at 128 users: 3 cuts with the fixed TTL before;
+ unit tests
+
+---
+ .../core/src/engine/cache/vllm_block_pool.rs  | 106 +++++++++++++++---
+ 1 file changed, 89 insertions(+), 17 deletions(-)
+
+diff --git a/crates/core/src/engine/cache/vllm_block_pool.rs b/crates/core/src/engine/cache/vllm_block_pool.rs
+index b0c6d9f88..e64ee0ad6 100644
+--- a/crates/core/src/engine/cache/vllm_block_pool.rs
++++ b/crates/core/src/engine/cache/vllm_block_pool.rs
+@@ -360,9 +360,13 @@ pub(crate) struct VllmBlockPool {
+ }
+ 
+ /// Inactive copies a finished request asked to keep (`kv.retain`), in release
+-/// order, linked through the same intrusive links as the ordinary LRU and
+-/// counted in `inactive_len`. Eviction takes an expired protected copy first,
+-/// then the ordinary LRU, and a live protected copy only when nothing else is left.
++/// order (a chain's tail first), linked through the same intrusive links as the
++/// ordinary LRU and counted in `inactive_len`. A copy whose protection expires
++/// rejoins the ordinary LRU at its newest end, tail first; eviction takes the
++/// ordinary LRU, and a live protected copy only when nothing else is left. So an
++/// ancestor never leaves G1 before a cached descendant: an expired ancestor used to
++/// be evicted ahead of the LRU, where a later, unprotected request's blocks below it
++/// still waited, which cut the chain in the router's indexer ("Failed to find block").
+ #[derive(Debug, Default)]
+ struct RetainList {
+     head: Option<BlockCopyId>,
+@@ -373,11 +377,15 @@ struct RetainList {
+     /// Protected copies by (expiry time bits, protection order), earliest first; expiry
+     /// times are non-negative, so their bit patterns order like the times.
+     by_expiry: std::collections::BTreeMap<(u64, u64), BlockCopyId>,
++    /// Copies a protection named while another request still referenced them (a
++    /// shared prefix): protected with this expiry when they are released, so the
++    /// prefix does not enter the ordinary LRU ahead of its protected descendants.
++    pending: FxHashMap<BlockCopyId, f64>,
+     next_seq: u64,
+     now_ms: f64,
+     /// Protected copies evicted before their TTL ran out.
+     broken: u64,
+-    /// Protected copies evicted after their TTL ran out (ahead of the LRU).
++    /// Protected copies whose TTL ran out (returned to the ordinary LRU).
+     expired: u64,
+ }
+ 
+@@ -422,8 +430,8 @@ impl VllmBlockPool {
+     }
+ 
+     /// `kv.retain`: keep the inactive `copies` out of ordinary LRU eviction until
+-    /// `until_ms`. Copies another request still references are left as they are.
+-    /// Returns how many copies entered protection.
++    /// `until_ms`. A copy another request still references is protected when it is
++    /// released (`RetainList::pending`). Returns how many copies entered protection now.
+     pub(crate) fn protect(&mut self, copies: &[BlockCopyId], until_ms: f64, now_ms: f64) -> usize {
+         assert!(
+             self.belady.is_none(),
+@@ -432,7 +440,15 @@ impl VllmBlockPool {
+         self.retain.get_or_insert_with(Box::default).now_ms = now_ms;
+         let mut protected = 0;
+         for &id in copies {
+-            if !self.copies.contains_key(id) || !self.is_inactive(id) {
++            if !self.copies.contains_key(id) {
++                continue;
++            }
++            if !self.is_inactive(id) {
++                if matches!(self.copies[id].state, CopyState::Cached { .. }) {
++                    let pending = &mut self.retain.as_deref_mut().unwrap().pending;
++                    let until = pending.entry(id).or_insert(until_ms);
++                    *until = until.max(until_ms);
++                }
+                 continue;
+             }
+             if self.in_retain_list(id) {
+@@ -529,21 +545,31 @@ impl VllmBlockPool {
+         }
+     }
+ 
+-    /// The next eviction victim without Belady: an expired protected copy, else
+-    /// the ordinary LRU head, else (counted as broken) the oldest protected copy.
++    /// The next eviction victim without Belady: the ordinary LRU head, else (counted
++    /// as broken) the oldest protected copy. Protected copies whose TTL ran out first
++    /// rejoin the ordinary LRU at its newest end, in protection order (a chain's tail
++    /// first), so they go after the blocks already waiting there.
+     fn lru_victim(&mut self) -> Option<BlockCopyId> {
+         let Some(retain) = self.retain.as_deref_mut() else {
+             return self.inactive_head;
+         };
+-        if let Some((&(until_bits, _), &expired)) = retain.by_expiry.first_key_value()
+-            && f64::from_bits(until_bits) <= retain.now_ms
+-        {
+-            retain.expired += 1;
+-            return Some(expired);
++        let now_ms = retain.now_ms;
++        let mut expired = Vec::new();
++        for (&(until_bits, _), &id) in &retain.by_expiry {
++            if f64::from_bits(until_bits) > now_ms {
++                break;
++            }
++            expired.push(id);
++        }
++        retain.expired += expired.len() as u64;
++        for id in expired {
++            self.unlink_inactive(id);
++            self.link_inactive_tail(id, false);
+         }
+         if self.inactive_head.is_some() {
+             return self.inactive_head;
+         }
++        let retain = self.retain.as_deref_mut().unwrap();
+         if retain.head.is_some() {
+             retain.broken += 1;
+         }
+@@ -1450,6 +1476,15 @@ impl VllmBlockPool {
+     }
+ 
+     fn insert_inactive(&mut self, id: BlockCopyId) {
++        // A copy a protection named while it was in use is protected now, if that has not run out.
++        if let Some(retain) = self.retain.as_deref_mut()
++            && let Some(until_ms) = retain.pending.remove(&id)
++            && until_ms > retain.now_ms
++        {
++            retain.set_expiry(id, until_ms);
++            self.link_inactive_tail(id, true);
++            return;
++        }
+         self.link_inactive_tail(id, false);
+     }
+ 
+@@ -1906,7 +1941,7 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn retained_copies_are_evicted_after_ordinary_ones_and_expired_first() {
++    fn retained_copies_are_evicted_after_ordinary_ones_and_expired_ones_rejoin_the_lru() {
+         let mut pool = VllmBlockPool::new(4);
+         let kept = cache_copy(&mut pool, 1);
+         pool.release(kept);
+@@ -1921,10 +1956,47 @@ mod tests {
+         assert_eq!(pool.protect(&[expired], 5.0, 0.0), 1);
+         pool.assert_lru_consistent();
+         pool.set_now_ms(10.0);
+-        // Expired protection first, then the ordinary LRU, the live one last.
++        // The ordinary LRU, then the expired copy (back at the LRU's newest end), the live one last.
+         let pressure = reserve(&mut pool, &[], 4);
+-        assert_eq!(pressure.removed, vec![2, 3, 4, 1]);
++        assert_eq!(pressure.removed, vec![3, 4, 2, 1]);
+         assert_eq!(pool.take_retain_broken(), 1);
++        assert_eq!(pool.take_retain_expired(), 1);
++        pool.cancel(pressure.reservation);
++        pool.assert_lru_consistent();
++    }
++
++    #[test]
++    fn an_expired_ancestor_is_not_evicted_before_a_descendant_waiting_in_the_lru() {
++        // 1 is a protected ancestor (until t=5); 2 extends it and is released later, unprotected.
++        // When 1's protection runs out it must not leave before 2 (evicted ahead of the LRU, it
++        // cut the chain in the router's indexer and 2's later removal failed).
++        let mut pool = VllmBlockPool::new(2);
++        let ancestor = cache_copy(&mut pool, 1);
++        pool.release(ancestor);
++        assert_eq!(pool.protect(&[ancestor], 5.0, 0.0), 1);
++        let descendant = cache_copy(&mut pool, 2);
++        pool.release(descendant);
++        pool.set_now_ms(10.0);
++        let pressure = reserve(&mut pool, &[], 1);
++        assert_eq!(pressure.removed, vec![2]);
++        pool.cancel(pressure.reservation);
++        pool.assert_lru_consistent();
++    }
++
++    #[test]
++    fn a_protected_copy_still_in_use_is_protected_when_released() {
++        // 1 is a shared prefix another request still holds when its owner's protection is applied;
++        // released later, it is protected, so the ordinary block 2 goes first.
++        let mut pool = VllmBlockPool::new(2);
++        let shared = cache_copy(&mut pool, 1);
++        assert_eq!(pool.protect(&[shared], 100.0, 0.0), 0);
++        let other = cache_copy(&mut pool, 2);
++        pool.release(other);
++        pool.release(shared);
++        pool.assert_lru_consistent();
++        let pressure = reserve(&mut pool, &[], 1);
++        assert_eq!(pressure.removed, vec![2]);
++        assert_eq!(pool.take_retain_broken(), 0);
+         pool.cancel(pressure.reservation);
+         pool.assert_lru_consistent();
+     }

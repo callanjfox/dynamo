@@ -1,0 +1,325 @@
+From 381d05593367b9b718d955e6cb5266b792e407c0 Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Fri, 13 Nov 2026 09:23:19 +1000
+Subject: [PATCH 24/38] kvcr.keep_source_recency (off by default): a pull pins
+ the source's G2 blocks in place and leaves their recency alone, as vLLM's
+ KVCR source read does (prepare_read, record_access=False; LRUCachePolicy
+ keeps a pinned chunk's rank); plan_reserve skips pinned blocks still linked;
+ unit test. Probe: per-tier store, landing and eviction counts and occupancy
+ in the G2 snapshot, one line per forward pass
+
+---
+ crates/core/src/engine/config.rs              |  7 ++
+ crates/core/src/engine/host_offload/tier.rs   | 95 ++++++++++++++++++-
+ crates/core/src/engine/kvcr.rs                |  5 +
+ crates/core/src/engine/scheduler/vllm/core.rs | 16 ++++
+ .../src/engine/scheduler/vllm/host_offload.rs |  5 +
+ crates/core/src/engine/scheduler/vllm/kvcr.rs | 35 +++++--
+ 6 files changed, 155 insertions(+), 8 deletions(-)
+
+diff --git a/crates/core/src/engine/config.rs b/crates/core/src/engine/config.rs
+index df37cd39f..60877aa74 100644
+--- a/crates/core/src/engine/config.rs
++++ b/crates/core/src/engine/config.rs
+@@ -423,6 +423,12 @@ pub struct KvcrConfig {
+     /// Off by default (peer G2 only).
+     #[serde(skip_serializing_if = "std::ops::Not::not")]
+     pub peer_hbm: bool,
++    /// A pull pins the source's G2 blocks without changing their recency, as vLLM's KVCR source
++    /// does (`vllm/v1/kv_offload/tiering/manager.py` `prepare_read`, `record_access=False`; its
++    /// `LRUCachePolicy` keeps a pinned chunk's rank). Off by default: the pinned blocks leave the
++    /// LRU and re-enter it as the newest, in key order, when the pull unpins them.
++    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
++    pub keep_source_recency: bool,
+ }
+ 
+ impl KvcrConfig {
+@@ -443,6 +449,7 @@ impl Default for KvcrConfig {
+             latency_to_first_byte_ms: 1.0,
+             bandwidth_gbps: 50.0,
+             peer_hbm: false,
++            keep_source_recency: false,
+         }
+     }
+ }
+diff --git a/crates/core/src/engine/host_offload/tier.rs b/crates/core/src/engine/host_offload/tier.rs
+index 1ba47e21a..6d4b006ea 100644
+--- a/crates/core/src/engine/host_offload/tier.rs
++++ b/crates/core/src/engine/host_offload/tier.rs
+@@ -297,6 +297,9 @@ pub(crate) struct HostTier {
+     /// The session each stored block belongs to (retention by value only).
+     owner_of: FxHashMap<HostBlockKey, u64>,
+     by_owner: FxHashMap<u64, FxHashSet<HostBlockKey>>,
++    /// KVCR probe counters: blocks admitted by a native store, admitted externally (KVCR
++    /// landings, G3 promotions), and evicted for capacity.
++    pub(crate) probe_counts: [u64; 3],
+     /// When this tier last evicted for capacity (retain-short).
+     last_evict_ms: f64,
+ }
+@@ -329,6 +332,7 @@ impl HostTier {
+         };
+         Ok(Self {
+             config,
++            probe_counts: [0; 3],
+             entries: FxHashMap::default(),
+             lru: Lru::default(),
+             transfers: FxHashMap::default(),
+@@ -671,6 +675,8 @@ impl HostTier {
+         if !victims.is_empty() {
+             self.last_evict_ms = now_ms;
+         }
++        self.probe_counts[usize::from(kind != Kind::Store)] += missing.len() as u64;
++        self.probe_counts[2] += victims.len() as u64;
+         if self.retain.is_some() {
+             for victim in victims {
+                 self.forget_owner(*victim);
+@@ -804,7 +810,11 @@ impl HostTier {
+             let Some((node, victim)) = self
+                 .lru
+                 .oldest_after(plan.cursor)
+-                .find(|(_, key)| !plan.protected.contains(key))
++                // A KVCR source pin that keeps recency leaves its block linked.
++                .find(|(_, key)| {
++                    !plan.protected.contains(key)
++                        && self.entries.get(key).is_some_and(|entry| entry.load_pins == 0)
++                })
+             else {
+                 return false;
+             };
+@@ -1006,6 +1016,39 @@ impl HostTier {
+         self.release_load_pins(keys);
+     }
+ 
++    /// [`Self::pin_external`] for a KVCR source read that keeps recency (`kvcr.keep_source_recency`):
++    /// the blocks stay at their place in the LRU; victim selection skips them while pinned.
++    pub(crate) fn pin_external_keep_recency(&mut self, keys: &[HostBlockKey]) {
++        for key in keys {
++            let entry = self
++                .entries
++                .get_mut(key)
++                .expect("pin requires a resident G2 entry");
++            debug_assert_eq!(entry.state, EntryState::Resident);
++            entry.load_pins = entry
++                .load_pins
++                .checked_add(1)
++                .expect("host pin count overflow");
++        }
++    }
++
++    /// Release [`Self::pin_external_keep_recency`]. A block another load took out of the LRU
++    /// meanwhile re-enters it as the newest once its last pin goes, as that load's release would.
++    pub(crate) fn unpin_external_keep_recency(&mut self, keys: &[HostBlockKey]) {
++        for key in keys {
++            let Some(entry) = self.entries.get_mut(key) else {
++                continue;
++            };
++            entry.load_pins = entry
++                .load_pins
++                .checked_sub(1)
++                .expect("host pin count underflow");
++            if entry.load_pins == 0 && entry.state == EntryState::Resident && entry.lru_slot.is_none() {
++                self.lru.touch(&mut entry.lru_slot, *key);
++            }
++        }
++    }
++
+     /// Submit stores prepared by `client` during the preceding engine step.
+     pub(crate) fn submit_prepared_stores(&mut self, client: u64, now_ms: f64) -> usize {
+         // Private lanes keep the caller's boundary time as their start bound.
+@@ -1437,6 +1480,21 @@ impl HostTier {
+                 .any(|transfer| transfer.client == client)
+     }
+ 
++    /// The KVCR probe's occupancy split: blocks pending a store or landing, resident but pinned
++    /// (loads, pulls), and resident and evictable.
++    pub(crate) fn probe_occupancy(&self) -> [usize; 3] {
++        let mut out = [0; 3];
++        for entry in self.entries.values() {
++            let i = match entry.state {
++                EntryState::Resident if entry.load_pins == 0 && entry.lru_slot.is_some() => 2,
++                EntryState::Resident => 1,
++                _ => 0,
++            };
++            out[i] += 1;
++        }
++        out
++    }
++
+     /// Sequence hashes of the resident blocks (the KVCR probe's G2 snapshot).
+     pub(crate) fn resident_hashes(&self) -> Vec<u64> {
+         self.entries
+@@ -1890,6 +1948,41 @@ pub(crate) mod tests {
+         assert_eq!(tier.lru.order(), [c, a]);
+     }
+ 
++    #[test]
++    fn source_pin_that_keeps_recency_survives_eviction_and_keeps_its_place() {
++        // `kvcr.keep_source_recency`: as vLLM's KVCR source read, the pin neither evicts the block
++        // nor moves it; it stays the least recently used once unpinned.
++        let mut tier = private(2, 0.0, 0.0);
++        let owner = Uuid::from_u128(1);
++        let (a, b, c, d) = (key(1), key(2), key(3), key(4));
++        for (k, t) in [(a, 0.0), (b, 1.0)] {
++            let StoreOutcome::Prepared { transfer_id, .. } =
++                tier.reserve_external(0, owner, &[k], None, t)
++            else {
++                panic!()
++            };
++            tier.complete_external(transfer_id);
++        }
++        tier.pin_external_keep_recency(&[a]);
++        assert_eq!(tier.lru.order(), [a, b]);
++        // `a` is LRU but pinned, so `c` evicts `b`, through a store and through a planned reservation.
++        let StoreOutcome::Prepared { transfer_id, .. } =
++            tier.reserve_external(0, owner, &[c], None, 2.0)
++        else {
++            panic!()
++        };
++        tier.complete_external(transfer_id);
++        assert!(matches!(tier.lookup(a), Lookup::Hit));
++        assert!(matches!(tier.lookup(b), Lookup::Miss));
++        let mut plan = tier.plan_external(&[d], 3.0);
++        assert!(tier.plan_reserve(&mut plan, d));
++        assert_eq!(plan.victims, [c]);
++        tier.unpin_external_keep_recency(&[a]);
++        assert_eq!(tier.pins(a), 0);
++        // Unpinned, `a` is where it was: the oldest.
++        assert_eq!(tier.lru.order(), [a, c]);
++    }
++
+     #[test]
+     fn retention_by_value_evicts_the_least_valuable_session_first() {
+         use crate::engine::KvRetainValue;
+diff --git a/crates/core/src/engine/kvcr.rs b/crates/core/src/engine/kvcr.rs
+index 066cdcc66..5740cb299 100644
+--- a/crates/core/src/engine/kvcr.rs
++++ b/crates/core/src/engine/kvcr.rs
+@@ -426,6 +426,11 @@ impl KvcrRegistry {
+         self.stats.peer_hbm_blocks += blocks as u64;
+     }
+ 
++    /// `kvcr.keep_source_recency`: pulls pin the source without changing its recency.
++    pub(crate) fn keep_source_recency(&self) -> bool {
++        self.config.keep_source_recency
++    }
++
+     /// Every registered rank's G2 but `except`, for the KVCR probe.
+     pub(crate) fn peer_tiers(&self, except: KvHintSource) -> Vec<(KvHintSource, HostTierHandle)> {
+         self.ranks
+diff --git a/crates/core/src/engine/scheduler/vllm/core.rs b/crates/core/src/engine/scheduler/vllm/core.rs
+index e3a87a008..ee3f91ec3 100644
+--- a/crates/core/src/engine/scheduler/vllm/core.rs
++++ b/crates/core/src/engine/scheduler/vllm/core.rs
+@@ -2524,6 +2524,22 @@ impl VllmCore {
+             });
+         }
+         let end_ms = forward_time.end_ms(compute_start_ms);
++        if crate::engine::kvcr::probe::enabled() {
++            // KVCR probe: one line per pass that computed something (start, compute start after any
++            // G2 fence, end; prefill requests, new and prefix tokens; decode requests).
++            let decodes = scheduled.values().filter(|work| work.prompt_tokens == 0).count();
++            let (pb, pn, pp) = prefill.map_or((0, 0, 0), |p| (p.batch_size, p.new_tokens, p.prefix_tokens));
++            if pb + decodes > 0 {
++                let worker = self
++                    .native_host_offload
++                    .as_ref()
++                    .and_then(|adapter| adapter.kvcr_worker())
++                    .map_or_else(|| "null".to_string(), |w| w.to_string());
++                crate::engine::kvcr::probe::write(&format!(
++                    r#"{{"ev":"pass","w":{worker},"t":{now_ms:.3},"start":{compute_start_ms:.3},"end":{end_ms:.3},"pb":{pb},"pn":{pn},"pp":{pp},"dec":{decodes}}}"#
++                ));
++            }
++        }
+         if (!scheduled.is_empty() || !output_signals.is_empty())
+             && let Some(adapter) = self.native_host_offload.as_mut()
+         {
+diff --git a/crates/core/src/engine/scheduler/vllm/host_offload.rs b/crates/core/src/engine/scheduler/vllm/host_offload.rs
+index e676eaa32..33f5b7424 100644
+--- a/crates/core/src/engine/scheduler/vllm/host_offload.rs
++++ b/crates/core/src/engine/scheduler/vllm/host_offload.rs
+@@ -268,6 +268,11 @@ impl VllmHostOffloadAdapter {
+         }
+     }
+ 
++    /// The worker this rank's KVCR adapter belongs to (the KVCR probe's pass lines).
++    pub(super) fn kvcr_worker(&self) -> Option<u64> {
++        self.kvcr.as_ref().map(|kvcr| kvcr.rank().worker_id)
++    }
++
+     /// Changes whenever G3 or KVCR stages, lands or loads; drives
+     /// same-timestamp retries. `None` without G3 until this rank's first KVCR
+     /// pull, so an idle KVCR schedules exactly like G2 alone.
+diff --git a/crates/core/src/engine/scheduler/vllm/kvcr.rs b/crates/core/src/engine/scheduler/vllm/kvcr.rs
+index ad69b0d01..473e86cda 100644
+--- a/crates/core/src/engine/scheduler/vllm/kvcr.rs
++++ b/crates/core/src/engine/scheduler/vllm/kvcr.rs
+@@ -98,8 +98,11 @@ impl VllmKvcrAdapter {
+             );
+             let mut held: FxHashMap<u64, u32> = FxHashMap::default();
+             let mut per_rank = vec![(self.rank.worker_id, own.resident_hashes())];
++            let mut counts = vec![(own.probe_counts, own.probe_occupancy())];
+             for (rank, g2) in &peers {
+-                per_rank.push((rank.worker_id, g2.lock().resident_hashes()));
++                let tier = g2.lock();
++                per_rank.push((rank.worker_id, tier.resident_hashes()));
++                counts.push((tier.probe_counts, tier.probe_occupancy()));
+             }
+             for (_, hashes) in &per_rank {
+                 for hash in hashes {
+@@ -107,12 +110,21 @@ impl VllmKvcrAdapter {
+                 }
+             }
+             let sizes: Vec<String> = per_rank.iter().map(|(w, h)| format!("[{w},{}]", h.len())).collect();
++            // Summed over ranks: cumulative blocks stored, landed externally and evicted, and
++            // now pending, pinned and evictable.
++            let sum = |f: &dyn Fn(&([u64; 3], [usize; 3])) -> u64| counts.iter().map(f).sum::<u64>();
+             crate::engine::kvcr::probe::write(&format!(
+-                r#"{{"ev":"g2snap","t":{now:.3},"capacity":{},"per_rank":[{}],"unique":{},"multi":{}}}"#,
++                r#"{{"ev":"g2snap","t":{now:.3},"capacity":{},"per_rank":[{}],"unique":{},"multi":{},"stored":{},"landed":{},"evicted":{},"pending":{},"pinned":{},"evictable":{}}}"#,
+                 own.capacity_blocks(),
+                 sizes.join(","),
+                 held.len(),
+                 held.values().filter(|n| **n >= 2).count(),
++                sum(&|c| c.0[0]),
++                sum(&|c| c.0[1]),
++                sum(&|c| c.0[2]),
++                sum(&|c| c.1[0] as u64),
++                sum(&|c| c.1[1] as u64),
++                sum(&|c| c.1[2] as u64),
+             ));
+         }
+         let (mut best, mut best_worker, mut named) = (0usize, None, None);
+@@ -244,7 +256,11 @@ impl VllmKvcrAdapter {
+             .copied()
+             .filter(|key| !from_g1.contains(key))
+             .collect();
+-        src.pin_external(&pinned);
++        if registry.keep_source_recency() {
++            src.pin_external_keep_recency(&pinned);
++        } else {
++            src.pin_external(&pinned);
++        }
+         drop(src);
+         let id = registry.submit(self.rank, source, pulled.len(), partial, now);
+         registry.note_pulled(owner, &pulled);
+@@ -303,11 +319,16 @@ impl VllmKvcrAdapter {
+                 }
+             }
+             tier.complete_external_from_kvcr(stage.reservation);
+-            registry
++            let keep = registry.keep_source_recency();
++            let source = registry
+                 .source(stage.source)
+-                .expect("a pull's source stays registered until it lands")
+-                .lock()
+-                .unpin_external(&stage.keys);
++                .expect("a pull's source stays registered until it lands");
++            let mut source = source.lock();
++            if keep {
++                source.unpin_external_keep_recency(&stage.keys);
++            } else {
++                source.unpin_external(&stage.keys);
++            }
+         }
+         self.epoch += 1;
+         true

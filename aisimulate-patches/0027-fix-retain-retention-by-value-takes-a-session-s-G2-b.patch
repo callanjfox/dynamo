@@ -1,0 +1,112 @@
+From c88eb6fbf4224d1a19dd23fa121c93a31357e3d9 Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Fri, 13 Nov 2026 14:04:09 +1000
+Subject: [PATCH 27/38] fix(retain): retention by value takes a session's G2
+ blocks from the tail of its chain (the last stored first); in hash order a
+ few victims cut the session's prefix at a random early block and lost
+ everything after it, so retention by value cost hit rate; unit test
+
+---
+ crates/core/src/engine/host_offload/tier.rs | 54 ++++++++++++++++++++-
+ 1 file changed, 53 insertions(+), 1 deletion(-)
+
+diff --git a/crates/core/src/engine/host_offload/tier.rs b/crates/core/src/engine/host_offload/tier.rs
+index 505de793d..570eacbc6 100644
+--- a/crates/core/src/engine/host_offload/tier.rs
++++ b/crates/core/src/engine/host_offload/tier.rs
+@@ -299,6 +299,10 @@ pub(crate) struct HostTier {
+     /// The session each stored block belongs to (retention by value only).
+     owner_of: FxHashMap<HostBlockKey, u64>,
+     by_owner: FxHashMap<u64, FxHashSet<HostBlockKey>>,
++    /// The order blocks took an owner in (a store's blocks in prompt order), so value eviction can take
++    /// a session's blocks from the tail of its chain.
++    owned_seq: FxHashMap<HostBlockKey, u64>,
++    next_owned_seq: u64,
+     /// KVCR probe counters: blocks admitted by a native store, admitted externally (KVCR
+     /// landings, G3 promotions), and evicted for capacity.
+     pub(crate) probe_counts: [u64; 3],
+@@ -352,6 +356,8 @@ impl HostTier {
+             value_evicted_by_value: 0,
+             owner_of: FxHashMap::default(),
+             by_owner: FxHashMap::default(),
++            owned_seq: FxHashMap::default(),
++            next_owned_seq: 0,
+             last_evict_ms: f64::NEG_INFINITY,
+         })
+     }
+@@ -374,6 +380,7 @@ impl HostTier {
+     }
+ 
+     fn forget_owner(&mut self, key: HostBlockKey) {
++        self.owned_seq.remove(&key);
+         if let Some(owner) = self.owner_of.remove(&key)
+             && let Some(keys) = self.by_owner.get_mut(&owner)
+         {
+@@ -440,7 +447,12 @@ impl HostTier {
+                 .collect();
+             owners.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+             'owners: for (_, owner) in owners {
+-                for &key in &self.by_owner[&owner] {
++                // A session's blocks from the tail of its chain: the last stored first. In hash
++                // order a few victims cut the session's prefix at a random early block and lost
++                // everything after it (retention by value cost hit rate instead of keeping it).
++                let mut keys: Vec<HostBlockKey> = self.by_owner[&owner].iter().copied().collect();
++                keys.sort_by_key(|key| std::cmp::Reverse(self.owned_seq.get(key).copied().unwrap_or(0)));
++                for key in keys {
+                     if !chosen.contains(&key) && eligible(self, key) {
+                         victims.push(key);
+                         if victims.len() == needed {
+@@ -695,6 +707,8 @@ impl HostTier {
+                     self.forget_owner(*key);
+                     self.owner_of.insert(*key, session);
+                     self.by_owner.entry(session).or_default().insert(*key);
++                    self.owned_seq.insert(*key, self.next_owned_seq);
++                    self.next_owned_seq += 1;
+                 }
+             }
+         }
+@@ -2055,6 +2069,44 @@ pub(crate) mod tests {
+         assert!(matches!(tier.lookup(key(1)), Lookup::Miss));
+     }
+ 
++    #[test]
++    fn retention_by_value_takes_a_session_from_the_tail_of_its_chain() {
++        use crate::engine::KvRetainValue;
++        let state = crate::engine::kv_retain::RetainState::shared();
++        let mut tier = private(4, 0.0, 0.0);
++        tier.set_retain(state.clone());
++        let (cheap, keep) = (Uuid::from_u128(1), Uuid::from_u128(2));
++        let value = |session, weight_milli| KvRetainValue {
++            session,
++            weight_milli,
++            think_ms: Some(1_000),
++            session_final: false,
++            short_window_ms: None,
++        };
++        state.lock().unwrap().note_request(cheap, value(10, 300));
++        state.lock().unwrap().note_request(keep, value(20, 10_000));
++        // One prefix chain, stored head to tail; its keys out of hash order.
++        let chain = [key(900), key(5), key(700), key(1)];
++        let StoreOutcome::Prepared { transfer_id, .. } =
++            tier.reserve_external(0, cheap, &chain, None, 0.0)
++        else {
++            panic!()
++        };
++        tier.complete_external(transfer_id);
++        // A more valuable session needs two blocks: the cheap session gives up its last two.
++        let StoreOutcome::Prepared { transfer_id, .. } =
++            tier.reserve_external(0, keep, &[key(50), key(51)], None, 1.0)
++        else {
++            panic!()
++        };
++        tier.complete_external(transfer_id);
++        let held: Vec<bool> = chain
++            .iter()
++            .map(|k| matches!(tier.lookup(*k), Lookup::Hit))
++            .collect();
++        assert_eq!(held, [true, true, false, false], "the chain's head stays");
++    }
++
+     #[test]
+     fn release_source_drops_only_resident_unpinned_blocks() {
+         let mut tier = private(4, 0.0, 0.0);

@@ -1,0 +1,401 @@
+From 4ec85ff188cde6424b508e79650b45967e88bdfb Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Sat, 14 Nov 2026 22:15:31 +1000
+Subject: [PATCH 31/38] feat(retain): KvRetainCost (with
+ kv_actions.retain_value.value: rebuild_cost): a session's value per block is
+ the cost of losing its blocks over their number (class weight times min(1,
+ rebuild time over the TTFT target) plus stall weight times the rebuild time,
+ discounted by H / (H + wait)), so a long session is no longer the cheapest
+ per block; with peers, a session another G2 tier also holds costs a KVCR
+ fetch (RetainState tracks each session's holding tiers); without a cost model
+ the value is unchanged; probe AISIM_VALUE_PROBE (one line per value-ranked
+ eviction: sessions taken and the five cheapest kept, with value, blocks,
+ weight, expected return); unit tests
+
+---
+ crates/core/src/engine/host_offload/tier.rs |  51 ++++++-
+ crates/core/src/engine/kv_retain.rs         | 159 ++++++++++++++++++++
+ crates/core/src/engine/mod.rs               |   2 +-
+ crates/core/src/replay/core/mod.rs          |   2 +-
+ crates/core/src/replay/mod.rs               |   2 +-
+ 5 files changed, 210 insertions(+), 6 deletions(-)
+
+diff --git a/crates/core/src/engine/host_offload/tier.rs b/crates/core/src/engine/host_offload/tier.rs
+index 570eacbc6..1bc37466e 100644
+--- a/crates/core/src/engine/host_offload/tier.rs
++++ b/crates/core/src/engine/host_offload/tier.rs
+@@ -308,8 +308,14 @@ pub(crate) struct HostTier {
+     pub(crate) probe_counts: [u64; 3],
+     /// When this tier last evicted for capacity (retain-short).
+     last_evict_ms: f64,
++    /// This tier's id in the retention state's session holders (the peer term of
++    /// `kv_actions.retain_value.peers`).
++    holder_id: u64,
+ }
+ 
++/// Ids for [`HostTier::holder_id`].
++static NEXT_HOLDER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
++
+ impl HostTier {
+     pub(crate) fn new(config: HostTierConfig) -> Result<Self> {
+         ensure!(config.capacity_blocks > 0, "host capacity must be positive");
+@@ -359,6 +365,7 @@ impl HostTier {
+             owned_seq: FxHashMap::default(),
+             next_owned_seq: 0,
+             last_evict_ms: f64::NEG_INFINITY,
++            holder_id: NEXT_HOLDER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+         })
+     }
+ 
+@@ -387,6 +394,9 @@ impl HostTier {
+             keys.remove(&key);
+             if keys.is_empty() {
+                 self.by_owner.remove(&owner);
++                if let Some(retain) = &self.retain {
++                    retain.lock().unwrap().note_holder(owner, self.holder_id, false);
++                }
+             }
+         }
+     }
+@@ -443,10 +453,16 @@ impl HostTier {
+             let mut owners: Vec<(f64, u64)> = self
+                 .by_owner
+                 .iter()
+-                .map(|(owner, keys)| (state.value(*owner, now_ms) / keys.len() as f64, *owner))
++                .map(|(owner, keys)| (state.per_block(*owner, keys.len(), self.holder_id, now_ms), *owner))
+                 .collect();
+             owners.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+-            'owners: for (_, owner) in owners {
++            // Probe (AISIM_VALUE_PROBE set): one line per value-ranked eviction: the sessions it
++            // takes blocks from and the five cheapest it keeps, each as [session key, value per
++            // block, blocks held, weight, expected return in ms (-1 in flight, -2 no hint), ended].
++            let probe = std::env::var_os("AISIM_VALUE_PROBE").is_some();
++            let mut used = 0usize;
++            'owners: for (_, owner) in owners.iter().copied() {
++                used += 1;
+                 // A session's blocks from the tail of its chain: the last stored first. In hash
+                 // order a few victims cut the session's prefix at a random early block and lost
+                 // everything after it (retention by value cost hit rate instead of keeping it).
+@@ -461,6 +477,27 @@ impl HostTier {
+                     }
+                 }
+             }
++            if probe {
++                let row = |(per_block, owner): (f64, u64)| {
++                    let blocks = self.by_owner.get(&owner).map_or(0, |keys| keys.len());
++                    let (weight, ret, ended) = state.describe(owner).unwrap_or((0.0, None, false));
++                    let ret = match ret {
++                        None => -1.0,
++                        Some(at) if at.is_infinite() => -2.0,
++                        Some(at) => at,
++                    };
++                    format!("[{owner},{per_block:.6e},{blocks},{weight},{ret:.0},{}]", u8::from(ended))
++                };
++                let taken: Vec<String> = owners[..used].iter().copied().map(row).collect();
++                let kept: Vec<String> =
++                    owners[used..(used + 5).min(owners.len())].iter().copied().map(row).collect();
++                eprintln!(
++                    "value_probe {{\"t\":{now_ms:.0},\"needed\":{needed},\"owners\":{},\"taken\":[{}],\"kept\":[{}]}}",
++                    owners.len(),
++                    taken.join(","),
++                    kept.join(",")
++                );
++            }
+         }
+         drop(state);
+         self.value_evicted_dup += duplicates;
+@@ -706,7 +743,13 @@ impl HostTier {
+                 for key in &missing {
+                     self.forget_owner(*key);
+                     self.owner_of.insert(*key, session);
+-                    self.by_owner.entry(session).or_default().insert(*key);
++                    let keys = self.by_owner.entry(session).or_default();
++                    if keys.is_empty()
++                        && let Some(retain) = &self.retain
++                    {
++                        retain.lock().unwrap().note_holder(session, self.holder_id, true);
++                    }
++                    keys.insert(*key);
+                     self.owned_seq.insert(*key, self.next_owned_seq);
+                     self.next_owned_seq += 1;
+                 }
+@@ -2037,6 +2080,7 @@ pub(crate) mod tests {
+             think_ms: Some(1_000),
+             session_final: false,
+             short_window_ms: None,
++            cost: None,
+         };
+         state.lock().unwrap().note_request(keep, value(10, 10_000));
+         state.lock().unwrap().note_request(cheap, value(20, 300));
+@@ -2082,6 +2126,7 @@ pub(crate) mod tests {
+             think_ms: Some(1_000),
+             session_final: false,
+             short_window_ms: None,
++            cost: None,
+         };
+         state.lock().unwrap().note_request(cheap, value(10, 300));
+         state.lock().unwrap().note_request(keep, value(20, 10_000));
+diff --git a/crates/core/src/engine/kv_retain.rs b/crates/core/src/engine/kv_retain.rs
+index a04555134..8e6c87400 100644
+--- a/crates/core/src/engine/kv_retain.rs
++++ b/crates/core/src/engine/kv_retain.rs
+@@ -33,6 +33,26 @@ pub struct KvRetainValue {
+     /// Retain by value only while this rank's G2 evicted within this window
+     /// (retain-short); `None` always.
+     pub short_window_ms: Option<u64>,
++    /// How losing the session's blocks is costed; `None` (the default) values a
++    /// session at its weight alone, the same however many blocks it holds.
++    pub cost: Option<KvRetainCost>,
++}
++
++/// Retention value as the cost of losing the blocks (`kv_actions.retain_value.value:
++/// rebuild_cost`), as `web/sim.js` `dramLoss` / `lossCost`: rebuilding `n` blocks takes `n`
++/// times `rebuild_us_per_block`, or, with `peers`, a KVCR fetch when another rank's G2 also
++/// holds the session (`fetch_latency_ms` plus `n` times `fetch_ns_per_block`); the loss is the
++/// class weight times min(1, that time over the class's TTFT target), plus, for a rebuild, the
++/// stall weight times the time, discounted by `H / (H + wait)`. Per block it is the loss over
++/// `n`, so a long session is no longer the cheapest to evict.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct KvRetainCost {
++    pub rebuild_us_per_block: u32,
++    pub ttft_target_ms: u32,
++    pub stall_milli: u32,
++    pub peers: bool,
++    pub fetch_latency_ms: u32,
++    pub fetch_ns_per_block: u32,
+ }
+ 
+ 
+@@ -51,6 +71,7 @@ struct SessionValue {
+     /// When the next turn is expected; `None` while a turn is in flight.
+     return_at_ms: Option<f64>,
+     ended: bool,
++    cost: Option<KvRetainCost>,
+ }
+ 
+ #[derive(Debug)]
+@@ -60,6 +81,10 @@ pub(crate) struct RetainState {
+     requests: FxHashMap<Uuid, KvRetainValue>,
+     sessions: FxHashMap<u64, SessionValue>,
+     short_window_ms: Option<u64>,
++    /// The G2 tiers (ids) holding blocks of each session, for the peer term of
++    /// `KvRetainCost`; kept only once a request carries a cost with `peers`.
++    holders: FxHashMap<u64, rustc_hash::FxHashSet<u64>>,
++    track_holders: bool,
+ }
+ 
+ impl Default for RetainState {
+@@ -69,6 +94,8 @@ impl Default for RetainState {
+             requests: FxHashMap::default(),
+             sessions: FxHashMap::default(),
+             short_window_ms: None,
++            holders: FxHashMap::default(),
++            track_holders: false,
+         }
+     }
+ }
+@@ -81,16 +108,82 @@ impl RetainState {
+     /// Path A: a booked request's value. Its session has a turn in flight.
+     pub(crate) fn note_request(&mut self, request: Uuid, value: KvRetainValue) {
+         self.short_window_ms = value.short_window_ms;
++        self.track_holders |= value.cost.is_some_and(|cost| cost.peers);
+         self.requests.insert(request, value);
+         let weight = f64::from(value.weight_milli) / 1000.0;
+         let session = self.sessions.entry(value.session).or_insert(SessionValue {
+             weight,
+             return_at_ms: None,
+             ended: false,
++            cost: value.cost,
+         });
+         session.weight = weight;
+         session.return_at_ms = None;
+         session.ended = false;
++        session.cost = value.cost;
++    }
++
++    /// A G2 tier (`tier`) now holds (`held`) or no longer holds blocks of `session`.
++    pub(crate) fn note_holder(&mut self, session: u64, tier: u64, held: bool) {
++        if !self.track_holders && held {
++            return;
++        }
++        if held {
++            self.holders.entry(session).or_default().insert(tier);
++        } else if let Some(tiers) = self.holders.get_mut(&session) {
++            tiers.remove(&tier);
++            if tiers.is_empty() {
++                self.holders.remove(&session);
++            }
++        }
++    }
++
++    /// Whether a G2 tier other than `tier` holds blocks of `session`.
++    pub(crate) fn held_elsewhere(&self, session: u64, tier: u64) -> bool {
++        self.holders
++            .get(&session)
++            .is_some_and(|tiers| tiers.iter().any(|other| *other != tier))
++    }
++
++    /// Value per block of `session`'s `blocks` blocks on tier `tier`: without a cost, its
++    /// value over its blocks; with one, the cost of losing them over their number.
++    pub(crate) fn per_block(&self, session: u64, blocks: usize, tier: u64, now_ms: f64) -> f64 {
++        let n = blocks.max(1) as f64;
++        let Some(s) = self.sessions.get(&session) else {
++            return 0.0;
++        };
++        let Some(cost) = s.cost else {
++            return self.value(session, now_ms) / n;
++        };
++        let discount = self.discount(session, now_ms);
++        if discount == 0.0 {
++            return 0.0;
++        }
++        let ttft_s = f64::from(cost.ttft_target_ms.max(1)) / 1000.0;
++        let (secs, rebuild) = if cost.peers && self.held_elsewhere(session, tier) {
++            (
++                f64::from(cost.fetch_latency_ms) / 1000.0 + n * f64::from(cost.fetch_ns_per_block) / 1e9,
++                false,
++            )
++        } else {
++            (n * f64::from(cost.rebuild_us_per_block) / 1e6, true)
++        };
++        let stall = if rebuild { secs * f64::from(cost.stall_milli) / 1000.0 } else { 0.0 };
++        (s.weight * (secs / ttft_s).min(1.0) + stall) * discount / n
++    }
++
++    /// `H / (H + wait)` for an idle session, 1 with a turn in flight, 0 once ended or with no
++    /// expected return.
++    fn discount(&self, session: u64, now_ms: f64) -> f64 {
++        match self.sessions.get(&session) {
++            None => 0.0,
++            Some(s) if s.ended => 0.0,
++            Some(s) => match s.return_at_ms {
++                None => 1.0,
++                Some(at) if at.is_infinite() => 0.0,
++                Some(at) => HORIZON_MS / (HORIZON_MS + (at - now_ms).max(0.0)),
++            },
++        }
+     }
+ 
+     /// A request finished at `now_ms`: its session is idle until its next turn,
+@@ -132,6 +225,14 @@ impl RetainState {
+         self.requests.get(&request).map(|value| value.session)
+     }
+ 
++    /// For the retention probe: (weight, expected return in ms, ended); the return is `None`
++    /// while a turn is in flight and infinite when the client gave no think time.
++    pub(crate) fn describe(&self, session: u64) -> Option<(f64, Option<f64>, bool)> {
++        self.sessions
++            .get(&session)
++            .map(|s| (s.weight, s.return_at_ms, s.ended))
++    }
++
+     /// What losing all of `session`'s KV costs now, in weighted misses.
+     pub(crate) fn value(&self, session: u64, now_ms: f64) -> f64 {
+         let Some(session) = self.sessions.get(&session) else {
+@@ -159,9 +260,67 @@ mod tests {
+             think_ms,
+             session_final,
+             short_window_ms: None,
++            cost: None,
++        }
++    }
++
++    fn costed(session: u64, peers: bool) -> KvRetainValue {
++        KvRetainValue {
++            cost: Some(KvRetainCost {
++                rebuild_us_per_block: 3_000,
++                ttft_target_ms: 3_000,
++                stall_milli: 500,
++                peers,
++                fetch_latency_ms: 100,
++                fetch_ns_per_block: 5_700,
++            }),
++            ..value(session, Some(60_000), false)
+         }
+     }
+ 
++    #[test]
++    fn rebuild_cost_values_a_long_session_by_what_losing_it_costs() {
++        // A 10,000-block session and a 10-block one, both back in 60 s, same class. By session
++        // value the long one is worth 1,000 times less per block; costed by the rebuild, losing
++        // it costs the full weight plus 15 s of stall, so it is worth about half as much per block.
++        let ratio = |state: &RetainState| {
++            state.per_block(1, 10_000, 9, 0.0) / state.per_block(2, 10, 9, 0.0)
++        };
++        let mut plain = RetainState::default();
++        plain.note_request(Uuid::from_u128(1), value(1, Some(60_000), false));
++        plain.note_request(Uuid::from_u128(2), value(2, Some(60_000), false));
++        assert!((ratio(&plain) - 1e-3).abs() < 1e-9);
++        let mut cost = RetainState::default();
++        cost.note_request(Uuid::from_u128(1), costed(1, false));
++        cost.note_request(Uuid::from_u128(2), costed(2, false));
++        // In flight (discount 1): long (2 x 1 + 0.5 x 30) / 10,000; short (2 x 0.01 + 0.5 x 0.03) / 10.
++        let long = (2.0 + 15.0) / 10_000.0;
++        let short = (2.0 * 0.01 + 0.015) / 10.0;
++        assert!((cost.per_block(1, 10_000, 9, 0.0) - long).abs() < 1e-12);
++        assert!((ratio(&cost) - long / short).abs() < 1e-9);
++        assert!(ratio(&cost) > 0.4);
++        // Idle, back in 60 s: discounted by 300 / 360; ended: nothing.
++        cost.note_finished(Uuid::from_u128(1), 0.0);
++        assert!((cost.per_block(1, 10_000, 9, 0.0) - long * 300.0 / 360.0).abs() < 1e-12);
++    }
++
++    #[test]
++    fn with_peers_a_session_another_tier_holds_costs_a_fetch() {
++        let mut state = RetainState::default();
++        state.note_request(Uuid::from_u128(1), costed(1, true));
++        let alone = state.per_block(1, 1_000, 7, 0.0);
++        // Tier 7 itself holds it: still a rebuild.
++        state.note_holder(1, 7, true);
++        assert_eq!(state.per_block(1, 1_000, 7, 0.0), alone);
++        // Tier 8 holds it too: losing tier 7's copy costs a fetch (0.1 s + 1,000 x 5.7 us).
++        state.note_holder(1, 8, true);
++        let fetch_s = 0.1 + 1_000.0 * 5.7e-6;
++        assert!((state.per_block(1, 1_000, 7, 0.0) - 2.0 * fetch_s / 3.0 / 1_000.0).abs() < 1e-12);
++        assert!(state.per_block(1, 1_000, 7, 0.0) < alone);
++        state.note_holder(1, 8, false);
++        assert_eq!(state.per_block(1, 1_000, 7, 0.0), alone);
++    }
++
+     #[test]
+     fn a_session_is_worth_its_weight_in_flight_less_while_idle_nothing_when_ended() {
+         let mut state = RetainState::default();
+diff --git a/crates/core/src/engine/mod.rs b/crates/core/src/engine/mod.rs
+index 5e70b335e..8dbc36f92 100644
+--- a/crates/core/src/engine/mod.rs
++++ b/crates/core/src/engine/mod.rs
+@@ -13,7 +13,7 @@ mod handoff;
+ mod host_offload;
+ mod kv_manager;
+ pub(crate) mod kv_retain;
+-pub use kv_retain::KvRetainValue;
++pub use kv_retain::{KvRetainCost, KvRetainValue};
+ 
+ static CLASS_PREEMPTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+ 
+diff --git a/crates/core/src/replay/core/mod.rs b/crates/core/src/replay/core/mod.rs
+index 2c623dce3..51fde5e4e 100644
+--- a/crates/core/src/replay/core/mod.rs
++++ b/crates/core/src/replay/core/mod.rs
+@@ -199,7 +199,7 @@ pub struct KvRetainAction {
+ }
+ 
+ /// Retention by value (`kv.retain` priority); defined with the engine, which acts on it.
+-pub use crate::engine::KvRetainValue;
++pub use crate::engine::{KvRetainCost, KvRetainValue};
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub struct Placement {
+diff --git a/crates/core/src/replay/mod.rs b/crates/core/src/replay/mod.rs
+index 5156a0f84..36395baff 100644
+--- a/crates/core/src/replay/mod.rs
++++ b/crates/core/src/replay/mod.rs
+@@ -124,7 +124,7 @@ pub use core::round_robin::{AggregatedRoundRobinPlacement, PoolRoundRobinPlaceme
+ pub use core::{EngineEventBatch, NoEngineEvents};
+ pub use core::{
+     KvAction, KvActionMessage, KvActionRequest, KvActionResult, KvActionStatus, KvFetchAction,
+-    KvHints, KvRetainAction, KvRetainValue, Placement, PlacementCacheSample, PlacementDecision, PlacementEffects,
++    KvHints, KvRetainAction, KvRetainCost, KvRetainValue, Placement, PlacementCacheSample, PlacementDecision, PlacementEffects,
+     PlacementPolicy, RequestIdentity, WorkerTopology,
+ };
+ #[doc(hidden)]

@@ -1,0 +1,91 @@
+From 6fdf14f58e9db4bae234d259f3999e3c88771fcd Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Fri, 13 Nov 2026 08:14:50 +1000
+Subject: [PATCH 22/38] fix(replay): settle due engine internal work before
+ every replay command (dispatch, cancel, each KV action), not only before
+ admission; a KV action or a pass completion at the same timestamp can make a
+ write-back tick due, and the engine refused the next command (write-back +
+ peer-HBM stopped at 516 s). Each KV action's events reach the router before
+ the next action
+
+---
+ crates/core/src/replay/agg.rs | 43 +++++++++++++++++++++++++----------
+ 1 file changed, 31 insertions(+), 12 deletions(-)
+
+diff --git a/crates/core/src/replay/agg.rs b/crates/core/src/replay/agg.rs
+index 8079c7e1c..d4e237dca 100644
+--- a/crates/core/src/replay/agg.rs
++++ b/crates/core/src/replay/agg.rs
+@@ -346,6 +346,10 @@ where
+         worker_idx: usize,
+         kv_hint: Option<KvHintSource>,
+     ) -> anyhow::Result<()> {
++        // The engine refuses a command while internal work is due, and a KV action or a pass
++        // completion earlier at this timestamp can have made some due (a write-back tick).
++        let mut steps = 0usize;
++        self.settle_internal_work(&mut steps)?;
+         self.engine
+             .dispatch(worker_idx, request, kv_hint, self.now_ms)
+             .and_then(|()| self.placement.dispatch_committed(uuid, self.now_ms))
+@@ -655,20 +659,31 @@ where
+             }
+         }
+         messages.retain(|m| !m.actions.is_empty());
+-        let (mut results, observed) = if messages.is_empty() {
+-            (Vec::new(), Vec::new())
+-        } else {
+-            // An engine refuses a command while its internal work (transfer completions, a
+-            // write-back tick) is due: settle that first, as admission does.
+-            self.apply_internal_work()?;
+-            self.engine.apply_kv_actions(messages, self.now_ms)?
+-        };
++        // An engine refuses a command while its internal work (transfer completions, a
++        // write-back tick) is due, and one action can make more due at once (write-back of the
++        // blocks it moved): settle it before each action, as admission does before each command.
++        // Each action's KV events go to the router before the next settle, so the indexer sees
++        // them in the order the engine made them.
++        let mut results = Vec::new();
++        for message in messages {
++            for action in message.actions {
++                let mut steps = 0usize;
++                self.settle_internal_work(&mut steps)?;
++                let one = crate::replay::core::KvActionMessage {
++                    scheduler_id: message.scheduler_id,
++                    message_id: message.message_id,
++                    actions: vec![action],
++                };
++                let (r, observed) = self.engine.apply_kv_actions(vec![one], self.now_ms)?;
++                results.extend(r);
++                // The blocks the action dropped or loaded, as KV events for the router.
++                for events in observed {
++                    self.apply_engine_observations(events, KvIngestBoundary::SchedulerCommand)?;
++                }
++            }
++        }
+         results.extend(dequeue_results);
+         self.placement.kv_action_results(results, self.now_ms)?;
+-        // The blocks those actions dropped or loaded, as KV events for the router.
+-        for events in observed {
+-            self.apply_engine_observations(events, KvIngestBoundary::SchedulerCommand)?;
+-        }
+         for request_id in dequeued {
+             let placements = self.placement.requeued(request_id, self.now_ms)?;
+             self.dispatch_placements(placements)?;
+@@ -703,6 +718,8 @@ where
+         {
+             return Ok(false);
+         }
++        let mut steps = 0usize;
++        self.settle_internal_work(&mut steps)?;
+         let effects = self.engine.apply_command(
+             scheduler_id,
+             Command::CancelRequest {
+@@ -1370,6 +1387,8 @@ where
+             };
+             if tokenizing {
+             } else if let Some(scheduler_id) = scheduler_id {
++                let mut steps = 0usize;
++                self.settle_internal_work(&mut steps)?;
+                 let effects = self.engine.apply_command(
+                     scheduler_id,
+                     Command::CancelRequest {

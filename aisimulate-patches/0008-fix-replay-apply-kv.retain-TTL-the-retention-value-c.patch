@@ -1,0 +1,599 @@
+From 76faccb959229c29f6aa13dfe1c0b13a79b9a37c Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Thu, 12 Nov 2026 17:05:29 +1000
+Subject: [PATCH 08/38] fix(replay): apply kv.retain TTL, the retention-value
+ countdown and fetch without retain on normal completion, not only on drops;
+ retention by value evicts copies G1 still holds first (web/sim.js dramLoss);
+ count expired protected evictions and value evictions
+
+---
+ .../core/src/engine/cache/vllm_block_pool.rs  |   9 ++
+ crates/core/src/engine/host_offload/tier.rs   | 105 +++++++++++++-----
+ .../core/src/engine/kv_manager/g1_manager.rs  |   8 ++
+ .../src/engine/kv_manager/vllm_backend.rs     |  21 ++++
+ crates/core/src/engine/kv_retain.rs           |   4 +
+ crates/core/src/engine/kvcr.rs                |  15 +++
+ crates/core/src/engine/scheduler/vllm/core.rs |  88 ++++++++-------
+ .../src/engine/scheduler/vllm/host_offload.rs |  37 +++++-
+ 8 files changed, 217 insertions(+), 70 deletions(-)
+
+diff --git a/crates/core/src/engine/cache/vllm_block_pool.rs b/crates/core/src/engine/cache/vllm_block_pool.rs
+index daa2ff737..b0c6d9f88 100644
+--- a/crates/core/src/engine/cache/vllm_block_pool.rs
++++ b/crates/core/src/engine/cache/vllm_block_pool.rs
+@@ -377,6 +377,8 @@ struct RetainList {
+     now_ms: f64,
+     /// Protected copies evicted before their TTL ran out.
+     broken: u64,
++    /// Protected copies evicted after their TTL ran out (ahead of the LRU).
++    expired: u64,
+ }
+ 
+ impl RetainList {
+@@ -482,6 +484,12 @@ impl VllmBlockPool {
+     }
+ 
+     /// Protected copies evicted before their TTL ran out, since the last call.
++    pub(crate) fn take_retain_expired(&mut self) -> u64 {
++        self.retain
++            .as_deref_mut()
++            .map_or(0, |retain| std::mem::take(&mut retain.expired))
++    }
++
+     pub(crate) fn take_retain_broken(&mut self) -> u64 {
+         self.retain
+             .as_deref_mut()
+@@ -530,6 +538,7 @@ impl VllmBlockPool {
+         if let Some((&(until_bits, _), &expired)) = retain.by_expiry.first_key_value()
+             && f64::from_bits(until_bits) <= retain.now_ms
+         {
++            retain.expired += 1;
+             return Some(expired);
+         }
+         if self.inactive_head.is_some() {
+diff --git a/crates/core/src/engine/host_offload/tier.rs b/crates/core/src/engine/host_offload/tier.rs
+index b50f4be31..77b240aa3 100644
+--- a/crates/core/src/engine/host_offload/tier.rs
++++ b/crates/core/src/engine/host_offload/tier.rs
+@@ -288,6 +288,12 @@ pub(crate) struct HostTier {
+     observer: Option<Arc<dyn HostOffloadObserver>>,
+     /// Retention by value (`kv.retain`), when the pool's router sends values.
+     retain: Option<crate::engine::kv_retain::SharedRetainState>,
++    /// This rank's G1 residency, for retention by value: a copy G1 still holds
++    /// is the cheapest to drop (G1 writes it again when it evicts it).
++    g1_view: Option<crate::engine::kv_retain::SharedG1View>,
++    /// G2 evictions chosen by value: G1 duplicates, then by session value.
++    value_evicted_dup: u64,
++    value_evicted_by_value: u64,
+     /// The session each stored block belongs to (retention by value only).
+     owner_of: FxHashMap<HostBlockKey, u64>,
+     by_owner: FxHashMap<u64, FxHashSet<HostBlockKey>>,
+@@ -335,6 +341,9 @@ impl HostTier {
+             warned_structurally_unfittable: false,
+             observer: None,
+             retain: None,
++            g1_view: None,
++            value_evicted_dup: 0,
++            value_evicted_by_value: 0,
+             owner_of: FxHashMap::default(),
+             by_owner: FxHashMap::default(),
+             last_evict_ms: f64::NEG_INFINITY,
+@@ -346,6 +355,18 @@ impl HostTier {
+         self.retain = Some(state);
+     }
+ 
++    pub(crate) fn set_g1_view(&mut self, view: crate::engine::kv_retain::SharedG1View) {
++        self.g1_view = Some(view);
++    }
++
++    /// Evictions retention by value chose: (G1 duplicates, by session value).
++    pub(crate) fn take_value_evictions(&mut self) -> (u64, u64) {
++        (
++            std::mem::take(&mut self.value_evicted_dup),
++            std::mem::take(&mut self.value_evicted_by_value),
++        )
++    }
++
+     fn forget_owner(&mut self, key: HostBlockKey) {
+         if let Some(owner) = self.owner_of.remove(&key)
+             && let Some(keys) = self.by_owner.get_mut(&owner)
+@@ -360,45 +381,72 @@ impl HostTier {
+     /// Victims by retention value: blocks of no known session first (as LRU),
+     /// then the sessions worth least per block. `None` when value retention is
+     /// not active, so the caller uses the LRU.
++    /// Victims by retention value, cheapest loss first as `web/sim.js`
++    /// `dramLoss`: copies this rank's G1 still holds (G1 writes them again when
++    /// it evicts them), then blocks of no known session (as LRU), then the
++    /// sessions worth least per block. `None` when value retention is not
++    /// active, so the caller uses the LRU.
+     fn value_victims(
+-        &self,
++        &mut self,
+         needed: usize,
+         now_ms: f64,
+-        mut eligible: impl FnMut(HostBlockKey) -> bool,
++        mut eligible: impl FnMut(&Self, HostBlockKey) -> bool,
+     ) -> Option<Vec<HostBlockKey>> {
+-        let state = self.retain.as_ref()?.lock().unwrap();
++        let retain = Arc::clone(self.retain.as_ref()?);
++        let state = retain.lock().unwrap();
+         if !state.active(self.last_evict_ms, now_ms) {
+             return None;
+         }
+-        // Blocks of no known session go first, as LRU. Walking the LRU for them is skipped
++        let mut victims = Vec::with_capacity(needed);
++        let mut chosen = rustc_hash::FxHashSet::default();
++        if let Some(view) = &self.g1_view {
++            let view = view.lock().unwrap();
++            for &hash in view.iter() {
++                let key = HostBlockKey::new(hash);
++                if self.entries.contains_key(&key) && eligible(self, key) {
++                    victims.push(key);
++                    chosen.insert(key);
++                    if victims.len() == needed {
++                        break;
++                    }
++                }
++            }
++        }
++        let duplicates = victims.len() as u64;
++        // Blocks of no known session go next, as LRU. Walking the LRU for them is skipped
+         // when every resident block has a session (the usual case), since the walk would
+         // visit every block.
+-        let owner_of = &self.owner_of;
+-        let mut victims = if self.entries.len() > self.owner_of.len() {
+-            self.lru
+-                .victims(needed, |key| !owner_of.contains_key(&key) && eligible(key))
+-        } else {
+-            Vec::new()
+-        };
+-        if victims.len() == needed {
+-            return Some(victims);
++        if victims.len() < needed && self.entries.len() > self.owner_of.len() {
++            let owner_of = &self.owner_of;
++            let more = self.lru.victims(needed - victims.len(), |key| {
++                !owner_of.contains_key(&key) && !chosen.contains(&key) && eligible(self, key)
++            });
++            for key in more {
++                chosen.insert(key);
++                victims.push(key);
++            }
+         }
+-        let mut owners: Vec<(f64, u64)> = self
+-            .by_owner
+-            .iter()
+-            .map(|(owner, keys)| (state.value(*owner, now_ms) / keys.len() as f64, *owner))
+-            .collect();
+-        owners.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+-        'owners: for (_, owner) in owners {
+-            for &key in &self.by_owner[&owner] {
+-                if eligible(key) {
+-                    victims.push(key);
+-                    if victims.len() == needed {
+-                        break 'owners;
++        if victims.len() < needed {
++            let mut owners: Vec<(f64, u64)> = self
++                .by_owner
++                .iter()
++                .map(|(owner, keys)| (state.value(*owner, now_ms) / keys.len() as f64, *owner))
++                .collect();
++            owners.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
++            'owners: for (_, owner) in owners {
++                for &key in &self.by_owner[&owner] {
++                    if !chosen.contains(&key) && eligible(self, key) {
++                        victims.push(key);
++                        if victims.len() == needed {
++                            break 'owners;
++                        }
+                     }
+                 }
+             }
+         }
++        drop(state);
++        self.value_evicted_dup += duplicates;
++        self.value_evicted_by_value += victims.len() as u64 - duplicates;
+         Some(victims)
+     }
+ 
+@@ -543,16 +591,15 @@ impl HostTier {
+ 
+         let free = self.config.capacity_blocks - self.entries.len();
+         let needed_victims = missing.len().saturating_sub(free);
+-        let entries = &self.entries;
+-        let eligible = |key: HostBlockKey| {
++        let eligible = |tier: &Self, key: HostBlockKey| {
+             !protected.contains(&key)
+-                && entries.get(&key).is_some_and(|entry| {
++                && tier.entries.get(&key).is_some_and(|entry| {
+                     entry.state == EntryState::Resident && entry.load_pins == 0
+                 })
+         };
+         let victims = match self.value_victims(needed_victims, now_ms, eligible) {
+             Some(victims) => victims,
+-            None => self.lru.victims(needed_victims, eligible),
++            None => self.lru.victims(needed_victims, |key| eligible(self, key)),
+         };
+         if victims.len() != needed_victims {
+             let structurally_unfittable = protected.len() > self.config.capacity_blocks;
+diff --git a/crates/core/src/engine/kv_manager/g1_manager.rs b/crates/core/src/engine/kv_manager/g1_manager.rs
+index 1b2027091..b37332dad 100644
+--- a/crates/core/src/engine/kv_manager/g1_manager.rs
++++ b/crates/core/src/engine/kv_manager/g1_manager.rs
+@@ -292,6 +292,14 @@ impl G1Manager {
+         self.inner.take_retain_broken()
+     }
+ 
++    pub(crate) fn take_retain_expired(&mut self) -> u64 {
++        self.inner.take_retain_expired()
++    }
++
++    pub(crate) fn set_g1_view(&mut self, view: crate::engine::kv_retain::SharedG1View) {
++        self.inner.set_g1_view(view);
++    }
++
+     pub(crate) fn log_evictions(&mut self) {
+         self.inner.log_evictions();
+     }
+diff --git a/crates/core/src/engine/kv_manager/vllm_backend.rs b/crates/core/src/engine/kv_manager/vllm_backend.rs
+index 1b6fe8d5a..faedc5925 100644
+--- a/crates/core/src/engine/kv_manager/vllm_backend.rs
++++ b/crates/core/src/engine/kv_manager/vllm_backend.rs
+@@ -379,6 +379,8 @@ pub(crate) struct VllmKvManager {
+     prefix_match_unit: Option<usize>,
+     /// G2 write-back: cached blocks G1 evicted since the last take.
+     evicted_log: Option<Vec<SequenceHash>>,
++    /// G1 residency shared with this rank's G2, for retention by value.
++    g1_view: Option<crate::engine::kv_retain::SharedG1View>,
+ }
+ 
+ impl VllmKvManager {
+@@ -387,6 +389,10 @@ impl VllmKvManager {
+         self.evicted_log.get_or_insert_with(Vec::new);
+     }
+ 
++    pub(crate) fn set_g1_view(&mut self, view: crate::engine::kv_retain::SharedG1View) {
++        self.g1_view = Some(view);
++    }
++
+     pub(crate) fn take_evicted(&mut self) -> Vec<SequenceHash> {
+         self.evicted_log.as_mut().map(std::mem::take).unwrap_or_default()
+     }
+@@ -432,6 +438,7 @@ impl VllmKvManager {
+             state_cache: None,
+             prefix_match_unit: None,
+             evicted_log: None,
++            g1_view: None,
+         }
+     }
+ 
+@@ -1420,6 +1427,10 @@ impl VllmKvManager {
+         loaded
+     }
+ 
++    pub(crate) fn take_retain_expired(&mut self) -> u64 {
++        self.pool.take_retain_expired()
++    }
++
+     pub(crate) fn take_retain_broken(&mut self) -> u64 {
+         self.pool.take_retain_broken()
+     }
+@@ -1771,6 +1782,16 @@ impl VllmKvManager {
+         if !self.enable_prefix_caching || full_blocks.is_empty() {
+             return;
+         }
++        if let Some(view) = &self.g1_view {
++            let mut view = view.lock().unwrap();
++            if is_store {
++                view.extend(full_blocks.iter().copied());
++            } else {
++                for hash in &full_blocks {
++                    view.remove(hash);
++                }
++            }
++        }
+         if *kv_cache_trace::KV_CACHE_TRACE_ENABLED {
+             kv_cache_trace::log_vllm_trace(
+                 if is_store { "allocation" } else { "eviction" },
+diff --git a/crates/core/src/engine/kv_retain.rs b/crates/core/src/engine/kv_retain.rs
+index 27d28676f..a04555134 100644
+--- a/crates/core/src/engine/kv_retain.rs
++++ b/crates/core/src/engine/kv_retain.rs
+@@ -38,6 +38,10 @@ pub struct KvRetainValue {
+ 
+ pub(crate) type SharedRetainState = Arc<Mutex<RetainState>>;
+ 
++/// The sequence hashes one rank's G1 holds, kept by its KV manager from its own
++/// stored and removed events, so its G2 can tell a copy G1 duplicates.
++pub(crate) type SharedG1View = Arc<Mutex<rustc_hash::FxHashSet<u64>>>;
++
+ /// The discount horizon, as `web/sim.js` `planHorizonS`.
+ const HORIZON_MS: f64 = 300_000.0;
+ 
+diff --git a/crates/core/src/engine/kvcr.rs b/crates/core/src/engine/kvcr.rs
+index 05129723b..7e486e707 100644
+--- a/crates/core/src/engine/kvcr.rs
++++ b/crates/core/src/engine/kvcr.rs
+@@ -68,6 +68,15 @@ pub struct KvcrStats {
+     /// Protected blocks evicted before their TTL ran out (nothing else was left).
+     #[serde(skip_serializing_if = "is_zero")]
+     pub retain_broken: u64,
++    /// Protected G1 blocks evicted after their TTL ran out.
++    #[serde(skip_serializing_if = "is_zero")]
++    pub retain_expired: u64,
++    /// G2 evictions retention by value chose among copies G1 still holds.
++    #[serde(skip_serializing_if = "is_zero")]
++    pub value_evicted_g1_duplicates: u64,
++    /// G2 evictions retention by value chose by session value (or no session).
++    #[serde(skip_serializing_if = "is_zero")]
++    pub value_evicted_by_value: u64,
+     /// Blocks dropped by `kv.invalidate` (G1 and G2 copies counted separately).
+     #[serde(skip_serializing_if = "is_zero")]
+     pub invalidated_blocks: u64,
+@@ -329,6 +338,12 @@ impl KvcrRegistry {
+         self.stats.retained_blocks += blocks as u64;
+     }
+ 
++    pub(crate) fn note_retain_counts(&mut self, expired: u64, dup: u64, by_value: u64) {
++        self.stats.retain_expired += expired;
++        self.stats.value_evicted_g1_duplicates += dup;
++        self.stats.value_evicted_by_value += by_value;
++    }
++
+     pub(crate) fn note_retain_broken(&mut self, blocks: usize) {
+         self.stats.retain_broken += blocks as u64;
+     }
+diff --git a/crates/core/src/engine/scheduler/vllm/core.rs b/crates/core/src/engine/scheduler/vllm/core.rs
+index 5a40a08f3..c8ece2ad4 100644
+--- a/crates/core/src/engine/scheduler/vllm/core.rs
++++ b/crates/core/src/engine/scheduler/vllm/core.rs
+@@ -24,7 +24,7 @@ use crate::engine::common::utils::{
+ };
+ use crate::engine::host_offload::{G2Binding, HostTierHandle};
+ use crate::engine::kv_manager::AllocationRequirement;
+-use crate::engine::kv_manager::{DestinationReservation, G1Acquire, NativeAllocation};
++use crate::engine::kv_manager::{BlockRequestLease, DestinationReservation, G1Acquire, NativeAllocation};
+ use crate::engine::kv_manager::{G1Manager, GroupedKvPool};
+ use crate::engine::scheduler::queue_metrics::{QueueStats, QueuedLength};
+ use crate::engine::scheduler::vllm::host_offload::{
+@@ -798,10 +798,12 @@ impl VllmCore {
+         registry: crate::engine::kvcr::SharedKvcrRegistry,
+         rank: KvHintSource,
+     ) -> HostTierHandle {
++        let view = crate::engine::kv_retain::SharedG1View::default();
++        self.kv_manager.set_g1_view(std::sync::Arc::clone(&view));
+         self.native_host_offload
+             .as_mut()
+             .expect("KVCR requires G2")
+-            .set_kvcr(registry, rank)
++            .set_kvcr(registry, rank, view)
+     }
+ 
+     pub(crate) fn set_host_offload_observer(
+@@ -1573,7 +1575,7 @@ impl VllmCore {
+         match self.source_holds.remove(handoff_id) {
+             RemovedSource::Held(payload) => {
+                 let request_id = payload.request_id;
+-                self.cleanup_completed_prefill(payload);
++                self.cleanup_completed_prefill(payload, None);
+                 self.bump_capacity_generation();
+                 (true, Some(request_id))
+             }
+@@ -1591,7 +1593,7 @@ impl VllmCore {
+         match self.source_holds.remove(handoff_id) {
+             RemovedSource::Held(payload) => {
+                 let request_id = payload.request_id;
+-                self.cleanup_completed_prefill(payload);
++                self.cleanup_completed_prefill(payload, mutation_now_ms);
+                 self.bump_capacity_generation();
+                 (true, Some(request_id))
+             }
+@@ -1603,7 +1605,7 @@ impl VllmCore {
+         }
+     }
+ 
+-    fn complete_source(&mut self, uuid: Uuid) {
++    fn complete_source(&mut self, uuid: Uuid, now_ms: f64) {
+         let transfer_timing = self.state.requests.get(&uuid).map(|request| {
+             prefill_handoff_transfer_timing(
+                 request.sequence.num_input_tokens(),
+@@ -1625,7 +1627,7 @@ impl VllmCore {
+         };
+         match self.source_holds.complete_source(uuid, payload) {
+             SourceCompletion::Release(payload) => {
+-                self.cleanup_completed_prefill(payload);
++                self.cleanup_completed_prefill(payload, Some(now_ms));
+             }
+             SourceCompletion::Held { handoff_id } => {
+                 self.lifecycle_events
+@@ -1643,13 +1645,40 @@ impl VllmCore {
+         self.bump_capacity_generation();
+     }
+ 
+-    fn cleanup_completed_prefill(&mut self, payload: HeldVllmPrefill) {
++    fn cleanup_completed_prefill(&mut self, payload: HeldVllmPrefill, now_ms: Option<f64>) {
+         let HeldVllmPrefill {
+             request_id,
+             request,
+         } = payload;
+-        self.kv_manager
+-            .finish_native(request_id, request.sequence.lease);
++        self.finish_request_kv(request_id, request.sequence.lease, now_ms);
++    }
++
++    /// Release a finished or dropped request's G1 blocks, applying its path A
++    /// KV actions: the session's retention value starts counting down to its
++    /// next turn, a fetch without retain drops its pulled G2 copies, and a
++    /// `kv.retain` TTL keeps its blocks out of ordinary LRU eviction.
++    fn finish_request_kv(&mut self, uuid: Uuid, lease: BlockRequestLease, now_ms: Option<f64>) {
++        let Some(adapter) = self.native_host_offload.as_ref() else {
++            self.kv_manager.finish_native(uuid, lease);
++            return;
++        };
++        let now_ms = now_ms.unwrap_or_else(|| adapter.current_time_ms());
++        adapter.note_finished(uuid, now_ms);
++        match adapter.retain_ms(uuid) {
++            Some(ttl_ms) => {
++                let blocks = self.kv_manager.finish_native_retained(
++                    uuid,
++                    lease,
++                    now_ms + ttl_ms as f64,
++                    now_ms,
++                );
++                let broken = self.kv_manager.take_retain_broken();
++                if let Some(adapter) = self.native_host_offload.as_ref() {
++                    adapter.note_retained(Some(blocks), broken);
++                }
++            }
++            None => self.kv_manager.finish_native(uuid, lease),
++        }
+     }
+ 
+     #[cfg(test)]
+@@ -1953,10 +1982,12 @@ impl VllmCore {
+         self.kv_manager.begin_step();
+         self.kv_manager.set_now_ms(now_ms);
+         let broken = self.kv_manager.take_retain_broken();
+-        if broken > 0
+-            && let Some(adapter) = self.native_host_offload.as_ref()
+-        {
+-            adapter.note_retained(None, broken);
++        let expired = self.kv_manager.take_retain_expired();
++        if let Some(adapter) = self.native_host_offload.as_ref() {
++            if broken > 0 {
++                adapter.note_retained(None, broken);
++            }
++            adapter.note_retain_counts(expired);
+         }
+         self.state.compact_running();
+         if self.class_preempt_for_waiting(now_ms) > 0 {
+@@ -2666,30 +2697,7 @@ impl VllmCore {
+             .state
+             .take_completed(&uuid)
+             .expect("request drop must remove the scheduler-owned request");
+-        if let Some(adapter) = self.native_host_offload.as_ref() {
+-            let now_ms = mutation_now_ms.unwrap_or_else(|| adapter.current_time_ms());
+-            adapter.note_finished(uuid, now_ms);
+-        }
+-        let retain = self.native_host_offload.as_ref().and_then(|adapter| {
+-            let ttl_ms = adapter.retain_ms(uuid)?;
+-            let now_ms = mutation_now_ms.unwrap_or_else(|| adapter.current_time_ms());
+-            Some((ttl_ms, now_ms))
+-        });
+-        match retain {
+-            Some((ttl_ms, now_ms)) => {
+-                let blocks = self.kv_manager.finish_native_retained(
+-                    uuid,
+-                    request.sequence.lease,
+-                    now_ms + ttl_ms as f64,
+-                    now_ms,
+-                );
+-                let broken = self.kv_manager.take_retain_broken();
+-                if let Some(adapter) = self.native_host_offload.as_ref() {
+-                    adapter.note_retained(Some(blocks), broken);
+-                }
+-            }
+-            None => self.kv_manager.finish_native(uuid, request.sequence.lease),
+-        }
++        self.finish_request_kv(uuid, request.sequence.lease, mutation_now_ms);
+         if capacity_improved {
+             self.bump_capacity_generation();
+         }
+@@ -3521,7 +3529,7 @@ impl VllmCore {
+                 .requests
+                 .get_mut(&uuid)
+                 .and_then(VllmRequestState::take_cached_tokens_for_signal);
+-            self.complete_source(uuid);
++            self.complete_source(uuid, compute_start_ms);
+             output_signals.push(OutputSignal {
+                 uuid,
+                 token_id: None,
+@@ -3623,7 +3631,7 @@ impl VllmCore {
+                 cached_tokens,
+             };
+             if completed {
+-                self.complete_source(uuid);
++                self.complete_source(uuid, pass_end_ms);
+                 running_changed = true;
+             }
+             if let Some(collector) = collector.as_deref_mut() {
+@@ -3872,7 +3880,7 @@ impl VllmCore {
+             }
+ 
+             if completed {
+-                self.complete_source(uuid);
++                self.complete_source(uuid, pass_end_ms);
+                 running_changed = true;
+                 continue;
+             }
+diff --git a/crates/core/src/engine/scheduler/vllm/host_offload.rs b/crates/core/src/engine/scheduler/vllm/host_offload.rs
+index d0c7b666f..9ff032f10 100644
+--- a/crates/core/src/engine/scheduler/vllm/host_offload.rs
++++ b/crates/core/src/engine/scheduler/vllm/host_offload.rs
+@@ -239,9 +239,11 @@ impl VllmHostOffloadAdapter {
+         &mut self,
+         registry: crate::engine::kvcr::SharedKvcrRegistry,
+         rank: KvHintSource,
++        g1_view: crate::engine::kv_retain::SharedG1View,
+     ) -> HostTierHandle {
+         let retain = registry.lock().unwrap().retain_state();
+         self.host.lock().set_retain(retain);
++        self.host.lock().set_g1_view(g1_view);
+         self.kvcr = Some(super::kvcr::VllmKvcrAdapter::new(registry, rank));
+         self.host.tier_handle()
+     }
+@@ -311,6 +313,20 @@ impl VllmHostOffloadAdapter {
+         }
+     }
+ 
++    /// Count expired protected G1 evictions and G2's retention-by-value choices.
++    pub(super) fn note_retain_counts(&self, expired: u64) {
++        let Some(kvcr) = &self.kvcr else {
++            return;
++        };
++        let (dup, by_value) = self.host.lock().take_value_evictions();
++        if expired + dup + by_value > 0 {
++            kvcr.registry()
++                .lock()
++                .unwrap()
++                .note_retain_counts(expired, dup, by_value);
++        }
++    }
++
+     /// Count a finished request's `kv.retain` protection and protected blocks
+     /// evicted early since the last count.
+     pub(super) fn note_retained(&self, request_blocks: Option<usize>, broken: u64) {
+@@ -1201,6 +1217,25 @@ mod tests {
+         assert_eq!(core.kv_residency(a), (false, false));
+     }
+ 
++    #[test]
++    fn a_normally_completed_request_with_a_ttl_is_protected() {
++        let mut core = block_action_core(16, 8, false);
++        let registry = crate::engine::kvcr::KvcrRegistry::new(crate::engine::KvcrConfig::default());
++        core.set_kvcr(
++            Arc::clone(&registry),
++            KvHintSource {
++                worker_id: 0,
++                dp_rank: 0,
++            },
++        );
++        let uuid = Uuid::from_u128(46);
++        registry.lock().unwrap().note_retain(uuid, 60_000);
++        let mut now_ms = 0.0;
++        run_to_completion(&mut core, uuid, (1..=8).collect(), &mut now_ms);
++        let stats = registry.lock().unwrap().stats();
++        assert_eq!((stats.retained_requests, stats.retained_blocks), (1, 2));
++    }
++
+     #[test]
+     fn demote_keeps_a_block_g2_lacks() {
+         // G2 of two blocks: a later one-block prompt evicts one of the first two.
+@@ -2163,7 +2198,7 @@ mod tests {
+         });
+         let adapters = [0, 1].map(|index| {
+             let mut adapter = adapter(blocks[index]);
+-            let g2 = adapter.set_kvcr(Arc::clone(&registry), ranks[index]);
++            let g2 = adapter.set_kvcr(Arc::clone(&registry), ranks[index], Default::default());
+             registry
+                 .lock()
+                 .unwrap()

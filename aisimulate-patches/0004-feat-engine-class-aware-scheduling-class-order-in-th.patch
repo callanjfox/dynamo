@@ -1,0 +1,1261 @@
+From 7b0bc7250c6f529d4eee91aa7005767e72a54a70 Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Thu, 12 Nov 2026 10:59:37 +1000
+Subject: [PATCH 04/38] feat(engine): class-aware scheduling (class order in
+ the waiting queue, class preemption), off by default
+
+EngineConfig.class_scheduling {order, preempt_max_rank}: requests carry a policy_class; the
+vLLM-style waiting queue is kept in (class rank, arrival) order and a preempted request rejoins at
+the front of its own class. With preempt_max_rank, a waiting request ranked at or above it that
+cannot get blocks or a sequence slot preempts running requests ranked below it (lowest class,
+newest first) before the pass, and KV-pressure preemption takes the lowest class first. Engine and
+replay requests gain an optional policy_class, forwarded from the replay request. Without
+class_scheduling the engine is unchanged.
+---
+ crates/core/src/engine/common/protocols.rs    |   6 +
+ crates/core/src/engine/config.rs              |  34 +++
+ crates/core/src/engine/mod.rs                 |   2 +-
+ crates/core/src/engine/protocol.rs            |   4 +
+ crates/core/src/engine/scheduler/rank.rs      |  18 ++
+ .../core/src/engine/scheduler/sglang/tests.rs |  26 +++
+ crates/core/src/engine/scheduler/vllm/core.rs | 196 +++++++++++++++++-
+ .../src/engine/scheduler/vllm/policy/tests.rs |   1 +
+ .../core/src/engine/scheduler/vllm/tests.rs   | 148 +++++++++++++
+ crates/core/src/replay/components/engine.rs   |   1 +
+ crates/core/src/replay/disagg.rs              |   1 +
+ crates/core/tests/engine.rs                   |   4 +
+ crates/core/tests/host_offload_scopes.rs      |   1 +
+ 13 files changed, 435 insertions(+), 7 deletions(-)
+
+diff --git a/crates/core/src/engine/common/protocols.rs b/crates/core/src/engine/common/protocols.rs
+index fe9084abb..fdaa3553e 100644
+--- a/crates/core/src/engine/common/protocols.rs
++++ b/crates/core/src/engine/common/protocols.rs
+@@ -84,6 +84,9 @@ pub(crate) struct DirectRequest {
+     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+     pub images: Vec<ImageSpec>,
+     pub kv_hint: Option<crate::engine::KvHintSource>,
++    /// Policy class, read only under `class_scheduling`.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub policy_class: Option<String>,
+ }
+ 
+ impl DirectRequest {
+@@ -234,6 +237,9 @@ pub(crate) struct MockEngineArgs {
+     pub kv_transfer_timing_mode: KvTransferTimingMode,
+     #[builder(default = "PreemptionMode::Lifo")]
+     pub preemption_mode: PreemptionMode,
++    /// Class-aware queue order and preemption; `None` keeps FCFS.
++    #[builder(default = "None")]
++    pub class_scheduling: Option<crate::engine::ClassSchedulingConfig>,
+     #[builder(default = "None")]
+     pub sglang: Option<SglangArgs>,
+     #[builder(default = "false")]
+diff --git a/crates/core/src/engine/config.rs b/crates/core/src/engine/config.rs
+index 65a48c35b..ccafcf6b7 100644
+--- a/crates/core/src/engine/config.rs
++++ b/crates/core/src/engine/config.rs
+@@ -140,6 +140,31 @@ pub enum WorkerType {
+     Decode,
+ }
+ 
++/// Class-aware scheduling for the vLLM-style engine (the JS model's `classQueue` and
++/// `preemptLower`/`batchPreempt`). Requests carry a policy class; `order` ranks the classes from
++/// highest to lowest, and a request whose class is missing or unknown ranks below them all.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct ClassSchedulingConfig {
++    /// Policy classes from highest to lowest priority, e.g. `["priority", "standard", "batch"]`.
++    pub order: Vec<String>,
++    /// When set, a waiting request ranked at or above this index that cannot be admitted for
++    /// lack of KV or sequence slots preempts running requests ranked below it (lowest class
++    /// first, newest first). `Some(0)` is `preemptLower` (priority takes room from the rest);
++    /// `Some(1)` is `batchPreempt` (priority and standard take room from batch).
++    #[serde(default)]
++    pub preempt_max_rank: Option<usize>,
++}
++
++impl ClassSchedulingConfig {
++    /// Rank of a policy class: its index in `order`, or `order.len()` when absent or unknown.
++    pub fn rank_of(&self, class: Option<&str>) -> usize {
++        class
++            .and_then(|c| self.order.iter().position(|o| o == c))
++            .unwrap_or(self.order.len())
++    }
++}
++
+ /// Decode preemption victim selection.
+ #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+ #[serde(rename_all = "snake_case")]
+@@ -675,6 +700,11 @@ pub struct EngineConfig {
+     /// Optional KVCR peer G2 fetch. Replay-owned.
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub kvcr: Option<crate::engine::KvcrConfig>,
++    /// Optional class-aware scheduling: the waiting queue is ordered by policy class and,
++    /// with `preempt_max_rank`, a higher class may preempt a running lower class. `None` keeps
++    /// the engine's first-come, first-served order unchanged.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub class_scheduling: Option<ClassSchedulingConfig>,
+     /// Optional manual vLLM G1 token/state cache configuration.
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub state_cache: Option<StateCacheConfig>,
+@@ -772,6 +802,8 @@ struct EngineConfigWire {
+     #[serde(default)]
+     kvcr: Option<crate::engine::KvcrConfig>,
+     #[serde(default)]
++    class_scheduling: Option<ClassSchedulingConfig>,
++    #[serde(default)]
+     kv_transfer_bandwidth: Option<f64>,
+     #[serde(default)]
+     kv_transfer_timing_mode: TransferTimingMode,
+@@ -833,6 +865,7 @@ impl<'de> Deserialize<'de> for EngineConfig {
+             native_host_offload: wire.native_host_offload,
+             g3_offload: wire.g3_offload,
+             kvcr: wire.kvcr,
++            class_scheduling: wire.class_scheduling,
+             state_cache: wire.state_cache,
+             prefix_match_unit: wire.prefix_match_unit,
+             kv_transfer_bandwidth: wire.kv_transfer_bandwidth,
+@@ -879,6 +912,7 @@ impl Default for EngineConfig {
+             native_host_offload: None,
+             g3_offload: None,
+             kvcr: None,
++            class_scheduling: None,
+             state_cache: None,
+             prefix_match_unit: None,
+             kv_transfer_bandwidth: None,
+diff --git a/crates/core/src/engine/mod.rs b/crates/core/src/engine/mod.rs
+index 13e319be5..900c3ed9f 100644
+--- a/crates/core/src/engine/mod.rs
++++ b/crates/core/src/engine/mod.rs
+@@ -38,7 +38,7 @@ pub use common::running_mean::RunningMean;
+ pub use common::speculative::normalize_conditional_accept_rates;
+ pub use config::{
+     Backend, EngineConfig, FrontendConfig, FrontendStage, G2Scope, G3OffloadConfig, G3Scope,
+-    KvcrConfig, NativeHostOffloadConfig, PreemptionMode, SglangConfig, SglangSchedulePolicy,
++    ClassSchedulingConfig, KvcrConfig, NativeHostOffloadConfig, PreemptionMode, SglangConfig, SglangSchedulePolicy,
+     StateCacheConfig, TrtllmCapacityPolicy, TrtllmConfig, WorkerType,
+ };
+ pub use g3_offload::{G3IoStats, G3Stats};
+diff --git a/crates/core/src/engine/protocol.rs b/crates/core/src/engine/protocol.rs
+index 52fd2c24b..7c2ae5fa6 100644
+--- a/crates/core/src/engine/protocol.rs
++++ b/crates/core/src/engine/protocol.rs
+@@ -88,6 +88,10 @@ pub struct Request {
+     /// `tokens`. Never the receiving rank itself. Engines without KVCR ignore it.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub kv_hint: Option<KvHintSource>,
++    /// Optional policy class (for example `priority`, `standard`, `batch`). The scheduler reads it
++    /// only when the engine's `class_scheduling` is set; otherwise it has no effect.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub policy_class: Option<String>,
+ }
+ 
+ /// Commands supported by the standalone scheduler.
+diff --git a/crates/core/src/engine/scheduler/rank.rs b/crates/core/src/engine/scheduler/rank.rs
+index 52fa13684..72cf22524 100644
+--- a/crates/core/src/engine/scheduler/rank.rs
++++ b/crates/core/src/engine/scheduler/rank.rs
+@@ -469,6 +469,7 @@ fn core_args(config: &EngineConfig, timing: Arc<dyn TimingModel>) -> MockEngineA
+             PreemptionMode::Lifo => CorePreemptionMode::Lifo,
+             PreemptionMode::Fifo => CorePreemptionMode::Fifo,
+         },
++        class_scheduling: config.class_scheduling.clone(),
+         sglang: Some(SglangArgs {
+             schedule_policy: Some(
+                 match config.sglang.schedule_policy {
+@@ -532,6 +533,7 @@ fn core_request(request: Request) -> DirectRequest {
+         session_id: request.session_id,
+         images: request.images,
+         kv_hint: request.kv_hint,
++        policy_class: request.policy_class,
+     }
+ }
+ 
+@@ -765,6 +767,7 @@ mod tests {
+                 embedding_bytes: 128,
+             }],
+             kv_hint: None,
++            policy_class: None,
+         };
+         let command = |request| match worker_type {
+             WorkerType::Aggregated => Command::Submit(request),
+@@ -943,6 +946,7 @@ mod tests {
+                     session_id: None,
+                     images: Vec::new(),
+                     kv_hint: None,
++                    policy_class: None,
+                 }),
+                 CommandContext {
+                     now_ms: 0.0,
+@@ -966,6 +970,7 @@ mod tests {
+                     session_id: None,
+                     images: Vec::new(),
+                     kv_hint: None,
++                    policy_class: None,
+                 }),
+                 CommandContext {
+                     now_ms: first_end_ms,
+@@ -1108,6 +1113,7 @@ mod tests {
+                     session_id: None,
+                     images: Vec::new(),
+                     kv_hint: None,
++                    policy_class: None,
+                 }),
+                 CommandContext {
+                     now_ms,
+@@ -1155,6 +1161,7 @@ mod tests {
+                         session_id: None,
+                         images: Vec::new(),
+                         kv_hint: None,
++                        policy_class: None,
+                     },
+                 },
+                 CommandContext {
+@@ -1186,6 +1193,7 @@ mod tests {
+                     session_id: None,
+                     images: Vec::new(),
+                     kv_hint: None,
++                    policy_class: None,
+                 }),
+                 CommandContext {
+                     now_ms: 0.0,
+@@ -1306,6 +1314,7 @@ mod tests {
+                     session_id: None,
+                     images: Vec::new(),
+                     kv_hint: None,
++                    policy_class: None,
+                 }),
+                 CommandContext {
+                     now_ms: h2d_due_ms - 0.5,
+@@ -1330,6 +1339,7 @@ mod tests {
+                     session_id: None,
+                     images: Vec::new(),
+                     kv_hint: None,
++                    policy_class: None,
+                 }),
+                 CommandContext {
+                     now_ms: h2d_due_ms + 0.5,
+@@ -1390,6 +1400,7 @@ mod tests {
+                     session_id: None,
+                     images: Vec::new(),
+                     kv_hint: None,
++                    policy_class: None,
+                 }),
+                 CommandContext {
+                     now_ms: h2d_due_ms + 1.0,
+@@ -1449,6 +1460,7 @@ mod tests {
+                         session_id: None,
+                         images: Vec::new(),
+                         kv_hint: None,
++                        policy_class: None,
+                     }),
+                     CommandContext {
+                         now_ms,
+@@ -1489,6 +1501,7 @@ mod tests {
+                     session_id: None,
+                     images: Vec::new(),
+                     kv_hint: None,
++                    policy_class: None,
+                 }),
+                 CommandContext {
+                     now_ms: h2d_due_ms - 0.5,
+@@ -1583,6 +1596,7 @@ mod tests {
+                         session_id: None,
+                         images: Vec::new(),
+                         kv_hint: None,
++                        policy_class: None,
+                     },
+                 },
+                 CommandContext {
+@@ -1654,6 +1668,7 @@ mod tests {
+                         session_id: None,
+                         images: Vec::new(),
+                         kv_hint: None,
++                        policy_class: None,
+                     }),
+                     CommandContext {
+                         now_ms: 0.0,
+@@ -1712,6 +1727,7 @@ mod tests {
+                         session_id: None,
+                         images: Vec::new(),
+                         kv_hint: None,
++                        policy_class: None,
+                     },
+                 },
+                 CommandContext {
+@@ -1807,6 +1823,7 @@ mod tests {
+                         output_token_ids: None,
+                         session_id: None,
+                         kv_hint: None,
++                        policy_class: None,
+                     },
+                 },
+                 0.0,
+@@ -1858,6 +1875,7 @@ mod tests {
+                         output_token_ids: None,
+                         session_id: None,
+                         kv_hint: None,
++                        policy_class: None,
+                     },
+                 },
+                 now_ms,
+diff --git a/crates/core/src/engine/scheduler/sglang/tests.rs b/crates/core/src/engine/scheduler/sglang/tests.rs
+index c88f28944..91f0cb56a 100644
+--- a/crates/core/src/engine/scheduler/sglang/tests.rs
++++ b/crates/core/src/engine/scheduler/sglang/tests.rs
+@@ -2098,6 +2098,7 @@ mod core_behavior {
+                 session_id: None,
+                 images: Vec::new(),
+                 kv_hint: None,
++                policy_class: None,
+             });
+             sequence.extend_from_slice(&planned);
+ 
+@@ -2399,6 +2400,7 @@ mod core_behavior {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+ 
+         let pass = core.execute_pass_internal(None, 0.0);
+@@ -2546,6 +2548,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+ 
+         let mut collector = crate::engine::trace::TraceCollector::default();
+@@ -2579,6 +2582,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+ 
+         let mut collector = crate::engine::trace::TraceCollector::default();
+@@ -2598,6 +2602,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+ 
+         // Pass 2: SGLang runs the r2 prefill batch alone ("run prefill first if possible");
+@@ -2636,6 +2641,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+         let mut collector = crate::engine::trace::TraceCollector::default();
+         let pass1 = core.execute_pass(&mut collector, 0.0);
+@@ -2659,6 +2665,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+         let pass2 = core.execute_pass(&mut collector, pass1.end_ms);
+         assert_eq!(
+@@ -2709,6 +2716,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+ 
+         let mut collector = crate::engine::trace::TraceCollector::default();
+@@ -2725,6 +2733,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+ 
+         let pass2 = core.execute_pass(&mut collector, pass1.end_ms);
+@@ -2938,6 +2947,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+         core.receive(DirectRequest {
+             tokens: (100..108).collect(),
+@@ -2948,6 +2958,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+ 
+         let mut collector = crate::engine::trace::TraceCollector::default();
+@@ -2995,6 +3006,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+         core.receive(DirectRequest {
+             tokens: (100..112).collect(), // prompt_len = 12
+@@ -3005,6 +3017,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+ 
+         let mut collector = crate::engine::trace::TraceCollector::default();
+@@ -3050,6 +3063,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+ 
+         let mut collector = crate::engine::trace::TraceCollector::default();
+@@ -3123,6 +3137,7 @@ mod forward_pass_metrics {
+                 session_id: None,
+                 images: Vec::new(),
+                 kv_hint: None,
++                policy_class: None,
+             });
+         }
+         // Pass 1 admits r1 only (r2 needs its full output reserved); r2 is admitted on the next
+@@ -3139,6 +3154,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+ 
+         let mut now = first.end_ms;
+@@ -3217,6 +3233,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+         let mut collector = crate::engine::trace::TraceCollector::default();
+         for _ in 0..16 {
+@@ -3249,6 +3266,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+         let mut collector = crate::engine::trace::TraceCollector::default();
+         let pass = core.execute_pass(&mut collector, now);
+@@ -3284,6 +3302,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+         let available_before = core.kv_manager.cache().available_tokens();
+         let mut collector = crate::engine::trace::TraceCollector::default();
+@@ -3323,6 +3342,7 @@ mod forward_pass_metrics {
+                 session_id: None,
+                 images: Vec::new(),
+                 kv_hint: None,
++                policy_class: None,
+             });
+         }
+         let mut collector = crate::engine::trace::TraceCollector::default();
+@@ -3352,6 +3372,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+         let mut collector = crate::engine::trace::TraceCollector::default();
+         let pass1 = core.execute_pass(&mut collector, 0.0);
+@@ -3409,6 +3430,7 @@ mod forward_pass_metrics {
+                 session_id: None,
+                 images: Vec::new(),
+                 kv_hint: None,
++                policy_class: None,
+             });
+         }
+         let available_before = core.kv_manager.cache().available_tokens();
+@@ -3447,6 +3469,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+         let mut collector = crate::engine::trace::TraceCollector::default();
+         let pass1 = core.execute_pass(&mut collector, 0.0);
+@@ -3519,6 +3542,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+         core.receive(DirectRequest {
+             tokens: (100..104).collect(),
+@@ -3529,6 +3553,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+ 
+         // Run several passes to build up KV pressure
+@@ -3546,6 +3571,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+ 
+         // Run more passes — at some point retraction should occur
+diff --git a/crates/core/src/engine/scheduler/vllm/core.rs b/crates/core/src/engine/scheduler/vllm/core.rs
+index 82ee90a92..61e847bdf 100644
+--- a/crates/core/src/engine/scheduler/vllm/core.rs
++++ b/crates/core/src/engine/scheduler/vllm/core.rs
+@@ -69,6 +69,8 @@ pub(crate) struct VllmRequestState {
+     /// Cleared on preemption: recomputation has no draft IDs to verify.
+     drafts_ready: bool,
+     pub(crate) num_preemptions: usize,
++    /// Index of the request's policy class under `class_scheduling` (0 is highest); 0 when off.
++    pub(crate) class_rank: usize,
+     /// Prefix tokens found cached at first admission (set once: a preempted
+     /// request re-probes against a cache warmed by its own blocks, which
+     /// would inflate the value).
+@@ -152,6 +154,8 @@ pub(crate) struct SchedulerState {
+     pub(crate) preemptions_total: u64,
+     queued_stats: QueueStats,
+     queued_lengths: FxHashMap<Uuid, QueuedLength>,
++    /// `class_scheduling` is on: the waiting queue is kept in (class rank, arrival) order.
++    class_ordered: bool,
+     #[cfg(test)]
+     connector_waiting_selections: usize,
+ }
+@@ -240,18 +244,62 @@ impl SchedulerState {
+             .unwrap_or_default()
+     }
+ 
++    /// Under `class_scheduling`, the index at which a request of class `rank` joins `queue`:
++    /// behind every live request of its class or a higher one (`front_of_class` false), or ahead
++    /// of every live request of its own class (`front_of_class` true, for a preempted request).
++    /// The queue stays in (class rank, arrival) order, so admission still takes the head.
++    fn class_insert_index(
++        &self,
++        queue: &VecDeque<Uuid>,
++        rank: usize,
++        front_of_class: bool,
++        include_connector_waiting: bool,
++    ) -> usize {
++        queue
++            .iter()
++            .position(|queued| {
++                let is_live = self.waiting_members.contains(queued)
++                    || (include_connector_waiting && self.connector_waiting_members.contains(queued));
++                is_live
++                    && self.requests.get(queued).is_some_and(|request| {
++                        if front_of_class {
++                            request.class_rank >= rank
++                        } else {
++                            request.class_rank > rank
++                        }
++                    })
++            })
++            .unwrap_or(queue.len())
++    }
++
++    fn class_rank_of(&self, uuid: Uuid) -> usize {
++        self.requests
++            .get(&uuid)
++            .map_or(0, |request| request.class_rank)
++    }
++
+     fn push_waiting(&mut self, uuid: Uuid) {
+         debug_assert!(!self.connector_waiting_members.contains(&uuid));
+         if !self.waiting_members.insert(uuid) {
+             return;
+         }
+         self.record_queued_length(uuid);
+-        self.waiting.push_back(uuid);
+-        if self
++        let prebuilt = self
+             .requests
+             .get(&uuid)
+-            .is_some_and(VllmRequestState::prompt_is_prebuilt)
+-        {
++            .is_some_and(VllmRequestState::prompt_is_prebuilt);
++        if self.class_ordered {
++            let rank = self.class_rank_of(uuid);
++            let index = self.class_insert_index(&self.waiting, rank, false, false);
++            self.waiting.insert(index, uuid);
++            if prebuilt {
++                let index = self.class_insert_index(&self.materialized_waiting, rank, false, true);
++                self.materialized_waiting.insert(index, uuid);
++            }
++            return;
++        }
++        self.waiting.push_back(uuid);
++        if prebuilt {
+             self.materialized_waiting.push_back(uuid);
+         }
+     }
+@@ -317,6 +365,20 @@ impl SchedulerState {
+             return;
+         }
+         self.record_queued_length(uuid);
++        if self.class_ordered {
++            let rank = self.class_rank_of(uuid);
++            let index = self.class_insert_index(&self.waiting, rank, true, false);
++            self.waiting.insert(index, uuid);
++            if self
++                .requests
++                .get(&uuid)
++                .is_some_and(VllmRequestState::prompt_is_prebuilt)
++            {
++                let index = self.class_insert_index(&self.materialized_waiting, rank, true, true);
++                self.materialized_waiting.insert(index, uuid);
++            }
++            return;
++        }
+         self.waiting.push_front(uuid);
+         if self
+             .requests
+@@ -647,6 +709,8 @@ pub(crate) struct VllmCore {
+     destination_holds: DestinationHolds<ReservedVllmDecode>,
+     active_destination_handoffs: ActiveHandoffRequests,
+     next_waiting_order: u64,
++    /// Preemptions made by `class_scheduling.preempt_max_rank` (a subset of all preemptions).
++    pub(crate) class_preemptions_total: u64,
+     capacity_generation: u64,
+     #[cfg(test)]
+     destination_reservation_attempts: usize,
+@@ -875,12 +939,16 @@ impl VllmCore {
+                     .expect("validated grouped cache capacity"),
+             ));
+         }
++        let class_ordered = args.class_scheduling.is_some();
+         Ok(Self {
+             kv_manager,
+             belady_oracle: None,
+             args,
+             dp_rank,
+-            state: SchedulerState::default(),
++            state: SchedulerState {
++                class_ordered,
++                ..SchedulerState::default()
++            },
+             speculative_sampler,
+             kv_event_buffer,
+             source_holds: SourceHolds::default(),
+@@ -888,6 +956,7 @@ impl VllmCore {
+             destination_holds: DestinationHolds::default(),
+             active_destination_handoffs: ActiveHandoffRequests::default(),
+             next_waiting_order: 0,
++            class_preemptions_total: 0,
+             capacity_generation: 0,
+             #[cfg(test)]
+             destination_reservation_attempts: 0,
+@@ -1371,6 +1440,11 @@ impl VllmCore {
+         waiting_order: u64,
+     ) -> VllmRequestState {
+         let uuid = request.uuid.unwrap_or_else(Uuid::new_v4);
++        let class_rank = self
++            .args
++            .class_scheduling
++            .as_ref()
++            .map_or(0, |c| c.rank_of(request.policy_class.as_deref()));
+         let prompt_len = request.tokens.len();
+         let requested_max_output_tokens = request.max_output_tokens;
+         let mut max_output_tokens = request.effective_max_output_tokens();
+@@ -1439,6 +1513,7 @@ impl VllmCore {
+             num_computed_tokens: 0,
+             drafts_ready: false,
+             num_preemptions: 0,
++            class_rank,
+             cached_prefix_tokens: None,
+             cached_tokens_signaled: false,
+             host_offload,
+@@ -1829,6 +1904,9 @@ impl VllmCore {
+             adapter.note_retained(None, broken);
+         }
+         self.state.compact_running();
++        if self.class_preempt_for_waiting(now_ms) > 0 {
++            self.state.compact_running();
++        }
+         let mut token_budget = self.args.max_num_batched_tokens.unwrap_or(usize::MAX);
+         let cadence_step = self.wave_step.is_multiple_of(
+             u64::try_from(self.args.prefill_schedule_interval)
+@@ -2482,6 +2560,17 @@ impl VllmCore {
+             policy::report_no_preemption_violation();
+             return None;
+         }
++        let selected = if self.args.class_scheduling.is_some() {
++            // Class order: the lowest class first, the newest within it (as the JS model does).
++            self.class_victim(None)
++        } else {
++            self.fcfs_victim()
++        };
++        self.preempt_selected(selected?, at_ms)
++    }
++
++    /// The vLLM victim: the newest (LIFO) or oldest (FIFO) running request.
++    fn fcfs_victim(&self) -> Option<Uuid> {
+         let running_len = self.state.running.len();
+         let mut selected = None;
+         for offset in 0..running_len {
+@@ -2504,7 +2593,102 @@ impl VllmCore {
+             selected = Some(uuid);
+             break;
+         }
+-        let selected = selected?;
++        selected
++    }
++
++    /// Under `class_scheduling`, the running request to preempt: the lowest class, the newest
++    /// within it. With `below`, only requests ranked strictly below that rank qualify.
++    fn class_victim(&self, below: Option<usize>) -> Option<Uuid> {
++        let mut best: Option<(usize, Uuid)> = None;
++        for uuid in self.state.running.iter().rev().copied() {
++            let Some(request) = self.state.requests.get(&uuid) else {
++                continue;
++            };
++            if !self.state.running_members.contains(&uuid) || request.status != RequestStatus::Running {
++                continue;
++            }
++            if below.is_some_and(|rank| request.class_rank <= rank) {
++                continue;
++            }
++            if best.is_none_or(|(rank, _)| request.class_rank > rank) {
++                best = Some((request.class_rank, uuid));
++            }
++        }
++        best.map(|(_, uuid)| uuid)
++    }
++
++    /// Before a pass, start each waiting request ranked at or above `preempt_max_rank` by taking
++    /// running requests ranked below it off the engine (lowest class, newest first) until it fits
++    /// in free blocks and a sequence slot, as the JS model's `preemptFor`. A request that would
++    /// not fit even with every lower-class request gone is left waiting. Returns preemptions made.
++    fn class_preempt_for_waiting(&mut self, at_ms: f64) -> usize {
++        let Some(max_rank) = self
++            .args
++            .class_scheduling
++            .as_ref()
++            .and_then(|c| c.preempt_max_rank)
++        else {
++            return 0;
++        };
++        if !policy::allows_preemption(self.args.scheduling_policy()) {
++            return 0;
++        }
++        let block_size = self.args.block_size.max(1);
++        let total_blocks = self.args.num_gpu_blocks;
++        let max_seqs = self.args.max_num_seqs.unwrap_or(usize::MAX);
++        let candidates: Vec<(Uuid, usize)> = self
++            .state
++            .waiting
++            .iter()
++            .copied()
++            .filter(|uuid| self.state.waiting_members.contains(uuid))
++            .filter_map(|uuid| {
++                let request = self.state.requests.get(&uuid)?;
++                (request.class_rank <= max_rank)
++                    .then(|| (uuid, (request.sequence.len() + 1).div_ceil(block_size)))
++            })
++            .collect();
++        let mut made = 0;
++        for (_uuid, need) in candidates {
++            let mut pinned = 0usize;
++            let mut lower = 0usize;
++            for running in self.state.running.iter() {
++                let Some(request) = self.state.requests.get(running) else {
++                    continue;
++                };
++                if !self.state.running_members.contains(running) || request.status != RequestStatus::Running {
++                    continue;
++                }
++                if request.class_rank <= max_rank {
++                    pinned += request.sequence.lease.resident_block_count();
++                } else {
++                    lower += 1;
++                }
++            }
++            if pinned + need > total_blocks
++                || (lower == 0 && self.state.running_members.len() >= max_seqs)
++            {
++                continue;
++            }
++            loop {
++                let free = total_blocks.saturating_sub(self.kv_manager.num_active_blocks());
++                if free >= need && self.state.running_members.len() < max_seqs {
++                    break;
++                }
++                let Some(victim) = self.class_victim(Some(max_rank)) else {
++                    return made;
++                };
++                if self.preempt_selected(victim, at_ms).is_none() {
++                    return made;
++                }
++                self.class_preemptions_total += 1;
++                made += 1;
++            }
++        }
++        made
++    }
++
++    fn preempt_selected(&mut self, selected: Uuid, at_ms: f64) -> Option<PreemptedRequest> {
+         let state_before = self.pressure_state();
+         let request_active_blocks_before = self
+             .state
+diff --git a/crates/core/src/engine/scheduler/vllm/policy/tests.rs b/crates/core/src/engine/scheduler/vllm/policy/tests.rs
+index 5776ca0cb..063eb2336 100644
+--- a/crates/core/src/engine/scheduler/vllm/policy/tests.rs
++++ b/crates/core/src/engine/scheduler/vllm/policy/tests.rs
+@@ -1039,6 +1039,7 @@ mod trtllm {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+     }
+ 
+diff --git a/crates/core/src/engine/scheduler/vllm/tests.rs b/crates/core/src/engine/scheduler/vllm/tests.rs
+index c52abd3d7..95629a6a1 100644
+--- a/crates/core/src/engine/scheduler/vllm/tests.rs
++++ b/crates/core/src/engine/scheduler/vllm/tests.rs
+@@ -1975,6 +1975,7 @@ mod core_behavior {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+ 
+         let mut collector = crate::engine::trace::TraceCollector::default();
+@@ -2026,6 +2027,7 @@ mod core_behavior {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+         core.receive(DirectRequest {
+             tokens: (100..108).collect(),
+@@ -2036,6 +2038,7 @@ mod core_behavior {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+ 
+         let mut collector = crate::engine::trace::TraceCollector::default();
+@@ -2095,6 +2098,7 @@ mod core_behavior {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+         core.receive(DirectRequest {
+             tokens: (100..108).collect(),
+@@ -2105,6 +2109,7 @@ mod core_behavior {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+ 
+         let mut collector = crate::engine::trace::TraceCollector::default();
+@@ -2144,6 +2149,7 @@ mod core_behavior {
+                 session_id: None,
+                 images: Vec::new(),
+                 kv_hint: None,
++                policy_class: None,
+             });
+         }
+ 
+@@ -2206,6 +2212,7 @@ mod core_behavior {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+ 
+         let mut collector = crate::engine::trace::TraceCollector::default();
+@@ -2232,6 +2239,7 @@ mod core_behavior {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+ 
+         let mut collector = crate::engine::trace::TraceCollector::default();
+@@ -2277,6 +2285,7 @@ mod core_behavior {
+                 session_id: None,
+                 images: Vec::new(),
+                 kv_hint: None,
++                policy_class: None,
+             });
+         }
+ 
+@@ -2325,6 +2334,7 @@ mod core_behavior {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+         core.receive(DirectRequest {
+             tokens: (100..112).collect(),
+@@ -2335,6 +2345,7 @@ mod core_behavior {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+         core.receive(DirectRequest {
+             tokens: (200..204).collect(),
+@@ -2345,6 +2356,7 @@ mod core_behavior {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+ 
+         let mut collector = crate::engine::trace::TraceCollector::default();
+@@ -2418,6 +2430,7 @@ mod core_behavior {
+                 session_id: None,
+                 images: Vec::new(),
+                 kv_hint: None,
++                policy_class: None,
+             });
+         }
+ 
+@@ -2450,6 +2463,7 @@ mod core_behavior {
+                 session_id: None,
+                 images: Vec::new(),
+                 kv_hint: None,
++                policy_class: None,
+             });
+         }
+ 
+@@ -2488,6 +2502,7 @@ mod core_behavior {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+         core.receive(DirectRequest {
+             tokens: (100..104).collect(),
+@@ -2498,6 +2513,7 @@ mod core_behavior {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+ 
+         let mut collector = crate::engine::trace::TraceCollector::default();
+@@ -2592,6 +2608,7 @@ mod core_behavior {
+                 session_id: None,
+                 images: Vec::new(),
+                 kv_hint: None,
++                policy_class: None,
+             });
+             core.execute_pass(&mut collector, 0.0);
+             assert!(core.is_empty());
+@@ -2605,6 +2622,7 @@ mod core_behavior {
+                 session_id: None,
+                 images: Vec::new(),
+                 kv_hint: None,
++                policy_class: None,
+             });
+             let pass = core.execute_pass(&mut collector, 1.0);
+             let fpm = pass.fpm.expect("forward-pass metrics should be present");
+@@ -2649,6 +2667,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+ 
+         let mut collector = crate::engine::trace::TraceCollector::default();
+@@ -2679,6 +2698,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+ 
+         let mut collector = crate::engine::trace::TraceCollector::default();
+@@ -2700,6 +2720,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+ 
+         // Pass 2: r1 decode + r2 prefill (mixed batch)
+@@ -2732,6 +2753,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+ 
+         let mut collector = crate::engine::trace::TraceCollector::default();
+@@ -2774,6 +2796,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+ 
+         let mut collector = crate::engine::trace::TraceCollector::default();
+@@ -2821,6 +2844,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+         core.receive(DirectRequest {
+             tokens: (100..108).collect(),
+@@ -2831,6 +2855,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+ 
+         let mut collector = crate::engine::trace::TraceCollector::default();
+@@ -2871,6 +2896,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+         core.receive(DirectRequest {
+             tokens: (100..112).collect(), // prompt_len = 12
+@@ -2881,6 +2907,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+ 
+         let mut collector = crate::engine::trace::TraceCollector::default();
+@@ -2922,6 +2949,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+ 
+         let mut collector = crate::engine::trace::TraceCollector::default();
+@@ -2994,6 +3022,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+ 
+         // Prefill r1 and decode a few tokens to build up KV
+@@ -3011,6 +3040,7 @@ mod forward_pass_metrics {
+             session_id: None,
+             images: Vec::new(),
+             kv_hint: None,
++            policy_class: None,
+         });
+ 
+         // This pass should trigger preemption
+@@ -3206,3 +3236,121 @@ mod forward_pass_metrics {
+         );
+     }
+ }
++
++mod class_scheduling {
++    use super::*;
++    use crate::engine::ClassSchedulingConfig;
++
++    fn args(preempt_max_rank: Option<usize>, classes: bool) -> MockEngineArgs {
++        MockEngineArgs::builder()
++            .block_size(4)
++            .num_gpu_blocks(64)
++            .max_num_batched_tokens(Some(64))
++            .max_num_seqs(Some(1))
++            .enable_chunked_prefill(true)
++            .enable_prefix_caching(false)
++            .speedup_ratio(0.0)
++            .class_scheduling(classes.then(|| ClassSchedulingConfig {
++                order: vec!["priority".into(), "standard".into(), "batch".into()],
++                preempt_max_rank,
++            }))
++            .build()
++            .unwrap()
++    }
++
++    fn submit(core: &mut VllmCore, id: u128, class: &str) -> Uuid {
++        let uuid = Uuid::from_u128(id);
++        core.receive(DirectRequest {
++            tokens: vec![id as u32; 8],
++            max_output_tokens: 32,
++            uuid: Some(uuid),
++            policy_class: Some(class.to_string()),
++            ..Default::default()
++        });
++        uuid
++    }
++
++    fn running(core: &VllmCore, uuid: Uuid) -> bool {
++        core.state
++            .requests
++            .get(&uuid)
++            .is_some_and(|r| r.status == RequestStatus::Running)
++    }
++
++    #[test]
++    fn waiting_queue_is_served_in_class_order_then_arrival() {
++        let mut core = VllmCore::new(args(None, true));
++        let batch = submit(&mut core, 1, "batch");
++        let standard = submit(&mut core, 2, "standard");
++        let priority = submit(&mut core, 3, "priority");
++        let unknown = submit(&mut core, 4, "other");
++        let mut collector = crate::engine::trace::TraceCollector::default();
++        core.execute_pass(&mut collector, 0.0);
++        assert!(running(&core, priority));
++        assert!(!running(&core, standard) && !running(&core, batch) && !running(&core, unknown));
++        let order: Vec<Uuid> = core
++            .state
++            .waiting
++            .iter()
++            .copied()
++            .filter(|u| core.state.requests.get(u).is_some_and(|r| r.status != RequestStatus::Running))
++            .collect();
++        assert_eq!(order, vec![standard, batch, unknown]);
++    }
++
++    #[test]
++    fn without_class_scheduling_the_queue_stays_first_come_first_served() {
++        let mut core = VllmCore::new(args(None, false));
++        let batch = submit(&mut core, 1, "batch");
++        let priority = submit(&mut core, 3, "priority");
++        let mut collector = crate::engine::trace::TraceCollector::default();
++        core.execute_pass(&mut collector, 0.0);
++        assert!(running(&core, batch));
++        assert!(!running(&core, priority));
++    }
++
++    #[test]
++    fn priority_preempts_a_running_lower_class_when_there_is_no_room() {
++        let mut core = VllmCore::new(args(Some(0), true));
++        let batch = submit(&mut core, 1, "batch");
++        let mut collector = crate::engine::trace::TraceCollector::default();
++        let pass = core.execute_pass(&mut collector, 0.0);
++        assert!(running(&core, batch));
++        let priority = submit(&mut core, 2, "priority");
++        core.execute_pass(&mut collector, pass.end_ms);
++        assert!(running(&core, priority));
++        assert!(!running(&core, batch));
++        assert_eq!(core.state.requests[&batch].num_preemptions, 1);
++        assert_eq!(core.class_preemptions_total, 1);
++    }
++
++    #[test]
++    fn standard_does_not_preempt_under_preempt_lower() {
++        let mut core = VllmCore::new(args(Some(0), true));
++        let batch = submit(&mut core, 1, "batch");
++        let mut collector = crate::engine::trace::TraceCollector::default();
++        let pass = core.execute_pass(&mut collector, 0.0);
++        let standard = submit(&mut core, 2, "standard");
++        core.execute_pass(&mut collector, pass.end_ms);
++        assert!(running(&core, batch));
++        assert!(!running(&core, standard));
++        assert_eq!(core.class_preemptions_total, 0);
++    }
++
++    #[test]
++    fn batch_preempt_lets_standard_take_room_from_batch_only() {
++        let mut core = VllmCore::new(args(Some(1), true));
++        let batch = submit(&mut core, 1, "batch");
++        let mut collector = crate::engine::trace::TraceCollector::default();
++        let pass = core.execute_pass(&mut collector, 0.0);
++        let standard = submit(&mut core, 2, "standard");
++        let pass = core.execute_pass(&mut collector, pass.end_ms);
++        assert!(running(&core, standard));
++        assert!(!running(&core, batch));
++        // A priority request cannot take room from standard under rank 1: both rank at or above it.
++        let priority = submit(&mut core, 3, "priority");
++        core.execute_pass(&mut collector, pass.end_ms);
++        assert!(running(&core, standard));
++        assert!(!running(&core, priority));
++    }
++}
+diff --git a/crates/core/src/replay/components/engine.rs b/crates/core/src/replay/components/engine.rs
+index a939436bf..2714add8d 100644
+--- a/crates/core/src/replay/components/engine.rs
++++ b/crates/core/src/replay/components/engine.rs
+@@ -1373,6 +1373,7 @@ fn native_request(request: DirectRequest, kv_hint: Option<KvHintSource>) -> Resu
+             .and_then(|context| context.session_id().map(str::to_owned)),
+         images: request.images,
+         kv_hint,
++        policy_class: request.policy_class,
+     })
+ }
+ 
+diff --git a/crates/core/src/replay/disagg.rs b/crates/core/src/replay/disagg.rs
+index 620f962c0..fb3fa16e0 100644
+--- a/crates/core/src/replay/disagg.rs
++++ b/crates/core/src/replay/disagg.rs
+@@ -4089,6 +4089,7 @@ fn direct_to_native(
+             .and_then(|context| context.session_id().map(str::to_owned)),
+         images: request.images,
+         kv_hint,
++        policy_class: request.policy_class,
+     })
+ }
+ 
+diff --git a/crates/core/tests/engine.rs b/crates/core/tests/engine.rs
+index 3319e21ec..4ab197187 100644
+--- a/crates/core/tests/engine.rs
++++ b/crates/core/tests/engine.rs
+@@ -520,6 +520,7 @@ fn submit_interval_request(
+                     session_id: None,
+                     images: Vec::new(),
+                     kv_hint: None,
++                    policy_class: None,
+                 }),
+             ),
+             now_ms,
+@@ -602,6 +603,7 @@ fn sglang_split_prefixes_remain_reusable_across_cache_pressure() {
+                         session_id: None,
+                         images: Vec::new(),
+                         kv_hint: None,
++                        policy_class: None,
+                     }),
+                 ),
+                 now_ms,
+@@ -658,6 +660,7 @@ fn sglang_prefill_packs_remaining_pages_and_completes_partial_chunks() {
+                             session_id: None,
+                             images: Vec::new(),
+                             kv_hint: None,
++                            policy_class: None,
+                         }),
+                     ),
+                     now_ms,
+@@ -1765,6 +1768,7 @@ fn native_images_require_sglang_even_with_vision_timing(
+                     embedding_bytes: 128,
+                 }],
+                 kv_hint: None,
++                policy_class: None,
+             }),
+         ),
+         0.0,
+diff --git a/crates/core/tests/host_offload_scopes.rs b/crates/core/tests/host_offload_scopes.rs
+index 86e47d16c..2c5e79410 100644
+--- a/crates/core/tests/host_offload_scopes.rs
++++ b/crates/core/tests/host_offload_scopes.rs
+@@ -456,6 +456,7 @@ fn serve_prompt(engine: &mut Engine, id: u128, now_ms: &mut f64) -> usize {
+                     output_token_ids: None,
+                     session_id: None,
+                     kv_hint: None,
++                    policy_class: None,
+                 }),
+             ),
+             *now_ms,

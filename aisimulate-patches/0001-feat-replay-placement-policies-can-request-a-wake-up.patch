@@ -1,0 +1,128 @@
+From 1e919e15db24a5b645b9fb90522c7041fa43db35 Mon Sep 17 00:00:00 2001
+From: callanjfox <callanf@nvidia.com>
+Date: Wed, 11 Nov 2026 19:03:24 +0800
+Subject: [PATCH 01/38] feat(replay): placement policies can request a wake-up
+ at a future replay time
+
+A dispatch gate's hold deadline or a client retry has no engine event to wake on.
+PlacementPolicy::next_wakeup_ms (default None) lets the policy name the next time it
+has work to release; aggregated and disaggregated replay visit it and call
+advance_clock there. The crate version matches the published
+0.13.0-dev.202610290000000087 so Dynamo can [patch] it in.
+
+---
+ Cargo.lock                         |  2 +-
+ crates/core/Cargo.toml             |  2 +-
+ crates/core/src/replay/agg.rs      | 14 ++++++++++----
+ crates/core/src/replay/core/mod.rs |  7 +++++++
+ crates/core/src/replay/disagg.rs   | 12 ++++++++++++
+ crates/core/src/replay/replayer.rs |  4 ++++
+ 6 files changed, 35 insertions(+), 6 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index dba722be0..ce446df0e 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -33,7 +33,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "aisimulate-core"
+-version = "0.13.0"
++version = "0.13.0-dev.202610290000000087"
+ dependencies = [
+  "anyhow",
+  "bincode",
+diff --git a/crates/core/Cargo.toml b/crates/core/Cargo.toml
+index a91df855b..5a5d0df0d 100644
+--- a/crates/core/Cargo.toml
++++ b/crates/core/Cargo.toml
+@@ -4,7 +4,7 @@
+ [package]
+ name = "aisimulate-core"
+ description = "Engine-neutral inference simulation, deterministic replay, and performance modeling"
+-version = "0.13.0"
++version = "0.13.0-dev.202610290000000087"
+ edition.workspace = true
+ authors.workspace = true
+ license.workspace = true
+diff --git a/crates/core/src/replay/agg.rs b/crates/core/src/replay/agg.rs
+index e235774f7..6a6275234 100644
+--- a/crates/core/src/replay/agg.rs
++++ b/crates/core/src/replay/agg.rs
+@@ -561,10 +561,16 @@ where
+             next_event_ms
+         };
+         let next_internal_deadline_ms = choose_next_timestamp(
+-            self.engine.next_internal_deadline_ms(),
+-            self.encoder
+-                .as_ref()
+-                .and_then(EncoderPool::next_deadline_ms),
++            choose_next_timestamp(
++                self.engine.next_internal_deadline_ms(),
++                self.encoder
++                    .as_ref()
++                    .and_then(EncoderPool::next_deadline_ms),
++            ),
++            // A placement policy's own deadline (a dispatch gate's hold, a client retry).
++            self.placement
++                .next_wakeup_ms()
++                .filter(|&wakeup_ms| wakeup_ms > self.now_ms),
+         );
+         (
+             choose_next_timestamp(
+diff --git a/crates/core/src/replay/core/mod.rs b/crates/core/src/replay/core/mod.rs
+index 76cc5b8cf..5f12ca468 100644
+--- a/crates/core/src/replay/core/mod.rs
++++ b/crates/core/src/replay/core/mod.rs
+@@ -158,6 +158,13 @@ pub trait PlacementPolicy<Request> {
+     fn advance_clock(&mut self, _now_ms: f64) -> Result<Vec<Placement>> {
+         Ok(Vec::new())
+     }
++    /// The earliest replay time at which this policy has work to release without any other
++    /// event, such as a dispatch gate's hold deadline or a client retry. The replay visits it
++    /// and calls [`Self::advance_clock`] there, so a hold in an otherwise idle cluster still
++    /// wakes. `None` (the default) when every pending request waits on an engine event.
++    fn next_wakeup_ms(&self) -> Option<f64> {
++        None
++    }
+     fn cancel_pending(&mut self, request_id: Uuid) -> bool;
+     /// Discard all request state, including tentative placement state when
+     /// cancellation precedes engine dispatch.
+diff --git a/crates/core/src/replay/disagg.rs b/crates/core/src/replay/disagg.rs
+index 843e04868..620f962c0 100644
+--- a/crates/core/src/replay/disagg.rs
++++ b/crates/core/src/replay/disagg.rs
+@@ -2286,6 +2286,18 @@ where
+                 .as_ref()
+                 .and_then(EncoderPool::next_deadline_ms),
+         );
++        // A placement policy's own deadline (a dispatch gate's hold, a client retry).
++        let next_internal_deadline_ms = choose_next_timestamp(
++            next_internal_deadline_ms,
++            choose_next_timestamp(
++                self.prefill_placement
++                    .next_wakeup_ms()
++                    .filter(|&wakeup_ms| wakeup_ms > self.now_ms),
++                self.decode_placement
++                    .next_wakeup_ms()
++                    .filter(|&wakeup_ms| wakeup_ms > self.now_ms),
++            ),
++        );
+         (
+             choose_next_timestamp(
+                 choose_next_timestamp(next_arrival_ms, next_event_ms),
+diff --git a/crates/core/src/replay/replayer.rs b/crates/core/src/replay/replayer.rs
+index 1a8902bb0..5ce62f0f1 100644
+--- a/crates/core/src/replay/replayer.rs
++++ b/crates/core/src/replay/replayer.rs
+@@ -138,6 +138,10 @@ where
+         self.0.advance_clock(now_ms).map_err(placement_boundary)
+     }
+ 
++    fn next_wakeup_ms(&self) -> Option<f64> {
++        self.0.next_wakeup_ms()
++    }
++
+     fn request_terminal(
+         &mut self,
+         request_id: Uuid,

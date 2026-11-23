@@ -1,0 +1,250 @@
+From 01ece65fcc362b4d5657e3ee62d6fcdab85e070c Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Fri, 13 Nov 2026 09:30:03 +1000
+Subject: [PATCH 25/38] native_host_offload.vllm_recency (off by default): G2
+ ranks blocks as vLLM's offloading LRU does: a store or KVCR landing is ranked
+ at admission in request order (LRUCachePolicy.insert from prepare_store), and
+ pins and completions never re-rank (prepare_load and complete_load,
+ complete_store re-enter through mark_evictable at the block's rank); touches
+ re-rank any held block; unit tests
+
+---
+ crates/core/src/engine/config.rs              | 11 +++
+ .../core/src/engine/host_offload/registry.rs  |  2 +
+ crates/core/src/engine/host_offload/tier.rs   | 90 +++++++++++++++++--
+ 3 files changed, 96 insertions(+), 7 deletions(-)
+
+diff --git a/crates/core/src/engine/config.rs b/crates/core/src/engine/config.rs
+index 60877aa74..4c887bfec 100644
+--- a/crates/core/src/engine/config.rs
++++ b/crates/core/src/engine/config.rs
+@@ -550,6 +550,16 @@ pub struct NativeHostOffloadConfig {
+     /// copy. Private (`dp_rank_local`) G2 only.
+     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+     pub write_back: bool,
++    /// Rank G2 blocks as vLLM's CPU offloading LRU does (`vllm/v1/kv_offload/cpu/policies/lru.py`
++    /// `LRUCachePolicy`; `cpu/manager.py` `prepare_store`, `complete_store`, `prepare_load`,
++    /// `complete_load`): a block takes its rank when it is admitted (a store or a KVCR landing is
++    /// reserved, in request order), and only touches change it. Pins and transfer completions never
++    /// re-rank: a store's completion and a load's or pull's unpin leave the block where it was
++    /// (`mark_evictable` re-enters it at its rank). Off by default: a block joins the LRU when its
++    /// transfer completes, and completions and unpins make their blocks the newest, in key order.
++    /// Private (`dp_rank_local`) G2 only.
++    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
++    pub vllm_recency: bool,
+ }
+ 
+ impl NativeHostOffloadConfig {
+@@ -564,6 +574,7 @@ impl NativeHostOffloadConfig {
+             latency_to_first_byte_ms: 0.0,
+             kv_layout_id: None,
+             write_back: false,
++            vllm_recency: false,
+         }
+     }
+ 
+diff --git a/crates/core/src/engine/host_offload/registry.rs b/crates/core/src/engine/host_offload/registry.rs
+index e70ccb1ab..f2c4fbbd9 100644
+--- a/crates/core/src/engine/host_offload/registry.rs
++++ b/crates/core/src/engine/host_offload/registry.rs
+@@ -53,6 +53,7 @@ impl G2Registry {
+                         contract.shared_d2h_bandwidth_gbps,
+                         contract.shared_h2d_bandwidth_gbps,
+                     )),
++                    vllm_recency: false,
+                 })?));
+                 state.pool = Some((contract, Arc::clone(&tier)));
+                 tier
+@@ -133,6 +134,7 @@ impl HostClient {
+                     capacity_blocks: config.num_host_blocks,
+                     block_bytes,
+                     shared_gbps: None,
++                    vllm_recency: config.vllm_recency,
+                 })?;
+                 tier.register(0, link)?;
+                 Ok(Self {
+diff --git a/crates/core/src/engine/host_offload/tier.rs b/crates/core/src/engine/host_offload/tier.rs
+index 6d4b006ea..505de793d 100644
+--- a/crates/core/src/engine/host_offload/tier.rs
++++ b/crates/core/src/engine/host_offload/tier.rs
+@@ -53,6 +53,8 @@ pub(crate) struct HostTierConfig {
+     /// Aggregate `(D2H, H2D)` caps of a cluster-shared pool in decimal GB/s.
+     /// `None` selects one private owner with FIFO lanes.
+     pub(crate) shared_gbps: Option<(f64, f64)>,
++    /// `native_host_offload.vllm_recency`: rank at admission; pins and completions never re-rank.
++    pub(crate) vllm_recency: bool,
+ }
+ 
+ /// One owner's access link. Zero bandwidth is instantaneous.
+@@ -727,6 +729,12 @@ impl HostTier {
+                     )
+                     .is_none()
+             );
++            // vllm_recency: a block takes its rank when it is admitted, in request order
++            // (`LRUCachePolicy.insert` from `prepare_store`); it stays unevictable until resident.
++            if self.config.vllm_recency {
++                let entry = self.entries.get_mut(key).unwrap();
++                self.lru.touch(&mut entry.lru_slot, *key);
++            }
+         }
+         if kind == Kind::Store {
+             self.observe(HostOffloadObservation {
+@@ -813,7 +821,9 @@ impl HostTier {
+                 // A KVCR source pin that keeps recency leaves its block linked.
+                 .find(|(_, key)| {
+                     !plan.protected.contains(key)
+-                        && self.entries.get(key).is_some_and(|entry| entry.load_pins == 0)
++                        && self.entries.get(key).is_some_and(|entry| {
++                            entry.load_pins == 0 && entry.state == EntryState::Resident
++                        })
+                 })
+             else {
+                 return false;
+@@ -936,7 +946,9 @@ impl HostTier {
+             assert_eq!(entry.state, EntryState::PendingStore { transfer_id: id });
+             entry.state = EntryState::Resident;
+             entry.kvcr_origin = kvcr_origin;
+-            if entry.load_pins == 0 {
++            // vllm_recency: a landing keeps the rank its reservation took (`complete_store`
++            // re-enters a chunk at its rank through `mark_evictable`).
++            if entry.load_pins == 0 && (entry.lru_slot.is_none() || !self.config.vllm_recency) {
+                 self.lru.touch(&mut entry.lru_slot, *key);
+             }
+         }
+@@ -969,8 +981,9 @@ impl HostTier {
+         );
+         let transfer = self.transfers.remove(&id).unwrap();
+         for key in transfer.blocks {
+-            let entry = self.entries.remove(&key).unwrap();
++            let mut entry = self.entries.remove(&key).unwrap();
+             assert_eq!(entry.load_pins, 0);
++            self.lru.remove(&mut entry.lru_slot);
+             self.meta.remove(&key);
+             self.forget_owner(key);
+         }
+@@ -1008,7 +1021,9 @@ impl HostTier {
+                 .load_pins
+                 .checked_add(1)
+                 .expect("host pin count overflow");
+-            self.lru.remove(&mut entry.lru_slot);
++            if !self.config.vllm_recency {
++                self.lru.remove(&mut entry.lru_slot);
++            }
+         }
+     }
+ 
+@@ -1171,9 +1186,14 @@ impl HostTier {
+     /// Apply framework-defined recency order. Not-ready or pinned blocks are
+     /// outside vLLM's evictable LRU and ignore ordinary touches.
+     pub(crate) fn touch(&mut self, key: HostBlockKey) {
++        let vllm_recency = self.config.vllm_recency;
+         if let Some(entry) = self.entries.get_mut(&key)
+-            && entry.state == EntryState::Resident
+-            && entry.load_pins == 0
++            && (if vllm_recency {
++                // `LRUCachePolicy.touch` re-ranks any chunk it holds, pinned or still being written.
++                entry.lru_slot.is_some()
++            } else {
++                entry.state == EntryState::Resident && entry.load_pins == 0
++            })
+         {
+             self.lru.touch(&mut entry.lru_slot, key);
+         }
+@@ -1182,11 +1202,16 @@ impl HostTier {
+     /// Make blocks that became evictable together the newest, in key order.
+     fn touch_cohort(&mut self, keys: &mut [HostBlockKey]) {
+         keys.sort_unstable();
++        let keep = self.config.vllm_recency;
+         for key in keys {
+             let entry = self
+                 .entries
+                 .get_mut(key)
+                 .expect("evictable host block disappeared");
++            // vllm_recency: a completion or unpin re-enters a block at its rank (`mark_evictable`).
++            if keep && entry.lru_slot.is_some() {
++                continue;
++            }
+             self.lru.touch(&mut entry.lru_slot, *key);
+         }
+     }
+@@ -1221,7 +1246,8 @@ impl HostTier {
+                 .entries
+                 .get_mut(key)
+                 .expect("validated host load source disappeared");
+-            if entry.load_pins == 0 {
++            // vllm_recency: `prepare_load` marks a chunk non-evictable without changing its rank.
++            if entry.load_pins == 0 && !self.config.vllm_recency {
+                 self.lru.remove(&mut entry.lru_slot);
+             }
+             entry.load_pins = entry
+@@ -1717,6 +1743,7 @@ pub(crate) mod tests {
+             capacity_blocks,
+             block_bytes: 1_000_000,
+             shared_gbps: None,
++            vllm_recency: false,
+         })
+         .unwrap();
+         tier.register(
+@@ -2270,6 +2297,54 @@ pub(crate) mod tests {
+         assert_eq!(tier.lookup(key(2)), Lookup::Miss);
+     }
+ 
++    /// `native_host_offload.vllm_recency`, as vLLM's `LRUCachePolicy`.
++    fn vllm_tier(capacity_blocks: usize) -> HostTier {
++        let mut tier = tier(capacity_blocks);
++        tier.config.vllm_recency = true;
++        tier
++    }
++
++    #[test]
++    fn vllm_recency_ranks_a_store_at_admission_and_completion_keeps_the_rank() {
++        // `prepare_store` inserts in request order; `complete_store` re-enters at that rank.
++        let mut tier = vllm_tier(4);
++        let now = make_resident(&mut tier, &[key(2), key(1)], 0.0);
++        let StoreOutcome::Prepared { transfer_id, .. } =
++            tier.prepare_store(C, request_id(), &[key(3)], None, now)
++        else {
++            panic!("absent block should store")
++        };
++        tier.touch(key(2));
++        // `3` was ranked at admission, before the touch; still pending, it is not a victim.
++        assert_eq!(tier.lru.order(), [key(1), key(3), key(2)]);
++        assert_eq!(tier.submit_prepared_stores(C, now), 1);
++        let deadline = tier.transfer_deadline(transfer_id).unwrap();
++        tier.tick(C, deadline);
++        assert_eq!(tier.lru.order(), [key(1), key(3), key(2)]);
++    }
++
++    #[test]
++    fn vllm_recency_keeps_a_load_pinned_block_at_its_rank() {
++        // `prepare_load` makes a chunk non-evictable without moving it; when the load ends
++        // `mark_evictable` re-enters it at its rank. Off, it re-enters as the newest.
++        let mut tier = vllm_tier(3);
++        let now = make_resident(&mut tier, &[key(1), key(2)], 0.0);
++        let LoadOutcome::Queued(load) = tier.schedule_load(C, request_id(), &[key(1)], now, now)
++        else {
++            panic!("resident block should load")
++        };
++        assert_eq!(tier.lru.order(), [key(1), key(2)]);
++        // `1` is the oldest but pinned: a store needing two blocks evicts `2`, not `1`.
++        assert!(matches!(
++            tier.prepare_store(C, request_id(), &[key(3), key(4)], None, now),
++            StoreOutcome::Prepared { .. }
++        ));
++        assert!(tier.is_resident(key(1)));
++        assert_eq!(tier.lookup(key(2)), Lookup::Miss);
++        assert!(tier.cancel_load(C, load, now, now));
++        assert_eq!(tier.lru.order(), [key(1), key(3), key(4)]);
++    }
++
+     #[test]
+     fn cancelled_pinned_batch_reenters_as_one_newer_cohort() {
+         let mut tier = tier(3);
+@@ -2383,6 +2458,7 @@ pub(crate) mod tests {
+             capacity_blocks,
+             block_bytes: 1_000_000,
+             shared_gbps: Some((shared_gbps, shared_gbps)),
++            vllm_recency: false,
+         })
+         .unwrap();
+         for client in [A, B] {

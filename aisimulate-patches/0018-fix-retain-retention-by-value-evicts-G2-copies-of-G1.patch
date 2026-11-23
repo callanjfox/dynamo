@@ -1,0 +1,32 @@
+From f0d309cc9798de970c2f9dee9b256dda049e108f Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Fri, 13 Nov 2026 00:24:48 +1000
+Subject: [PATCH 18/38] fix(retain): retention by value evicts G2 copies of
+ G1-resident blocks first only with write-back G2; with write-through such a
+ copy is never stored again, so evicting it lost the block and the rest of its
+ prefix chain (retain-short: hit 0.23 against 0.82) and the G1 walk slowed
+ every eviction
+
+---
+ crates/core/src/engine/scheduler/vllm/host_offload.rs | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/crates/core/src/engine/scheduler/vllm/host_offload.rs b/crates/core/src/engine/scheduler/vllm/host_offload.rs
+index 4826a9ab2..2eac01274 100644
+--- a/crates/core/src/engine/scheduler/vllm/host_offload.rs
++++ b/crates/core/src/engine/scheduler/vllm/host_offload.rs
+@@ -243,7 +243,13 @@ impl VllmHostOffloadAdapter {
+     ) -> HostTierHandle {
+         let retain = registry.lock().unwrap().retain_state();
+         self.host.lock().set_retain(retain);
+-        self.host.lock().set_g1_view(g1_view);
++        // Retention by value evicts first the G2 copies of blocks G1 still holds. That is safe only
++        // with write-back, where G1 stores a block in G2 when it evicts it; with write-through a
++        // dropped copy is never stored again, so the block (and the rest of its prefix chain) is
++        // lost once G1 evicts it. Write-through ranks by session value alone.
++        if self.write_back.is_some() {
++            self.host.lock().set_g1_view(g1_view);
++        }
+         self.kvcr = Some(super::kvcr::VllmKvcrAdapter::new(registry, rank));
+         self.host.tier_handle()
+     }

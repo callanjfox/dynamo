@@ -1,0 +1,245 @@
+# B0+lt (f47_tr4f_s_pq_cw_np_itl_lt_t90): the session scheduler's first example policy.
+# Per-class busy thresholds (priority skips the busy queue), the session scheduler gate with aging lobby order,
+# ITL-judged attainment, honest Retry-After estimates, the prefill budget and the standard-class target loop,
+# and forecast placement on the DeepSeek-V4-Pro TP4 B300 step table (lower-tier hits on).
+# Sized for 4 workers with 323 GB of host KV each: dram_tokens_per_worker = 323e9 / 4444 bytes per token.
+# engine_priority maps each class to routing.priority, which the mocker maps back to the engine's class
+# (mocker --engine-priority with the same map, --class-scheduling class_scheduling.json).
+# kv_actions are offline-replay only (the live router ignores them).
+default_policy_class: standard
+policy_classes:
+- name: priority
+  quantum: 8
+  prefill_busy_threshold_frac: 4.0
+- name: standard
+  quantum: 4
+  prefill_busy_threshold_frac: 0.95
+- name: batch
+  quantum: 1
+  prefill_busy_threshold_frac: 0.85
+request_classifier:
+  type: session-scheduler
+  parameters:
+    mode: enforce
+    default_class: standard
+    classes:
+    - name: priority
+      rank: 1
+      value: 2.0
+      service_level:
+        ttft_s: 3.0
+        itl_s: 0.05
+        percentile: 0.9
+        attainment: 0.9
+        window_s: 60.0
+      admission:
+        gate_share: 1.0
+        max_lobby_wait_s: 25.0
+        on_wait_limit: expire
+        shed_hold_s: 0.0
+    - name: standard
+      rank: 2
+      value: 1.0
+      service_level:
+        ttft_s: 8.0
+        itl_s: 0.1
+        percentile: 0.9
+        attainment: 0.7
+        window_s: 60.0
+      admission:
+        gate_share: 0.9
+        max_lobby_wait_s: 55.0
+        on_wait_limit: expire
+        shed_hold_s: 10.0
+    - name: batch
+      rank: 3
+      value: 0.5
+      admission:
+        gate_share: 0.75
+        max_lobby_wait_s: 290.0
+        on_wait_limit: expire
+        shed_hold_s: 120.0
+    admission:
+      lobby_order: aging
+      judge_itl: true
+      retry_after_estimate:
+        estimate_window_waits: 20
+        count_ends: true
+        max_s: 120
+        fallback_s: 30
+        min_s: 10
+      prefill_budget:
+        margin: 0.9
+        window_s: 30
+        place_onboard: true
+        lookahead_step_s: 10
+      target_loop:
+        class: standard
+        margin: 0.03
+        guard: 0.0
+        guard_gain: 0.5
+        gain: 0.5
+        up_factor: 0.5
+        step_s: 30
+        smooth_s: 600
+        min_scale: 0.6
+        max_scale: 1.5
+        infeasible_after_s: 600
+        infeasible_hold: false
+        reprobe_s: 900
+        priority_wait_cut: 0.5
+      hot_demand: next_turn
+      dram_tokens_per_worker: 72682268
+      dram_write_through: true
+    forecast:
+      enabled: true
+      step_table:
+        prefill_tokens:
+        - 0.0
+        - 64.0
+        - 128.0
+        - 256.0
+        - 512.0
+        - 1024.0
+        - 2048.0
+        - 4096.0
+        - 8192.0
+        - 16384.0
+        - 32768.0
+        prefill_s:
+        - 0.028151
+        - 0.031279
+        - 0.038151
+        - 0.044097
+        - 0.053791
+        - 0.07592
+        - 0.100301
+        - 0.162999
+        - 0.346389
+        - 0.612054
+        - 1.19294
+        prefix_weight: 0.0124
+        decode_batch:
+        - 1.0
+        - 2.0
+        - 4.0
+        - 8.0
+        - 16.0
+        - 32.0
+        - 64.0
+        - 128.0
+        - 256.0
+        decode_context:
+        - 1024.0
+        - 4096.0
+        - 16384.0
+        - 32768.0
+        - 65536.0
+        - 131072.0
+        - 262144.0
+        - 524288.0
+        - 1048576.0
+        decode_s:
+        - 0.010239
+        - 0.01015
+        - 0.010159
+        - 0.010215
+        - 0.010608
+        - 0.010579
+        - 0.010586
+        - 0.010673
+        - 0.010882
+        - 0.010753
+        - 0.0107
+        - 0.010682
+        - 0.01074
+        - 0.010834
+        - 0.010931
+        - 0.011065
+        - 0.011289
+        - 0.011723
+        - 0.011924
+        - 0.011823
+        - 0.011875
+        - 0.011863
+        - 0.012112
+        - 0.012204
+        - 0.012414
+        - 0.01285
+        - 0.013719
+        - 0.014776
+        - 0.014703
+        - 0.014833
+        - 0.014892
+        - 0.015013
+        - 0.015235
+        - 0.015671
+        - 0.016534
+        - 0.018255
+        - 0.019407
+        - 0.019506
+        - 0.019502
+        - 0.019627
+        - 0.019841
+        - 0.020275
+        - 0.02114
+        - 0.022864
+        - 0.022864
+        - 0.023995
+        - 0.024149
+        - 0.024264
+        - 0.024442
+        - 0.024849
+        - 0.025709
+        - 0.027431
+        - 0.027431
+        - 0.027431
+        - 0.029734
+        - 0.030034
+        - 0.030366
+        - 0.030822
+        - 0.031692
+        - 0.033407
+        - 0.033407
+        - 0.033407
+        - 0.033407
+        - 0.036351
+        - 0.037014
+        - 0.037817
+        - 0.038656
+        - 0.038656
+        - 0.038656
+        - 0.038656
+        - 0.038656
+        - 0.038656
+        - 0.04251
+        - 0.044249
+        - 0.04479
+        - 0.04479
+        - 0.04479
+        - 0.04479
+        - 0.04479
+        - 0.04479
+        - 0.04479
+worker_selection:
+  aggregated:
+    type: session-placement
+    parameters:
+      seed: 3516948205
+      pool: null
+      affinity: null
+      forecast:
+        weight: 1.0
+        lower_tier_hits: true
+        itl_limit: true
+        home: last_sent
+        home_drop_if_late: true
+        home_late_needs_alternative: true
+kv_actions:
+  release_source: true
+  retain_value:
+    short_window_s: 600
+engine_priority:
+  priority: 2
+  standard: 1
+  batch: 0

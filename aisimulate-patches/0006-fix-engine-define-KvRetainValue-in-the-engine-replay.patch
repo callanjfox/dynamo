@@ -1,0 +1,103 @@
+From 485667da4f9bccfa0c5c57391651f783cbbb4488 Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Thu, 12 Nov 2026 13:24:01 +1000
+Subject: [PATCH 06/38] fix(engine): define KvRetainValue in the engine (replay
+ re-exports it), so the engine keeps no dependency on replay
+ (tests/firewall.rs)
+
+---
+ crates/core/src/engine/host_offload/tier.rs |  2 +-
+ crates/core/src/engine/kv_retain.rs         | 21 ++++++++++++++++++++-
+ crates/core/src/engine/mod.rs               |  1 +
+ crates/core/src/replay/core/mod.rs          | 21 ++-------------------
+ 4 files changed, 24 insertions(+), 21 deletions(-)
+
+diff --git a/crates/core/src/engine/host_offload/tier.rs b/crates/core/src/engine/host_offload/tier.rs
+index e439e34fc..b50f4be31 100644
+--- a/crates/core/src/engine/host_offload/tier.rs
++++ b/crates/core/src/engine/host_offload/tier.rs
+@@ -1831,7 +1831,7 @@ pub(crate) mod tests {
+ 
+     #[test]
+     fn retention_by_value_evicts_the_least_valuable_session_first() {
+-        use crate::replay::KvRetainValue;
++        use crate::engine::KvRetainValue;
+         let state = crate::engine::kv_retain::RetainState::shared();
+         let mut tier = private(3, 0.0, 0.0);
+         tier.set_retain(state.clone());
+diff --git a/crates/core/src/engine/kv_retain.rs b/crates/core/src/engine/kv_retain.rs
+index b7ae63002..27d28676f 100644
+--- a/crates/core/src/engine/kv_retain.rs
++++ b/crates/core/src/engine/kv_retain.rs
+@@ -15,7 +15,26 @@ use std::sync::{Arc, Mutex};
+ use rustc_hash::FxHashMap;
+ use uuid::Uuid;
+ 
+-use crate::replay::KvRetainValue;
++/// Retention by value (`kv.retain` priority): G2 evicts the blocks whose loss
++/// costs least per block first. A session's value is its class weight,
++/// discounted by how long until its next turn (`H / (H + wait)`, H = 300 s) and
++/// spread over its blocks; an ended session is worth nothing.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct KvRetainValue {
++    /// The session's key (a hash of its session id); its blocks share one value.
++    pub session: u64,
++    /// The class weight, in thousandths.
++    pub weight_milli: u32,
++    /// The client's expected think time to the next turn, from when this request
++    /// finishes; `None` when unknown.
++    pub think_ms: Option<u64>,
++    /// This request ends its session.
++    pub session_final: bool,
++    /// Retain by value only while this rank's G2 evicted within this window
++    /// (retain-short); `None` always.
++    pub short_window_ms: Option<u64>,
++}
++
+ 
+ pub(crate) type SharedRetainState = Arc<Mutex<RetainState>>;
+ 
+diff --git a/crates/core/src/engine/mod.rs b/crates/core/src/engine/mod.rs
+index 900c3ed9f..2b09660bc 100644
+--- a/crates/core/src/engine/mod.rs
++++ b/crates/core/src/engine/mod.rs
+@@ -13,6 +13,7 @@ mod handoff;
+ mod host_offload;
+ mod kv_manager;
+ pub(crate) mod kv_retain;
++pub use kv_retain::KvRetainValue;
+ pub(crate) mod kvcr;
+ mod launch;
+ mod offload_lru;
+diff --git a/crates/core/src/replay/core/mod.rs b/crates/core/src/replay/core/mod.rs
+index 56da31777..2283d18a9 100644
+--- a/crates/core/src/replay/core/mod.rs
++++ b/crates/core/src/replay/core/mod.rs
+@@ -166,25 +166,8 @@ pub struct KvRetainAction {
+     pub value: Option<KvRetainValue>,
+ }
+ 
+-/// Retention by value (`kv.retain` priority): G2 evicts the blocks whose loss
+-/// costs least per block first. A session's value is its class weight,
+-/// discounted by how long until its next turn (`H / (H + wait)`, H = 300 s) and
+-/// spread over its blocks; an ended session is worth nothing.
+-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+-pub struct KvRetainValue {
+-    /// The session's key (a hash of its session id); its blocks share one value.
+-    pub session: u64,
+-    /// The class weight, in thousandths.
+-    pub weight_milli: u32,
+-    /// The client's expected think time to the next turn, from when this request
+-    /// finishes; `None` when unknown.
+-    pub think_ms: Option<u64>,
+-    /// This request ends its session.
+-    pub session_final: bool,
+-    /// Retain by value only while this rank's G2 evicted within this window
+-    /// (retain-short); `None` always.
+-    pub short_window_ms: Option<u64>,
+-}
++/// Retention by value (`kv.retain` priority); defined with the engine, which acts on it.
++pub use crate::engine::KvRetainValue;
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub struct Placement {

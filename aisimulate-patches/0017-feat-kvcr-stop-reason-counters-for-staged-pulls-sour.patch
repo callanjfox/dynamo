@@ -1,0 +1,105 @@
+From c50dbe8fd94566257ca29e0a0b23a1839ed3fe69 Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Thu, 12 Nov 2026 23:25:51 +1000
+Subject: [PATCH 17/38] feat(kvcr): stop-reason counters for staged pulls
+ (source missing, already pulled, no room) and the wanted blocks left
+ unpulled, in the KVCR stats; counters only
+
+---
+ crates/core/src/engine/kvcr.rs                | 28 +++++++++++++++++++
+ crates/core/src/engine/scheduler/vllm/kvcr.rs | 15 +++++++++-
+ 2 files changed, 42 insertions(+), 1 deletion(-)
+
+diff --git a/crates/core/src/engine/kvcr.rs b/crates/core/src/engine/kvcr.rs
+index 4a293a43d..8532b339b 100644
+--- a/crates/core/src/engine/kvcr.rs
++++ b/crates/core/src/engine/kvcr.rs
+@@ -56,6 +56,22 @@ pub struct KvcrStats {
+     /// Path B `kv.release_source` actions this pool's ranks executed.
+     #[serde(skip_serializing_if = "is_zero")]
+     pub moves: u64,
++    /// Why staged pulls stopped short: the source held neither the next block in G2 nor (with
++    /// `peer_hbm`) in device KV; this request already pulled it at this instant; or the target's
++    /// G2 had no room to reserve it.
++    #[serde(skip_serializing_if = "is_zero")]
++    pub stops_source_missing: u64,
++    #[serde(skip_serializing_if = "is_zero")]
++    pub stops_attempted: u64,
++    #[serde(skip_serializing_if = "is_zero")]
++    pub stops_no_room: u64,
++    /// Blocks a staged pull wanted (G1 and the target's G2 lacked them) but did not pull.
++    #[serde(skip_serializing_if = "is_zero")]
++    pub unpulled_blocks: u64,
++    /// Of `unpulled_blocks`, those the source's device KV held at the time (from its device
++    /// KV events; counted only with `peer_hbm`, which tracks them).
++    #[serde(skip_serializing_if = "is_zero")]
++    pub unpulled_in_source_device: u64,
+     /// Pulled blocks read from a peer's device KV (`peer_hbm`).
+     #[serde(skip_serializing_if = "is_zero")]
+     pub peer_hbm_blocks: u64,
+@@ -393,6 +409,18 @@ impl KvcrRegistry {
+         self.config.peer_hbm && self.g1_resident.get(&rank).is_some_and(|set| set.contains(&hash))
+     }
+ 
++    /// Note why a staged pull stopped (`reason`: 0 source missing, 1 attempted, 2 no room) and
++    /// the wanted blocks it left behind.
++    pub(crate) fn note_stop(&mut self, reason: u8, unpulled: u64, in_source_device: u64) {
++        match reason {
++            0 => self.stats.stops_source_missing += 1,
++            1 => self.stats.stops_attempted += 1,
++            _ => self.stats.stops_no_room += 1,
++        }
++        self.stats.unpulled_blocks += unpulled;
++        self.stats.unpulled_in_source_device += in_source_device;
++    }
++
+     /// Note a pull's blocks read from a peer's device KV.
+     pub(crate) fn note_peer_hbm(&mut self, blocks: usize) {
+         self.stats.peer_hbm_blocks += blocks as u64;
+diff --git a/crates/core/src/engine/scheduler/vllm/kvcr.rs b/crates/core/src/engine/scheduler/vllm/kvcr.rs
+index 28d28535a..e42c8e4b0 100644
+--- a/crates/core/src/engine/scheduler/vllm/kvcr.rs
++++ b/crates/core/src/engine/scheduler/vllm/kvcr.rs
+@@ -101,9 +101,10 @@ impl VllmKvcrAdapter {
+         let mut src = source_g2.lock();
+         let (mut deferred, mut partial) = (false, false);
+         let (mut plan, mut no_room) = (None, None);
++        let mut stop: Option<(u8, usize)> = None;
+         // `peer_hbm`: blocks the source's G2 lacks but its device KV holds (not pinnable).
+         let mut from_g1: rustc_hash::FxHashSet<HostBlockKey> = rustc_hash::FxHashSet::default();
+-        for key in keys.iter().copied() {
++        for (at, key) in keys.iter().copied().enumerate() {
+             match tier.lookup(key) {
+                 Lookup::Hit => {}
+                 Lookup::Pending { .. } => deferred = true,
+@@ -112,6 +113,8 @@ impl VllmKvcrAdapter {
+                     let in_g1 = !in_g2 && registry.device_holds(source, key.sequence_hash());
+                     if self.attempted.contains(&(owner, key)) || !(in_g2 || in_g1) {
+                         partial = true;
++                        let reason = u8::from(self.attempted.contains(&(owner, key)));
++                        stop = Some((reason, at));
+                         break;
+                     }
+                     if in_g1 {
+@@ -121,11 +124,21 @@ impl VllmKvcrAdapter {
+                     let plan = plan.get_or_insert_with(|| tier.plan_external(keys, now));
+                     if !tier.plan_reserve(plan, key) {
+                         (partial, no_room) = (true, Some(key));
++                        stop = Some((2, at));
+                         break;
+                     }
+                 }
+             }
+         }
++        if let Some((reason, at)) = stop {
++            let rest = &keys[at..];
++            let unpulled = rest.iter().filter(|k| !matches!(tier.lookup(**k), Lookup::Hit)).count();
++            let in_device = rest
++                .iter()
++                .filter(|k| registry.device_holds(source, k.sequence_hash()))
++                .count();
++            registry.note_stop(reason, unpulled as u64, in_device as u64);
++        }
+         let plan = plan.filter(|plan| !plan.reserved().is_empty());
+         let pulled = plan
+             .as_ref()

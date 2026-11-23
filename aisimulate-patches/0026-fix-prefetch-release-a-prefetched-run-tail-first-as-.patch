@@ -1,0 +1,75 @@
+From cc4ea111674225cbee3503fcaaa4d3d1d3ab3fd7 Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Fri, 13 Nov 2026 12:37:51 +1000
+Subject: [PATCH 26/38] fix(prefetch): release a prefetched run tail first, as
+ a request's blocks are, so G1 evicts it from the tail; released head first,
+ the head went before its own tail, the router's indexer dropped the chain
+ below it and the tail's later removal failed (demote + prefetch stopped the
+ replay: Failed to find block); unit test
+
+---
+ .../src/engine/kv_manager/vllm_backend.rs     | 10 +++++++-
+ .../src/engine/scheduler/vllm/host_offload.rs | 25 +++++++++++++++++++
+ 2 files changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/crates/core/src/engine/kv_manager/vllm_backend.rs b/crates/core/src/engine/kv_manager/vllm_backend.rs
+index 4b4fe157f..af3c794a9 100644
+--- a/crates/core/src/engine/kv_manager/vllm_backend.rs
++++ b/crates/core/src/engine/kv_manager/vllm_backend.rs
+@@ -1448,11 +1448,19 @@ impl VllmKvManager {
+             return Vec::new();
+         }
+         let mut loaded = Vec::with_capacity(hashes.len());
++        let mut copies = Vec::with_capacity(hashes.len());
+         for &hash in hashes {
+             let (copy, _) = self.pool.allocate_cached(&mut outcome.reservation, hash);
+-            self.pool.release(copy);
++            copies.push(copy);
+             loaded.push(hash);
+         }
++        // Released tail first, as a request's blocks are (`release_lease_entries`), so the run's head
++        // is the most recently freed and is evicted last. Released head first, the head was evicted
++        // before its own tail: the router's indexer dropped the chain below it, and the tail's later
++        // removal named a block it no longer held (demote + prefetch stopped: "Failed to find block").
++        for copy in copies.into_iter().rev() {
++            self.pool.release(copy);
++        }
+         self.pool.cancel(outcome.reservation);
+         self.publish_kv_event(loaded.clone(), local_hashes, parent, true, None, None);
+         loaded
+diff --git a/crates/core/src/engine/scheduler/vllm/host_offload.rs b/crates/core/src/engine/scheduler/vllm/host_offload.rs
+index 33f5b7424..694270d32 100644
+--- a/crates/core/src/engine/scheduler/vllm/host_offload.rs
++++ b/crates/core/src/engine/scheduler/vllm/host_offload.rs
+@@ -1333,6 +1333,31 @@ mod tests {
+         assert_eq!((stats.retained_requests, stats.retained_blocks), (1, 2));
+     }
+ 
++    #[test]
++    fn a_prefetched_run_is_evicted_tail_first() {
++        // G1 of four blocks, G2 of eight. A three-block chain is demoted, then prefetched back as
++        // idle cached blocks. A later prompt needs room: G1 must evict the run from its tail, as it
++        // evicts a finished request's blocks. Evicting the head first cut the router indexer's
++        // chain there and the tail's later removal failed ("Failed to find block").
++        let mut core = block_action_core(4, 8, false);
++        let mut now_ms = 0.0;
++        let tokens: Vec<u32> = (1..=12).collect();
++        let uuid = Uuid::from_u128(48);
++        run_to_completion(&mut core, uuid, tokens.clone(), &mut now_ms);
++        let hashes = prompt_hashes(uuid, tokens);
++        assert_eq!(hashes.len(), 3);
++        core.apply_command(drop_blocks(&hashes, true, false, true)).unwrap();
++        assert!(hashes.iter().all(|hash| core.kv_residency(*hash) == (false, true)));
++        core.apply_command(prefetch_blocks(&hashes)).unwrap();
++        assert!(hashes.iter().all(|hash| core.kv_residency(*hash) == (true, true)));
++        run_to_completion(&mut core, Uuid::from_u128(49), (31..=38).collect(), &mut now_ms);
++        let in_g1: Vec<bool> = hashes.iter().map(|hash| core.kv_residency(*hash).0).collect();
++        let kept = in_g1.iter().take_while(|held| **held).count();
++        assert!(kept < hashes.len(), "the prompt needed room from the run: {in_g1:?}");
++        assert!(in_g1[kept..].iter().all(|held| !held), "evicted from the tail only: {in_g1:?}");
++        assert!(kept > 0, "the head stays: {in_g1:?}");
++    }
++
+     #[test]
+     fn demote_keeps_a_block_g2_lacks() {
+         // G2 of two blocks: a later one-block prompt evicts one of the first two. Demote drops only

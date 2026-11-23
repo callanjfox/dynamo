@@ -1,0 +1,46 @@
+From 28beaa03366b2fddcc9a90ef13b2daed058ff533 Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Thu, 12 Nov 2026 13:13:14 +1000
+Subject: [PATCH 03/38] G2 retention by value: skip the LRU walk for unowned
+ blocks when every block has a session, and iterate a session's blocks without
+ sorting
+
+---
+ crates/core/src/engine/host_offload/tier.rs | 16 ++++++++++------
+ 1 file changed, 10 insertions(+), 6 deletions(-)
+
+diff --git a/crates/core/src/engine/host_offload/tier.rs b/crates/core/src/engine/host_offload/tier.rs
+index 7a4491891..e439e34fc 100644
+--- a/crates/core/src/engine/host_offload/tier.rs
++++ b/crates/core/src/engine/host_offload/tier.rs
+@@ -370,10 +370,16 @@ impl HostTier {
+         if !state.active(self.last_evict_ms, now_ms) {
+             return None;
+         }
++        // Blocks of no known session go first, as LRU. Walking the LRU for them is skipped
++        // when every resident block has a session (the usual case), since the walk would
++        // visit every block.
+         let owner_of = &self.owner_of;
+-        let mut victims = self
+-            .lru
+-            .victims(needed, |key| !owner_of.contains_key(&key) && eligible(key));
++        let mut victims = if self.entries.len() > self.owner_of.len() {
++            self.lru
++                .victims(needed, |key| !owner_of.contains_key(&key) && eligible(key))
++        } else {
++            Vec::new()
++        };
+         if victims.len() == needed {
+             return Some(victims);
+         }
+@@ -384,9 +390,7 @@ impl HostTier {
+             .collect();
+         owners.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+         'owners: for (_, owner) in owners {
+-            let mut keys: Vec<_> = self.by_owner[&owner].iter().copied().collect();
+-            keys.sort_unstable();
+-            for key in keys {
++            for &key in &self.by_owner[&owner] {
+                 if eligible(key) {
+                     victims.push(key);
+                     if victims.len() == needed {

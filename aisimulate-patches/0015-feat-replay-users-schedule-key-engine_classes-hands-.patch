@@ -1,0 +1,120 @@
+From cf353f71e2cecef4b239ba5bca4f8da21ca413c9 Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Thu, 12 Nov 2026 19:10:14 +1000
+Subject: [PATCH 15/38] feat(replay): users schedule key engine_classes hands
+ each user's class to the engine as policy_class, off by default
+
+---
+ crates/core/src/replay/loadgen/driver.rs |  6 +++++
+ crates/core/src/replay/loadgen/users.rs  | 34 +++++++++++++++++++++---
+ 2 files changed, 37 insertions(+), 3 deletions(-)
+
+diff --git a/crates/core/src/replay/loadgen/driver.rs b/crates/core/src/replay/loadgen/driver.rs
+index 666c2cd7a..02ad4670c 100644
+--- a/crates/core/src/replay/loadgen/driver.rs
++++ b/crates/core/src/replay/loadgen/driver.rs
+@@ -3887,9 +3887,15 @@ impl WorkloadDriver {
+         let node = session_index - copy.node_offset;
+         let identity = users.identity(&copy, node);
+         let hash_ids = users.hash_ids(&copy, node);
++        let policy_class = users
++            .spec
++            .engine_classes
++            .as_ref()
++            .map(|classes| classes[copy.user as usize].clone());
+         let session = &mut self.sessions[session_index];
+         session.session_id = identity.conversation_id.clone();
+         let turn = &mut session.turns[0];
++        turn.policy_class = policy_class;
+         turn.request_id = Some(identity.request_id.clone());
+         turn.play_id = Some(identity.play_id.clone());
+         let mut rng = StdRng::seed_from_u64(
+diff --git a/crates/core/src/replay/loadgen/users.rs b/crates/core/src/replay/loadgen/users.rs
+index b849bc76f..6b309c5d0 100644
+--- a/crates/core/src/replay/loadgen/users.rs
++++ b/crates/core/src/replay/loadgen/users.rs
+@@ -248,13 +248,16 @@ struct ScheduleFile {
+     cooldown_s: f64,
+     #[serde(default)]
+     loss_cooldown_s: f64,
++    /// Hand each user's class (`plan[].cls`) to the engine as the request's `policy_class`, for
++    /// class-aware engine scheduling. Off by default: requests carry no class, as before.
++    #[serde(default)]
++    engine_classes: bool,
+     templates: String,
+     plan: Vec<PlanUser>,
+ }
+ 
+ #[derive(Deserialize)]
+ struct PlanUser {
+-    #[allow(dead_code)]
+     cls: String,
+     entries: Vec<PlanEntry>,
+ }
+@@ -272,6 +275,8 @@ pub struct AgenticUsers {
+     pub(super) horizon_ms: f64,
+     pub(super) cooldown_ms: f64,
+     pub(super) loss_cooldown_ms: f64,
++    /// Each user's class for the engine, when the schedule sets `engine_classes`.
++    pub(super) engine_classes: Option<Vec<String>>,
+ }
+ 
+ impl AgenticUsers {
+@@ -296,18 +301,23 @@ impl AgenticUsers {
+                 .join(templates)
+         };
+         let corpus = Arc::new(UsersCorpus::load(&templates)?);
++        let classes = file
++            .engine_classes
++            .then(|| file.plan.iter().map(|user| user.cls.clone()).collect());
+         let plans = file
+             .plan
+             .into_iter()
+             .map(|user| user.entries.into_iter().map(|e| e.tmpl).collect::<Vec<_>>())
+             .collect::<Vec<_>>();
+-        Self::new(
++        let mut users = Self::new(
+             corpus,
+             plans,
+             file.horizon_s,
+             file.cooldown_s,
+             file.loss_cooldown_s,
+-        )
++        )?;
++        users.engine_classes = classes;
++        Ok(users)
+     }
+ 
+     pub(super) fn new(
+@@ -344,6 +354,7 @@ impl AgenticUsers {
+             horizon_ms: horizon_s * 1000.0,
+             cooldown_ms: cooldown_s * 1000.0,
+             loss_cooldown_ms: loss_cooldown_s * 1000.0,
++            engine_classes: None,
+         })
+     }
+ }
+@@ -514,6 +525,23 @@ mod tests {
+         assert!(d.is_drained());
+     }
+ 
++    #[test]
++    fn users_classes_reach_the_engine_only_when_the_schedule_asks() {
++        let mut d = driver(3600.0);
++        assert!(d.pop_ready(0.0, usize::MAX).iter().all(|t| t.request.policy_class.is_none()));
++        let mut users =
++            AgenticUsers::new(corpus(), vec![vec![0], vec![1]], 3600.0, 2.0, 120.0).unwrap();
++        users.engine_classes = Some(vec!["priority".into(), "batch".into()]);
++        let mut d = WorkloadDriver::new_agentic_users(users, 4, true).unwrap();
++        let mut first = d.pop_ready(0.0, usize::MAX);
++        first.sort_by_key(id);
++        let classes = first
++            .iter()
++            .map(|t| t.request.policy_class.clone())
++            .collect::<Vec<_>>();
++        assert_eq!(classes, vec![Some("priority".into()), Some("batch".into())]);
++    }
++
+     #[test]
+     fn a_failed_play_waits_the_loss_cooldown() {
+         let mut d = driver(3600.0);

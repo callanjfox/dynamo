@@ -1,0 +1,59 @@
+From 040b511d213a3f613175e26065f897f1f58739df Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Fri, 13 Nov 2026 06:18:58 +1000
+Subject: [PATCH 21/38] fix(invalidate): invalidate drops only blocks no cached
+ block extends, tail first, so it never cuts a cached prefix chain
+ (invalidate-oracle stopped the replay: Failed to find block); KV actions
+ settle due engine internal work first (write-back peer HBM was refused a
+ command while internal work was due)
+
+---
+ crates/core/src/engine/scheduler/vllm/core.rs | 20 ++++++++++++++++++-
+ crates/core/src/replay/agg.rs                 |  3 +++
+ 2 files changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/crates/core/src/engine/scheduler/vllm/core.rs b/crates/core/src/engine/scheduler/vllm/core.rs
+index aa7ab9859..de290dffd 100644
+--- a/crates/core/src/engine/scheduler/vllm/core.rs
++++ b/crates/core/src/engine/scheduler/vllm/core.rs
+@@ -2619,7 +2619,25 @@ impl VllmCore {
+                         }
+                     }
+                 } else if g1 {
+-                    affected.extend(self.kv_manager.drop_cached_blocks(&hashes));
++                    // Invalidate: drop only blocks no cached block extends, repeatedly, so the
++                    // chain is cut from its end (as for demote); a block another cached chain still
++                    // extends stays.
++                    let mut left = hashes.clone();
++                    loop {
++                        let (now, later): (Vec<u64>, Vec<u64>) = left
++                            .iter()
++                            .partition(|hash| !self.kv_manager.has_cached_child(**hash));
++                        if now.is_empty() {
++                            break;
++                        }
++                        let dropped = self.kv_manager.drop_cached_blocks(&now);
++                        let progressed = !dropped.is_empty();
++                        affected.extend(dropped);
++                        left = later;
++                        if !progressed {
++                            break;
++                        }
++                    }
+                 }
+                 let g1_count = affected.len();
+                 if let Some(adapter) = self.native_host_offload.as_mut() {
+diff --git a/crates/core/src/replay/agg.rs b/crates/core/src/replay/agg.rs
+index 8c58fb732..8079c7e1c 100644
+--- a/crates/core/src/replay/agg.rs
++++ b/crates/core/src/replay/agg.rs
+@@ -658,6 +658,9 @@ where
+         let (mut results, observed) = if messages.is_empty() {
+             (Vec::new(), Vec::new())
+         } else {
++            // An engine refuses a command while its internal work (transfer completions, a
++            // write-back tick) is due: settle that first, as admission does.
++            self.apply_internal_work()?;
+             self.engine.apply_kv_actions(messages, self.now_ms)?
+         };
+         results.extend(dequeue_results);

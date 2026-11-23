@@ -1,0 +1,598 @@
+From 2091bb75254836ea290c2e847be10492b12efa08 Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Thu, 19 Nov 2026 01:23:13 +0000
+Subject: [PATCH 37/38] f49g: H warm-KV seeding (DYNAMO_REPLAY_WARM_KV=g2),
+ default off
+
+---
+ crates/core/src/engine/protocol.rs            |  10 +
+ crates/core/src/engine/scheduler/vllm/core.rs |  49 ++++
+ .../src/engine/scheduler/vllm/host_offload.rs | 264 ++++++++++++++++++
+ crates/core/src/replay/agg.rs                 | 138 ++++++++-
+ crates/core/src/replay/mod.rs                 |   1 +
+ 5 files changed, 461 insertions(+), 1 deletion(-)
+
+diff --git a/crates/core/src/engine/protocol.rs b/crates/core/src/engine/protocol.rs
+index 4d7de782b..92357a8e9 100644
+--- a/crates/core/src/engine/protocol.rs
++++ b/crates/core/src/engine/protocol.rs
+@@ -122,6 +122,16 @@ pub enum KvBlockCommand {
+         hashes: Vec<u64>,
+         local_hashes: Vec<u64>,
+     },
++    /// Make the complete prompt blocks of `tokens` resident in this rank's G2 at once, as
++    /// though an earlier turn of the session had offloaded them (replay's warm KV,
++    /// `DYNAMO_REPLAY_WARM_KV`): under the block identities request `owner` will look them up
++    /// by, as the newest blocks of G2's LRU, evicting as a store would, with no transfer time,
++    /// published as `HostPinned` stored events. Engines without G2 ignore it.
++    Seed {
++        owner: Uuid,
++        tokens: Vec<u32>,
++        session_id: Option<String>,
++    },
+ }
+ 
+ /// Commands supported by the standalone scheduler.
+diff --git a/crates/core/src/engine/scheduler/vllm/core.rs b/crates/core/src/engine/scheduler/vllm/core.rs
+index 2c79c8ee7..97c9c47a0 100644
+--- a/crates/core/src/engine/scheduler/vllm/core.rs
++++ b/crates/core/src/engine/scheduler/vllm/core.rs
+@@ -2777,9 +2777,58 @@ impl VllmCore {
+                 };
+                 adapter.replicate(source, &hashes, &local_hashes, now_ms)
+             }
++            KvBlockCommand::Seed {
++                owner,
++                tokens,
++                session_id,
++            } => self.seed_host_prefix(owner, tokens, session_id, now_ms),
+         }
+     }
+ 
++    /// `KvBlockCommand::Seed`: make the complete prompt blocks of `tokens` resident in this
++    /// rank's G2 under the host keys and router identities that request `owner` will look them
++    /// up by (see `VllmHostOffloadAdapter::seed_prefix`). Returns the seeded blocks' hashes.
++    fn seed_host_prefix(
++        &mut self,
++        owner: Uuid,
++        tokens: Vec<u32>,
++        session_id: Option<String>,
++        now_ms: f64,
++    ) -> Vec<u64> {
++        let Some(adapter) = self.native_host_offload.as_mut() else {
++            return Vec::new();
++        };
++        let block_size = self.args.block_size;
++        // The same identities `make_request_state` gives the request itself.
++        let mut state = RequestKvState::native(
++            owner,
++            tokens,
++            1,
++            1,
++            block_size,
++            self.args.enable_prefix_caching,
++            self.retain_local_hashes,
++            self.emit_token_ids,
++            None,
++        );
++        state.lease.session_id = session_id;
++        let request = VllmHostRequestState::new(
++            &state.sequence,
++            &state.lease,
++            block_size,
++            adapter.publishes_residency(),
++            None,
++        );
++        let seeded = adapter.seed_prefix(&request, &mut self.kv_manager, now_ms);
++        tracing::debug!(
++            %owner,
++            prompt_blocks = state.sequence.num_input_tokens() / block_size,
++            seeded_blocks = seeded.len(),
++            "warm KV: seeded a primer's prefix into G2"
++        );
++        seeded.into_iter().map(|key| key.sequence_hash()).collect()
++    }
++
+     fn drop_request_at(
+         &mut self,
+         uuid: Uuid,
+diff --git a/crates/core/src/engine/scheduler/vllm/host_offload.rs b/crates/core/src/engine/scheduler/vllm/host_offload.rs
+index f5375da5d..3cc6fdbad 100644
+--- a/crates/core/src/engine/scheduler/vllm/host_offload.rs
++++ b/crates/core/src/engine/scheduler/vllm/host_offload.rs
+@@ -535,6 +535,67 @@ impl VllmHostOffloadAdapter {
+         tier.complete_external(id);
+     }
+ 
++    /// Warm KV (`KvBlockCommand::Seed`): make `request`'s complete prompt blocks resident in
++    /// this rank's G2 at once, as if an earlier turn of its session had offloaded them. The
++    /// blocks take the request's own host keys and router identities, enter as the newest
++    /// blocks of the LRU, evict the least recently used unpinned blocks as a store would (never
++    /// a block of this prompt), take no D2H time, and are published as `HostPinned` stored
++    /// events. Blocks G2 already holds or is still writing stay as they are. Seeding stops at
++    /// the first block G2 has no room for. Returns the seeded blocks in prompt order.
++    pub(super) fn seed_prefix(
++        &mut self,
++        request: &VllmHostRequestState,
++        kv_manager: &mut G1Manager,
++        now_ms: f64,
++    ) -> Vec<HostBlockKey> {
++        if request.prompt_keys.is_empty() {
++            return Vec::new();
++        }
++        let client = self.host.id();
++        let mut tier = self.host.lock();
++        // With a pass in flight, host completions due before `now_ms` stay unticked until the
++        // pass boundary, and the tier refuses a mutation past an unticked completion. The seed
++        // then lands at the earliest such completion instead. Without a pass in flight nothing
++        // is due (the engine refuses a command while internal work is due), so it lands at
++        // `now_ms`.
++        let at_ms = tier
++            .next_deadline(client)
++            .map_or(now_ms, |deadline| deadline.min(now_ms))
++            .max(tier.current_time_ms());
++        let mut plan = tier.plan_external(&request.prompt_keys, at_ms);
++        let mut seen = rustc_hash::FxHashSet::default();
++        let mut seeded = Vec::new();
++        let mut seeded_meta = Vec::new();
++        for (index, key) in request.prompt_keys.iter().copied().enumerate() {
++            if !seen.insert(key) || tier.planned_lookup(Some(&plan), key) != Lookup::Miss {
++                continue;
++            }
++            if !tier.plan_reserve(&mut plan, key) {
++                break;
++            }
++            seeded.push(key);
++            if let Some(meta) = &request.prompt_meta {
++                seeded_meta.push(meta[index].clone());
++            }
++        }
++        if seeded.is_empty() {
++            return seeded;
++        }
++        let meta = request.prompt_meta.is_some().then_some(seeded_meta);
++        let transfer_id = tier.reserve_planned(client, request.owner, plan, meta, at_ms);
++        tier.complete_external(transfer_id);
++        // vLLM's lookup touches a prompt's blocks in reverse, so the earlier turn that left this
++        // prefix in G2 left its head the newest: under pressure the tail goes first.
++        for key in seeded.iter().rev() {
++            tier.touch(*key);
++        }
++        // The seed is a command: the residency it publishes belongs to the command's KV events.
++        for event in tier.take_events(client) {
++            kv_manager.publish_host_pinned_event(event);
++        }
++        seeded
++    }
++
+     /// Write-back: G1 now holds these prompt blocks; forget them if dropped.
+     pub(super) fn note_g1_blocks(&mut self, keys: &[HostBlockKey], meta: Option<&[HostBlockMeta]>) {
+         if let Some(known) = self.write_back.as_mut() {
+@@ -2744,4 +2805,207 @@ mod tests {
+         assert_eq!(registry.lock().unwrap().stats().loaded_blocks, 0);
+         assert_eq!(target.host.lock().take_kvcr_origin(&host.prompt_keys), 1);
+     }
++
++    /// A prefix-caching core with a private G2 of `g2_blocks` that captures its KV events, so
++    /// G2 publishes its residency as `HostPinned` events.
++    fn warm_core(g2_blocks: usize) -> VllmCore {
++        let args = MockEngineArgs::builder()
++            .num_gpu_blocks(16)
++            .block_size(4)
++            .max_num_seqs(Some(4))
++            .max_num_batched_tokens(Some(64))
++            .enable_prefix_caching(true)
++            .kv_cache_bytes_per_token(Some(250_000))
++            .native_host_offload(Some(
++                NativeHostOffloadConfig::new(g2_blocks).with_bandwidths(1.0, 1.0),
++            ))
++            .speedup_ratio(0.0)
++            .build()
++            .unwrap();
++        VllmCore::new_with_worker_rank(args, 0, 0, 0, true, None).unwrap()
++    }
++
++    fn warm_seed(owner: Uuid, tokens: &[u32]) -> SchedulerCommand {
++        SchedulerCommand::KvBlocks(crate::engine::KvBlockCommand::Seed {
++            owner,
++            tokens: tokens.to_vec(),
++            session_id: None,
++        })
++    }
++
++    /// The `HostPinned` residency changes in `events`.
++    fn host_residency(events: &[crate::engine::KvEvent]) -> Vec<(&'static str, Vec<u64>)> {
++        use crate::engine::{KvEventData, KvEventTier};
++        events
++            .iter()
++            .filter(|event| event.tier == KvEventTier::HostPinned)
++            .map(|event| match &event.data {
++                KvEventData::Stored(stored) => (
++                    "stored",
++                    stored.blocks.iter().map(|block| block.block_hash).collect(),
++                ),
++                KvEventData::Removed { block_hashes } => ("removed", block_hashes.clone()),
++            })
++            .collect()
++    }
++
++    /// Serve one request to completion; returns each admission's host-reused prompt tokens.
++    fn serve(core: &mut VllmCore, uuid: Uuid, tokens: Vec<u32>, now_ms: &mut f64) -> Vec<usize> {
++        core.receive(DirectRequest {
++            tokens,
++            max_output_tokens: 1,
++            uuid: Some(uuid),
++            arrival_timestamp_ms: Some(*now_ms),
++            ..Default::default()
++        });
++        let mut host_reused = Vec::new();
++        for _ in 0..16 {
++            if core.is_ready() {
++                let pass = core.execute_pass(&mut TraceCollector::default(), *now_ms);
++                *now_ms = pass.end_ms;
++                core.complete_engine_boundary(*now_ms);
++                host_reused.extend(pass.admissions.iter().map(|admission| {
++                    admission
++                        .cache_tier_attribution
++                        .map_or(0, |tiers| tiers.host_reused_input_tokens)
++                }));
++            } else if let Some(deadline) = core.next_internal_deadline_ms() {
++                *now_ms = (*now_ms).max(deadline);
++                core.process_internal_work(*now_ms);
++            } else {
++                assert!(core.is_empty());
++                return host_reused;
++            }
++        }
++        panic!("request did not drain")
++    }
++
++    #[test]
++    fn warm_seed_makes_a_primer_prefix_host_resident_and_its_admission_loads_it() {
++        let mut core = warm_core(8);
++        let primer = Uuid::from_u128(60);
++        // Two complete blocks and one more token.
++        let tokens: Vec<u32> = (1..=9).collect();
++        let hashes = prompt_hashes(primer, tokens.clone());
++        assert_eq!(hashes.len(), 2);
++        assert_eq!(
++            core.apply_command(warm_seed(primer, &tokens)).unwrap(),
++            SchedulerCommandResult::Applied
++        );
++        assert!(hashes.iter().all(|hash| core.kv_residency(*hash) == (false, true)));
++        // The router learns of the seeded blocks as of any G2 store.
++        let events = core.drain_kv_events();
++        assert_eq!(host_residency(&events), vec![("stored", hashes.clone())]);
++        assert_eq!(events.len(), 1, "a seed publishes no device events");
++
++        let mut now_ms = 0.0;
++        assert_eq!(
++            serve(&mut core, primer, tokens, &mut now_ms),
++            vec![8],
++            "the primer loads both blocks host to device instead of prefilling them"
++        );
++        assert!(hashes.iter().all(|hash| core.kv_residency(*hash) == (true, true)));
++    }
++
++    #[test]
++    fn warm_seed_evicts_the_least_recently_used_host_blocks_when_g2_is_full() {
++        // A G2 of four blocks; each prompt has two.
++        let mut core = warm_core(4);
++        let ids: Vec<Uuid> = (61..=64).map(Uuid::from_u128).collect();
++        let prompts: Vec<Vec<u32>> = [1u32, 101, 201, 301]
++            .iter()
++            .map(|first| (*first..*first + 8).collect())
++            .collect();
++        let hashes: Vec<Vec<u64>> = ids
++            .iter()
++            .zip(&prompts)
++            .map(|(id, prompt)| prompt_hashes(*id, prompt.clone()))
++            .collect();
++        let in_g2 = |core: &VllmCore, hashes: &[u64]| {
++            hashes
++                .iter()
++                .map(|hash| core.kv_residency(*hash).1)
++                .collect::<Vec<_>>()
++        };
++        for (id, prompt) in ids.iter().zip(&prompts).take(2) {
++            assert_eq!(
++                core.apply_command(warm_seed(*id, prompt)).unwrap(),
++                SchedulerCommandResult::Applied
++            );
++        }
++        core.drain_kv_events();
++
++        // G2 is full: C's seed evicts A, the older seed, and keeps B.
++        assert_eq!(
++            core.apply_command(warm_seed(ids[2], &prompts[2])).unwrap(),
++            SchedulerCommandResult::Applied
++        );
++        assert_eq!(in_g2(&core, &hashes[0]), vec![false, false]);
++        assert_eq!(in_g2(&core, &hashes[1]), vec![true, true]);
++        assert_eq!(in_g2(&core, &hashes[2]), vec![true, true]);
++        let events = host_residency(&core.drain_kv_events());
++        assert_eq!(events.len(), 2, "{events:?}");
++        assert_eq!(events[0].0, "removed");
++        let mut removed = events[0].1.clone();
++        removed.sort_unstable();
++        let mut a = hashes[0].clone();
++        a.sort_unstable();
++        assert_eq!(removed, a);
++        assert_eq!(events[1], ("stored", hashes[2].clone()));
++
++        // C entered as the newest: D's seed evicts B, not C.
++        assert_eq!(
++            core.apply_command(warm_seed(ids[3], &prompts[3])).unwrap(),
++            SchedulerCommandResult::Applied
++        );
++        assert_eq!(in_g2(&core, &hashes[1]), vec![false, false]);
++        assert_eq!(in_g2(&core, &hashes[2]), vec![true, true]);
++        assert_eq!(in_g2(&core, &hashes[3]), vec![true, true]);
++    }
++
++    #[test]
++    fn warm_seed_keeps_blocks_g2_holds_and_stops_where_g2_has_no_room() {
++        // A G2 of two blocks and a prompt of three.
++        let mut core = warm_core(2);
++        let owner = Uuid::from_u128(65);
++        let tokens: Vec<u32> = (1..=12).collect();
++        let hashes = prompt_hashes(owner, tokens.clone());
++        assert_eq!(
++            core.apply_command(warm_seed(owner, &tokens)).unwrap(),
++            SchedulerCommandResult::Applied
++        );
++        assert_eq!(
++            hashes
++                .iter()
++                .map(|hash| core.kv_residency(*hash).1)
++                .collect::<Vec<_>>(),
++            vec![true, true, false],
++            "the leading blocks that fit, never evicting the prompt's own"
++        );
++        core.drain_kv_events();
++        // Seeding the same prompt again changes nothing and publishes nothing.
++        assert_eq!(
++            core.apply_command(warm_seed(owner, &tokens)).unwrap(),
++            SchedulerCommandResult::Noop
++        );
++        assert!(host_residency(&core.drain_kv_events()).is_empty());
++    }
++
++    #[test]
++    fn warm_seed_is_a_noop_without_g2() {
++        let args = MockEngineArgs::builder()
++            .num_gpu_blocks(16)
++            .block_size(4)
++            .enable_prefix_caching(true)
++            .kv_cache_bytes_per_token(Some(250_000))
++            .speedup_ratio(0.0)
++            .build()
++            .unwrap();
++        let mut core = VllmCore::new(args);
++        let tokens: Vec<u32> = (1..=8).collect();
++        assert_eq!(
++            core.apply_command(warm_seed(Uuid::from_u128(66), &tokens)).unwrap(),
++            SchedulerCommandResult::Noop
++        );
++    }
+ }
+diff --git a/crates/core/src/replay/agg.rs b/crates/core/src/replay/agg.rs
+index e9a07425b..d0b213669 100644
+--- a/crates/core/src/replay/agg.rs
++++ b/crates/core/src/replay/agg.rs
+@@ -32,7 +32,8 @@ use super::{
+     },
+     state::AggRequestState,
+ };
+-use crate::engine::{Command, CommandResult, KvHintSource, LifecycleEvent};
++use super::warm_kv::{WarmKv, WarmKvSeeds, is_primer};
++use crate::engine::{Command, CommandResult, KvBlockCommand, KvHintSource, LifecycleEvent};
+ use crate::replay::engine::ReplayRoleFactory;
+ use crate::replay::loadgen::{AgenticPreparationTransition, ReplayRequestPayload};
+ use crate::replay::protocol::{DirectRequest, ForwardPassSnapshot, OutputSignal};
+@@ -122,6 +123,9 @@ where
+     requeued: FxHashMap<Uuid, DirectRequest>,
+     /// f48h: the policy reads the engines' gauges (`PlacementPolicy::wants_engine_gauges`).
+     engine_gauges: bool,
++    /// Warm KV (`DYNAMO_REPLAY_WARM_KV`): seed each users primer's prefix into its worker's G2.
++    warm_kv: WarmKv,
++    warm_kv_seeds: WarmKvSeeds,
+ }
+ 
+ impl<PlacementPolicyImpl, Observation, Metadata>
+@@ -152,6 +156,7 @@ where
+             startup_time_ms,
+         )?;
+         let placement = create_placement(dp_size, engine.active_topology())?;
++        let warm_kv = WarmKv::from_env()?;
+         // f48h: rank gauges are tracked only for a policy that reads them. Tracking them adds
+         // no telemetry output: samples are published only with a telemetry observer installed.
+         let engine_gauges = placement.wants_engine_gauges();
+@@ -200,9 +205,17 @@ where
+             requeued: FxHashMap::default(),
+             encoder: None,
+             engine_gauges,
++            warm_kv,
++            warm_kv_seeds: WarmKvSeeds::default(),
+         })
+     }
+ 
++    /// Set warm KV explicitly; [`Self::new_composed`] reads it from `DYNAMO_REPLAY_WARM_KV`.
++    pub(crate) fn with_warm_kv(mut self, warm_kv: WarmKv) -> Self {
++        self.warm_kv = warm_kv;
++        self
++    }
++
+     pub(crate) fn with_sla_thresholds(mut self, sla: crate::replay::SlaThresholds) -> Self {
+         self.collector.set_sla_thresholds(sla);
+         self
+@@ -359,6 +372,7 @@ where
+         // completion earlier at this timestamp can have made some due (a write-back tick).
+         let mut steps = 0usize;
+         self.settle_internal_work(&mut steps)?;
++        self.seed_warm_kv(&request, uuid, worker_idx)?;
+         self.engine
+             .dispatch(worker_idx, request, kv_hint, self.now_ms)
+             .and_then(|()| self.placement.dispatch_committed(uuid, self.now_ms))
+@@ -367,6 +381,43 @@ where
+             })
+     }
+ 
++    /// Warm KV: just before a users primer reaches its worker, make its complete prompt blocks
++    /// resident in that worker's G2 (once per primer), so its admission loads them host to
++    /// device instead of prefilling them. The router sees the seeded blocks' stored events
++    /// before the primer is submitted.
++    fn seed_warm_kv(
++        &mut self,
++        request: &DirectRequest,
++        uuid: Uuid,
++        worker_idx: usize,
++    ) -> anyhow::Result<()> {
++        if self.warm_kv == WarmKv::Off || !is_primer(request) || !self.warm_kv_seeds.claim(uuid) {
++            return Ok(());
++        }
++        let session_id = request
++            .replay_context
++            .as_ref()
++            .and_then(|context| context.session_id().map(str::to_owned));
++        let effects = self.engine.apply_command(
++            worker_idx,
++            Command::KvBlocks(KvBlockCommand::Seed {
++                owner: uuid,
++                tokens: request.tokens.clone(),
++                session_id,
++            }),
++            self.now_ms,
++        )?;
++        let seeded = effects.result == CommandResult::Applied;
++        self.warm_kv_seeds.record(worker_idx, request.tokens.len(), seeded);
++        tracing::debug!(%uuid, worker_idx, seeded, "warm KV: primer seed");
++        self.apply_engine_observations(effects.engine_events, KvIngestBoundary::SchedulerCommand)?;
++        // A seed into a cluster-shared G2 wakes the pool's other ranks: settle them before the
++        // primer's own submit, which the engine refuses while internal work is due.
++        let mut steps = 0usize;
++        self.settle_internal_work(&mut steps)?;
++        Ok(())
++    }
++
+     fn record_placement(&mut self, placement: Placement) {
+         if let Some(sample) = placement.cache_sample {
+             self.traffic
+@@ -1982,6 +2033,7 @@ where
+         }
+         self.collector.set_runtime_evidence(self.evidence.finish());
+         self.collector.prepare_batch_report()?;
++        self.warm_kv_seeds.log_summary();
+         Ok((self.collector, self.stats))
+     }
+ }
+@@ -3151,6 +3203,89 @@ mod host_offload_tests {
+         assert_eq!(released.first_admit_ms, Some(5.0));
+         assert_eq!(released.terminal_status, ReplayTerminalStatus::Completed);
+     }
++
++    const PRIMER: Uuid = Uuid::from_u128(10);
++    const TURN: Uuid = Uuid::from_u128(11);
++
++    fn authored(uuid: Uuid, tokens: Vec<u32>, authored_id: &str) -> DirectRequest {
++        DirectRequest {
++            replay_context: Some(crate::replay::protocol::ReplayRequestContext {
++                authored_id: authored_id.to_owned(),
++                ..Default::default()
++            }),
++            ..request(uuid, 0.0, tokens)
++        }
++    }
++
++    /// Serve a users primer and an ordinary turn, both of two complete blocks and one more
++    /// token, on worker 0 with a private G2; returns their first-admission host-reused tokens.
++    fn warm_kv_host_reuse(warm_kv: WarmKv) -> (Option<usize>, Option<usize>) {
++        let config = ReplayEngineConfig {
++            rank: EngineConfig {
++                num_gpu_blocks: 16,
++                block_size: 4,
++                max_num_seqs: 2,
++                max_num_batched_tokens: 64,
++                enable_prefix_caching: true,
++                kv_cache_bytes_per_token: Some(250_000),
++                native_host_offload: Some(
++                    NativeHostOffloadConfig::new(8).with_bandwidths(1.0, 1.0),
++                ),
++                timing_model: TimingModelConfig::Fixed {
++                    prefill_ms: 1.0,
++                    decode_ms: 0.0,
++                },
++                ..EngineConfig::default()
++            },
++            ..ReplayEngineConfig::default()
++        };
++        let factory = ReplayEngineFactory::new()
++            .role_factory(&config, WorkerStage::Aggregated, false)
++            .unwrap();
++        let admission = AdmissionQueue::new_requests(
++            VecDeque::from([
++                authored(PRIMER, (1..=9).collect(), "cp000000000000:t0:primer"),
++                authored(TURN, (101..=109).collect(), "cp000001000000:t0:r1"),
++            ]),
++            ReplayMode::Trace,
++        );
++        let runtime = AggRuntimeImpl::<ReleaseToIdleWorker, NoEngineEvents, ()>::new_composed(
++            factory,
++            admission,
++            2,
++            None,
++            |_dp_size, _topology| Ok(ReleaseToIdleWorker { pending: None }),
++        )
++        .unwrap()
++        .with_per_request_records(true)
++        .with_warm_kv(warm_kv);
++        let (collector, _) = runtime.run().unwrap();
++        let report = collector.finish();
++        assert_eq!(report.request_counts.completed_requests, 2);
++        let reused = |uuid: Uuid| {
++            report
++                .per_request
++                .iter()
++                .find(|request| request.uuid == uuid.to_string())
++                .expect("request record")
++                .first_admission_host_reused_input_tokens
++        };
++        (reused(PRIMER), reused(TURN))
++    }
++
++    #[test]
++    fn warm_kv_off_leaves_a_primer_to_prefill_its_context() {
++        let (primer, turn) = warm_kv_host_reuse(WarmKv::Off);
++        assert_eq!(primer.unwrap_or(0), 0);
++        assert_eq!(turn.unwrap_or(0), 0);
++    }
++
++    #[test]
++    fn warm_kv_g2_seeds_only_the_primer_which_loads_its_context_from_g2() {
++        let (primer, turn) = warm_kv_host_reuse(WarmKv::G2);
++        assert_eq!(primer, Some(8), "both complete blocks load host to device");
++        assert_eq!(turn.unwrap_or(0), 0, "an ordinary turn is not seeded");
++    }
+ }
+ 
+ impl<PlacementPolicyImpl, Observation, Metadata>
+@@ -3390,6 +3525,7 @@ where
+         let next_evidence = ReplayEvidenceCollector::new(self.evidence.options());
+         self.collector
+             .set_runtime_evidence(std::mem::replace(&mut self.evidence, next_evidence).finish());
++        self.warm_kv_seeds.log_summary();
+         self.collector.g3_offload = self.engine.g3_stats();
+         self.collector.kvcr = self.engine.kvcr_stats();
+         self.collector.g2_domains = self.engine.g2_domains();
+diff --git a/crates/core/src/replay/mod.rs b/crates/core/src/replay/mod.rs
+index 36395baff..4171caf13 100644
+--- a/crates/core/src/replay/mod.rs
++++ b/crates/core/src/replay/mod.rs
+@@ -34,6 +34,7 @@ pub(crate) mod scaling;
+ mod spec;
+ pub(crate) mod state;
+ mod telemetry;
++mod warm_kv;
+ 
+ #[derive(Clone)]
+ pub(crate) struct OfflineDisaggReplayConfig {

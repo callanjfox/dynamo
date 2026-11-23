@@ -1,0 +1,12 @@
+# Today: the KV router with per-class quanta and busy thresholds, no admission control.
+default_policy_class: standard
+policy_classes:
+  - name: priority
+    quantum: 8
+    prefill_busy_threshold_frac: 1.0
+  - name: standard
+    quantum: 4
+    prefill_busy_threshold_frac: 0.95
+  - name: batch
+    quantum: 1
+    prefill_busy_threshold_frac: 0.85

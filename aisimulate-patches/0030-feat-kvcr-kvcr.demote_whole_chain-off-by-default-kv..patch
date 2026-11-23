@@ -1,0 +1,285 @@
+From 82bb5385c685116fed40d6790a427553c349d106 Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Sat, 14 Nov 2026 18:41:06 +1000
+Subject: [PATCH 30/38] feat(kvcr): kvcr.demote_whole_chain (off by default):
+ kv.demote starts its tail walk at the end of the single-child chain G1 caches
+ below the request's last block (the turn's output blocks), so a demote of a
+ finished turn's prompt is no longer stopped at once by its own output blocks
+ (43% of demotes dropped nothing for that reason); CachedChains keeps each
+ block's last stored child. Probe AISIM_KV_PROBE prints one line per demote
+ (walk length, blocks below, G1 and G2 residency, dropped, why it stopped);
+ unit test
+
+---
+ crates/core/src/engine/config.rs              |  7 +++
+ .../core/src/engine/kv_manager/g1_manager.rs  |  4 ++
+ .../src/engine/kv_manager/vllm_backend.rs     | 47 ++++++++++++++++---
+ crates/core/src/engine/kvcr.rs                |  5 ++
+ crates/core/src/engine/scheduler/vllm/core.rs | 42 ++++++++++++++++-
+ .../src/engine/scheduler/vllm/host_offload.rs | 47 +++++++++++++++++++
+ 6 files changed, 144 insertions(+), 8 deletions(-)
+
+diff --git a/crates/core/src/engine/config.rs b/crates/core/src/engine/config.rs
+index 4c887bfec..1f9045a98 100644
+--- a/crates/core/src/engine/config.rs
++++ b/crates/core/src/engine/config.rs
+@@ -429,6 +429,12 @@ pub struct KvcrConfig {
+     /// LRU and re-enter it as the newest, in key order, when the pull unpins them.
+     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+     pub keep_source_recency: bool,
++    /// `kv.demote` drops the whole cached chain under the request's blocks: the walk from the
++    /// tail starts at the last block of the single-child chain G1 caches below the request's last
++    /// block (the turn's own output blocks), not at the request's last prompt block, which those
++    /// output blocks extend (so it was never childless and nothing was dropped). Off by default.
++    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
++    pub demote_whole_chain: bool,
+ }
+ 
+ impl KvcrConfig {
+@@ -450,6 +456,7 @@ impl Default for KvcrConfig {
+             bandwidth_gbps: 50.0,
+             peer_hbm: false,
+             keep_source_recency: false,
++            demote_whole_chain: false,
+         }
+     }
+ }
+diff --git a/crates/core/src/engine/kv_manager/g1_manager.rs b/crates/core/src/engine/kv_manager/g1_manager.rs
+index 202ac0ade..0c805b8b0 100644
+--- a/crates/core/src/engine/kv_manager/g1_manager.rs
++++ b/crates/core/src/engine/kv_manager/g1_manager.rs
+@@ -287,6 +287,10 @@ impl G1Manager {
+         self.inner.has_cached_child(hash)
+     }
+ 
++    pub(crate) fn cached_only_descendants(&self, hash: u64) -> Vec<u64> {
++        self.inner.cached_only_descendants(hash)
++    }
++
+     pub(crate) fn prefetch_cached_blocks(
+         &mut self,
+         hashes: &[u64],
+diff --git a/crates/core/src/engine/kv_manager/vllm_backend.rs b/crates/core/src/engine/kv_manager/vllm_backend.rs
+index c53b5023c..93b2d4c9b 100644
+--- a/crates/core/src/engine/kv_manager/vllm_backend.rs
++++ b/crates/core/src/engine/kv_manager/vllm_backend.rs
+@@ -19,6 +19,29 @@ use crate::engine::belady::BeladyOracle;
+ pub(crate) struct CachedChains {
+     parent_of: rustc_hash::FxHashMap<SequenceHash, SequenceHash>,
+     children: rustc_hash::FxHashMap<SequenceHash, u32>,
++    /// The child last stored under each block, for `kvcr.demote_whole_chain` (followed only where
++    /// a block has exactly one cached child).
++    last_child: rustc_hash::FxHashMap<SequenceHash, SequenceHash>,
++}
++
++impl CachedChains {
++    /// The single-child chain G1 caches below `hash`, nearest first; stops at a block with no
++    /// cached child or with more than one.
++    fn only_descendants(&self, hash: SequenceHash) -> Vec<SequenceHash> {
++        let mut out = Vec::new();
++        let mut at = hash;
++        while self.children.get(&at) == Some(&1) {
++            let Some(&child) = self.last_child.get(&at) else {
++                break;
++            };
++            if self.parent_of.get(&child) != Some(&at) {
++                break;
++            }
++            out.push(child);
++            at = child;
++        }
++        out
++    }
+ }
+ pub(crate) use crate::engine::cache::vllm_block_pool::SourceReuseDependency;
+ use crate::engine::cache::vllm_block_pool::{
+@@ -416,6 +439,14 @@ impl VllmKvManager {
+             .is_some_and(|c| c.children.get(&hash).is_some_and(|n| *n > 0))
+     }
+ 
++    /// The single-child chain G1 caches below `hash`, nearest first (empty when chains are not
++    /// tracked).
++    pub(crate) fn cached_only_descendants(&self, hash: SequenceHash) -> Vec<SequenceHash> {
++        self.chain
++            .as_ref()
++            .map_or_else(Vec::new, |c| c.only_descendants(hash))
++    }
++
+     pub(crate) fn take_evicted(&mut self) -> Vec<SequenceHash> {
+         self.evicted_log.as_mut().map(std::mem::take).unwrap_or_default()
+     }
+@@ -1843,6 +1874,7 @@ impl VllmKvManager {
+                     {
+                         chain.parent_of.insert(hash, p);
+                         *chain.children.entry(p).or_default() += 1;
++                        chain.last_child.insert(p, hash);
+                     }
+                     parent = Some(hash);
+                 }
+@@ -1866,12 +1898,15 @@ impl VllmKvManager {
+                             );
+                         }
+                     }
+-                    if let Some(p) = chain.parent_of.remove(hash)
+-                        && let Some(n) = chain.children.get_mut(&p)
+-                    {
+-                        *n -= 1;
+-                        if *n == 0 {
+-                            chain.children.remove(&p);
++                    if let Some(p) = chain.parent_of.remove(hash) {
++                        if chain.last_child.get(&p) == Some(hash) {
++                            chain.last_child.remove(&p);
++                        }
++                        if let Some(n) = chain.children.get_mut(&p) {
++                            *n -= 1;
++                            if *n == 0 {
++                                chain.children.remove(&p);
++                            }
+                         }
+                     }
+                 }
+diff --git a/crates/core/src/engine/kvcr.rs b/crates/core/src/engine/kvcr.rs
+index 5740cb299..38e3e0a22 100644
+--- a/crates/core/src/engine/kvcr.rs
++++ b/crates/core/src/engine/kvcr.rs
+@@ -431,6 +431,11 @@ impl KvcrRegistry {
+         self.config.keep_source_recency
+     }
+ 
++    /// `kvcr.demote_whole_chain`: a demote also drops the cached chain below its last block.
++    pub(crate) fn demote_whole_chain(&self) -> bool {
++        self.config.demote_whole_chain
++    }
++
+     /// Every registered rank's G2 but `except`, for the KVCR probe.
+     pub(crate) fn peer_tiers(&self, except: KvHintSource) -> Vec<(KvHintSource, HostTierHandle)> {
+         self.ranks
+diff --git a/crates/core/src/engine/scheduler/vllm/core.rs b/crates/core/src/engine/scheduler/vllm/core.rs
+index 8c1437c3a..67f423161 100644
+--- a/crates/core/src/engine/scheduler/vllm/core.rs
++++ b/crates/core/src/engine/scheduler/vllm/core.rs
+@@ -2622,19 +2622,57 @@ impl VllmCore {
+                     // and their later removals (or a store under one of them) fail ("Failed to
+                     // find block", "... parent block").
+                     if let Some(adapter) = adapter {
+-                        for &hash in hashes.iter().rev() {
++                        // Probe (AISIM_KV_PROBE set): one line per demote, where and why the walk
++                        // from the tail stopped.
++                        let probe = std::env::var_os("AISIM_KV_PROBE").is_some();
++                        // `kvcr.demote_whole_chain`: start from the end of the single-child chain
++                        // G1 caches below the request's last cached block (its output blocks).
++                        let mut walk = hashes.clone();
++                        let mut below = 0usize;
++                        if adapter.demote_whole_chain()
++                            && let Some(at) = hashes
++                                .iter()
++                                .rposition(|hash| self.kv_manager.has_cached_block(*hash))
++                        {
++                            let more = self.kv_manager.cached_only_descendants(hashes[at]);
++                            below = more.len();
++                            walk.truncate(at + 1);
++                            walk.extend(more);
++                        }
++                        let mut skipped = 0usize;
++                        let mut stop = "end";
++                        for &hash in walk.iter().rev() {
+                             if !self.kv_manager.has_cached_block(hash) {
++                                skipped += 1;
+                                 continue;
+                             }
+-                            if !adapter.g2_resident(hash) || self.kv_manager.has_cached_child(hash) {
++                            if !adapter.g2_resident(hash) {
++                                stop = "not_in_g2";
++                                break;
++                            }
++                            if self.kv_manager.has_cached_child(hash) {
++                                stop = "has_child";
+                                 break;
+                             }
+                             let dropped = self.kv_manager.drop_cached_blocks(&[hash]);
+                             if dropped.is_empty() {
++                                stop = "in_use";
+                                 break;
+                             }
+                             affected.extend(dropped);
+                         }
++                        if probe {
++                            let in_g2 = walk.iter().filter(|hash| adapter.g2_resident(**hash)).count();
++                            let in_g1 = walk
++                                .iter()
++                                .filter(|hash| self.kv_manager.has_cached_block(**hash))
++                                .count();
++                            eprintln!(
++                                "kv_probe demote t_ms={now_ms:.0} hashes={} below={below} in_g1={in_g1} in_g2={in_g2} uncached_tail={skipped} dropped={} stop={stop}",
++                                hashes.len(),
++                                affected.len()
++                            );
++                        }
+                     }
+                 } else if g1 {
+                     // Invalidate: drop only blocks no cached block extends, repeatedly, so the
+diff --git a/crates/core/src/engine/scheduler/vllm/host_offload.rs b/crates/core/src/engine/scheduler/vllm/host_offload.rs
+index b3026df08..426502e44 100644
+--- a/crates/core/src/engine/scheduler/vllm/host_offload.rs
++++ b/crates/core/src/engine/scheduler/vllm/host_offload.rs
+@@ -354,6 +354,13 @@ impl VllmHostOffloadAdapter {
+         }
+     }
+ 
++    /// `kvcr.demote_whole_chain` (needs KVCR, which carries the config).
++    pub(super) fn demote_whole_chain(&self) -> bool {
++        self.kvcr
++            .as_ref()
++            .is_some_and(|kvcr| kvcr.registry().lock().unwrap().demote_whole_chain())
++    }
++
+     /// Whether this rank's G2 holds `hash` resident.
+     pub(super) fn g2_resident(&self, hash: u64) -> bool {
+         matches!(
+@@ -1472,6 +1479,46 @@ mod tests {
+         }
+     }
+ 
++    /// A demote of A's prompt blocks after B extended A's chain by one block (as a turn's output
++    /// blocks extend its prompt): returns A's hashes, B's extra block, and the core.
++    fn demote_under_a_longer_chain(whole_chain: bool) -> (Vec<u64>, u64, VllmCore) {
++        let mut core = block_action_core(16, 8, false);
++        let registry = crate::engine::kvcr::KvcrRegistry::new(crate::engine::KvcrConfig {
++            demote_whole_chain: whole_chain,
++            ..Default::default()
++        });
++        core.set_kvcr(
++            Arc::clone(&registry),
++            KvHintSource {
++                worker_id: 0,
++                dp_rank: 0,
++            },
++        );
++        let mut now_ms = 0.0;
++        let a_tokens: Vec<u32> = (1..=8).collect();
++        let a = Uuid::from_u128(55);
++        run_to_completion(&mut core, a, a_tokens.clone(), &mut now_ms);
++        let b_tokens: Vec<u32> = (1..=12).collect();
++        let b = Uuid::from_u128(56);
++        run_to_completion(&mut core, b, b_tokens.clone(), &mut now_ms);
++        let a_hashes = prompt_hashes(a, a_tokens);
++        let b_hashes = prompt_hashes(b, b_tokens);
++        assert_eq!(b_hashes[..2], a_hashes[..]);
++        assert!(b_hashes.iter().all(|hash| core.kv_residency(*hash) == (true, true)));
++        core.apply_command(drop_blocks(&a_hashes, true, false, true)).unwrap();
++        (a_hashes, b_hashes[2], core)
++    }
++
++    #[test]
++    fn demote_whole_chain_drops_the_cached_blocks_below_the_request() {
++        // Off (the default): A's last block has a cached child, so nothing is dropped.
++        let (a, below, core) = demote_under_a_longer_chain(false);
++        assert!(a.iter().chain([&below]).all(|hash| core.kv_residency(*hash) == (true, true)));
++        // On: the walk starts at the chain's end, so the child and then A's blocks go, tail first.
++        let (a, below, core) = demote_under_a_longer_chain(true);
++        assert!(a.iter().chain([&below]).all(|hash| core.kv_residency(*hash) == (false, true)));
++    }
++
+     #[test]
+     fn write_back_writes_g1_evictions_to_g2_and_loads_exclusively() {
+         // G1 of two blocks, G2 of eight.

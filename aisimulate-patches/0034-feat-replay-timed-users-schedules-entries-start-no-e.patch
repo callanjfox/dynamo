@@ -1,0 +1,338 @@
+From 1b9828299984f679419a28e140193fc57a1e139f Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Tue, 17 Nov 2026 22:49:43 +0000
+Subject: [PATCH 34/38] feat(replay): timed users schedules: entries start no
+ earlier than at_s, are skipped at or after until_s (the user has left), and
+ hold nodes until absolute times (correlated idle returns); schema
+ dynosim.users.schedule.timed (an untimed schedule with these fields is
+ refused); a user whose plan ends with a stay that ends is not out of entries;
+ unit tests
+
+---
+ crates/core/src/replay/loadgen/driver.rs |  32 +++-
+ crates/core/src/replay/loadgen/users.rs  | 206 ++++++++++++++++++++++-
+ 2 files changed, 227 insertions(+), 11 deletions(-)
+
+diff --git a/crates/core/src/replay/loadgen/driver.rs b/crates/core/src/replay/loadgen/driver.rs
+index 02ad4670c..5354a00f3 100644
+--- a/crates/core/src/replay/loadgen/driver.rs
++++ b/crates/core/src/replay/loadgen/driver.rs
+@@ -3766,22 +3766,38 @@ impl WorkloadDriver {
+ 
+     /// Starts user `user`'s next schedule entry at `start_ms` (its roots become ready then), unless
+     /// the user has none left or the start is at or past the horizon. An empty template is skipped.
+-    fn users_start_next(&mut self, user: usize, start_ms: f64) -> Result<()> {
++    /// In a timed run an entry starts no earlier than its `at_s`, is skipped when it would start at
++    /// or after its `until_s`, and its held nodes are not ready before their times.
++    fn users_start_next(&mut self, user: usize, mut start_ms: f64) -> Result<()> {
+         let users = self.users.as_mut().expect("users run");
+         if start_ms >= users.horizon_ms() {
+             return Ok(());
+         }
+         let corpus = Arc::clone(&users.spec.corpus);
+-        let (position, template_index) = loop {
++        let (position, template_index, holds) = loop {
+             let position = users.next_entry[user];
+             let Some(&template_index) = users.spec.plans[user].get(position) else {
+-                users.users_out_of_entries += 1;
+-                tracing::warn!(user, position, "users run: a user ran out of schedule entries");
++                if !users.spec.left_for_good(user) {
++                    users.users_out_of_entries += 1;
++                    tracing::warn!(user, position, "users run: a user ran out of schedule entries");
++                }
+                 return Ok(());
+             };
+             users.next_entry[user] += 1;
++            let mut holds = Vec::new();
++            if let Some(timing) = users.spec.entry_timing(user, position) {
++                let start = start_ms.max(timing.at_ms);
++                if timing.until_ms.is_some_and(|until| start >= until) {
++                    continue;
++                }
++                if start >= users.horizon_ms() {
++                    return Ok(());
++                }
++                start_ms = start;
++                holds.clone_from(&timing.holds);
++            }
+             if !corpus.templates[template_index].nodes.is_empty() {
+-                break (position, template_index);
++                break (position, template_index, holds);
+             }
+         };
+         let template = &corpus.templates[template_index];
+@@ -3858,6 +3874,12 @@ impl WorkloadDriver {
+         state.lanes[user].active_play = Some(play_index);
+         users.copies.push(copy);
+         state.activate_play(play_index, start_ms, &mut self.sessions, &mut self.ready_sessions);
++        // Held nodes are not roots (validated), so they are still blocked: their dependencies
++        // release them no earlier than the hold.
++        for (node, until_ms) in holds {
++            let index = node_offset + node as usize;
++            state.ready_after_ms[index] = state.ready_after_ms[index].max(until_ms);
++        }
+         Ok(())
+     }
+ 
+diff --git a/crates/core/src/replay/loadgen/users.rs b/crates/core/src/replay/loadgen/users.rs
+index 6b309c5d0..ac81751dd 100644
+--- a/crates/core/src/replay/loadgen/users.rs
++++ b/crates/core/src/replay/loadgen/users.rs
+@@ -265,6 +265,29 @@ struct PlanUser {
+ #[derive(Deserialize)]
+ struct PlanEntry {
+     tmpl: usize,
++    /// Timed schedules only: the entry does not start before this time (a user joining).
++    #[serde(default)]
++    at_s: Option<f64>,
++    /// Timed schedules only: the entry is skipped when it would start at or after this time (the
++    /// user has left).
++    #[serde(default)]
++    until_s: Option<f64>,
++    /// Timed schedules only: (template node, time): the node is not ready before the time
++    /// (absolute; a session idle until a correlated return).
++    #[serde(default)]
++    holds: Vec<(u32, f64)>,
++}
++
++/// The users schedule schema; a timed schedule adds per-entry `at_s`, `until_s` and `holds`.
++pub const USERS_SCHEMA: &str = "dynosim.users.schedule";
++pub const USERS_SCHEMA_TIMED: &str = "dynosim.users.schedule.timed";
++
++/// A timed schedule entry's start floor, skip time and holds, in ms.
++#[derive(Debug, Clone, Default, PartialEq)]
++pub struct EntryTiming {
++    pub at_ms: f64,
++    pub until_ms: Option<f64>,
++    pub holds: Vec<(u32, f64)>,
+ }
+ 
+ /// A users run: templates, each user's entries (template indexes), the horizon and cooldowns.
+@@ -277,6 +300,8 @@ pub struct AgenticUsers {
+     pub(super) loss_cooldown_ms: f64,
+     /// Each user's class for the engine, when the schedule sets `engine_classes`.
+     pub(super) engine_classes: Option<Vec<String>>,
++    /// Per user and entry, a timed schedule's start floor, skip time and holds (`None`: untimed).
++    pub(super) timing: Option<Vec<Vec<EntryTiming>>>,
+ }
+ 
+ impl AgenticUsers {
+@@ -286,8 +311,9 @@ impl AgenticUsers {
+             .with_context(|| format!("reading users schedule {}", schedule.display()))?;
+         let file: ScheduleFile = serde_json::from_str(&text)
+             .with_context(|| format!("parsing users schedule {}", schedule.display()))?;
++        let timed = file.schema == USERS_SCHEMA_TIMED;
+         ensure!(
+-            file.schema == "dynosim.users.schedule",
++            timed || file.schema == USERS_SCHEMA,
+             "unknown users schedule schema {}",
+             file.schema
+         );
+@@ -304,11 +330,26 @@ impl AgenticUsers {
+         let classes = file
+             .engine_classes
+             .then(|| file.plan.iter().map(|user| user.cls.clone()).collect());
+-        let plans = file
+-            .plan
+-            .into_iter()
+-            .map(|user| user.entries.into_iter().map(|e| e.tmpl).collect::<Vec<_>>())
+-            .collect::<Vec<_>>();
++        let mut timing = Vec::with_capacity(file.plan.len());
++        let mut plans = Vec::with_capacity(file.plan.len());
++        for user in file.plan {
++            let mut tmpls = Vec::with_capacity(user.entries.len());
++            let mut times = Vec::with_capacity(user.entries.len());
++            for e in user.entries {
++                ensure!(
++                    timed || (e.at_s.is_none() && e.until_s.is_none() && e.holds.is_empty()),
++                    "a schedule entry with at_s, until_s or holds needs schema {USERS_SCHEMA_TIMED}"
++                );
++                tmpls.push(e.tmpl);
++                times.push(EntryTiming {
++                    at_ms: e.at_s.unwrap_or(0.0) * 1000.0,
++                    until_ms: e.until_s.map(|s| s * 1000.0),
++                    holds: e.holds.into_iter().map(|(n, s)| (n, s * 1000.0)).collect(),
++                });
++            }
++            plans.push(tmpls);
++            timing.push(times);
++        }
+         let mut users = Self::new(
+             corpus,
+             plans,
+@@ -317,6 +358,9 @@ impl AgenticUsers {
+             file.loss_cooldown_s,
+         )?;
+         users.engine_classes = classes;
++        if timed {
++            users = users.with_timing(timing)?;
++        }
+         Ok(users)
+     }
+ 
+@@ -355,8 +399,52 @@ impl AgenticUsers {
+             cooldown_ms: cooldown_s * 1000.0,
+             loss_cooldown_ms: loss_cooldown_s * 1000.0,
+             engine_classes: None,
++            timing: None,
+         })
+     }
++
++    /// A timed run: per user and entry, the start floor, skip time and holds (ms). A hold names a
++    /// template node that is not a root (roots are ready when the copy starts).
++    pub(super) fn with_timing(mut self, timing: Vec<Vec<EntryTiming>>) -> Result<Self> {
++        ensure!(timing.len() == self.plans.len(), "timing needs one list per user");
++        for (entries, times) in self.plans.iter().zip(&timing) {
++            ensure!(entries.len() == times.len(), "timing needs one value per schedule entry");
++            for (&t, e) in entries.iter().zip(times) {
++                ensure!(e.at_ms.is_finite() && e.at_ms >= 0.0, "at_s must be finite and >= 0");
++                ensure!(
++                    e.until_ms.is_none_or(|u| u.is_finite() && u >= 0.0),
++                    "until_s must be finite and >= 0"
++                );
++                let template = &self.corpus.templates[t];
++                for &(node, until) in &e.holds {
++                    ensure!(
++                        (node as usize) < template.nodes.len(),
++                        "hold names node {node} of template {t}, which has {} nodes",
++                        template.nodes.len()
++                    );
++                    ensure!(
++                        !template.roots.contains(&node),
++                        "hold names root node {node} of template {t}: use at_s to delay a start"
++                    );
++                    ensure!(until.is_finite() && until >= 0.0, "a hold time must be finite and >= 0");
++                }
++            }
++        }
++        self.timing = Some(timing);
++        Ok(self)
++    }
++
++    /// Entry `position` of user `user`'s timing, in a timed run.
++    pub(super) fn entry_timing(&self, user: usize, position: usize) -> Option<&EntryTiming> {
++        self.timing.as_ref().map(|t| &t[user][position])
++    }
++
++    /// Whether user `user` has left for good: a timed plan whose last entry has a skip time.
++    pub(super) fn left_for_good(&self, user: usize) -> bool {
++        self.timing
++            .as_ref()
++            .is_some_and(|t| t[user].last().is_some_and(|e| e.until_ms.is_some()))
++    }
+ }
+ 
+ /// One instantiated copy of a template (one per agentic play of a users run).
+@@ -542,6 +630,112 @@ mod tests {
+         assert_eq!(classes, vec![Some("priority".into()), Some("batch".into())]);
+     }
+ 
++    fn timed(at_s: f64, until_s: Option<f64>, holds: Vec<(u32, f64)>) -> EntryTiming {
++        EntryTiming {
++            at_ms: at_s * 1000.0,
++            until_ms: until_s.map(|s| s * 1000.0),
++            holds: holds.into_iter().map(|(n, s)| (n, s * 1000.0)).collect(),
++        }
++    }
++
++    #[test]
++    fn timed_users_join_at_their_time_and_skip_entries_after_leaving() {
++        // User 0 joins at 100 s. User 1 plays template 1, then an entry it has left by (until 4 s),
++        // then joins again at 50 s with template 0.
++        let users = AgenticUsers::new(corpus(), vec![vec![1], vec![1, 1, 0]], 3600.0, 2.0, 120.0)
++            .unwrap()
++            .with_timing(vec![
++                vec![timed(100.0, None, vec![])],
++                vec![
++                    timed(0.0, Some(4.0), vec![]),
++                    timed(0.0, Some(4.0), vec![]),
++                    timed(50.0, None, vec![]),
++                ],
++            ])
++            .unwrap();
++        let mut d = WorkloadDriver::new_agentic_users(users, 4, true).unwrap();
++        let first = d.pop_ready(0.0, usize::MAX);
++        assert_eq!(first.iter().map(id).collect::<Vec<_>>(), vec!["cp000001000000:t1:r0"]);
++        // Done at 5 s: the next entry would start at 7 s, after its until (4 s), so it is skipped.
++        d.on_complete(first[0].request_uuid, 5000.0).unwrap();
++        assert_eq!(d.next_ready_time_ms(), Some(50_000.0));
++        assert!(d.pop_ready(49_999.0, usize::MAX).is_empty());
++        let back = d.pop_ready(50_000.0, usize::MAX);
++        assert_eq!(back.iter().map(id).collect::<Vec<_>>(), vec!["cp000001000002:t0:r0"]);
++        assert!(d.pop_ready(99_999.0, usize::MAX).is_empty());
++        let joined = d.pop_ready(100_000.0, usize::MAX);
++        assert_eq!(joined.iter().map(id).collect::<Vec<_>>(), vec!["cp000000000000:t1:r0"]);
++    }
++
++    #[test]
++    fn a_hold_keeps_a_later_turn_until_its_time() {
++        let users = AgenticUsers::new(corpus(), vec![vec![0]], 3600.0, 2.0, 120.0)
++            .unwrap()
++            .with_timing(vec![vec![timed(0.0, None, vec![(1, 60.0)])]])
++            .unwrap();
++        let mut d = WorkloadDriver::new_agentic_users(users, 4, true).unwrap();
++        let first = d.pop_ready(0.0, usize::MAX);
++        d.on_complete(first[0].request_uuid, 5000.0).unwrap();
++        // Without the hold r1 is ready at 6 s; held, at 60 s.
++        assert_eq!(d.next_ready_time_ms(), Some(60_000.0));
++        assert!(d.pop_ready(59_999.0, usize::MAX).is_empty());
++        assert_eq!(id(&d.pop_ready(60_000.0, usize::MAX)[0]), "cp000000000000:t0:r1");
++    }
++
++    #[test]
++    fn a_user_that_left_is_not_out_of_entries() {
++        let users = AgenticUsers::new(corpus(), vec![vec![1], vec![1]], 3600.0, 2.0, 120.0)
++            .unwrap()
++            .with_timing(vec![vec![timed(0.0, Some(30.0), vec![])], vec![timed(0.0, None, vec![])]])
++            .unwrap();
++        let mut d = WorkloadDriver::new_agentic_users(users, 4, true).unwrap();
++        let first = d.pop_ready(0.0, usize::MAX);
++        for t in &first {
++            d.on_complete(t.request_uuid, 5000.0).unwrap();
++        }
++        assert!(d.pop_ready(10_000.0, usize::MAX).is_empty());
++        // User 1 (no until on its last entry) ran out; user 0 left.
++        assert_eq!(d.users_out_of_entries(), Some(1));
++    }
++
++    #[test]
++    fn timing_is_validated() {
++        let new = || AgenticUsers::new(corpus(), vec![vec![0]], 3600.0, 2.0, 120.0).unwrap();
++        assert!(new().with_timing(vec![vec![timed(0.0, None, vec![(0, 5.0)])]]).is_err(), "a root");
++        assert!(new().with_timing(vec![vec![timed(0.0, None, vec![(2, 5.0)])]]).is_err(), "no node 2");
++        assert!(new().with_timing(vec![vec![timed(-1.0, None, vec![])]]).is_err());
++        assert!(new().with_timing(vec![]).is_err());
++    }
++
++    #[test]
++    fn timing_fields_need_the_timed_schema() {
++        let dir = std::env::temp_dir().join(format!("users-timed-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let templates = dir.join("templates.jsonl");
++        std::fs::write(
++            &templates,
++            concat!(
++                r#"{"schema":"dynosim.users.templates","version":1,"block_size":4,"templates":1,"cold":1}"#,
++                "\n",
++                r#"{"i":0,"blocks":1,"nodes":[["t1:r0","t1:s",4,1,0.0,[],-1,0,[0]]]}"#,
++                "\n"
++            ),
++        )
++        .unwrap();
++        let schedule = |schema: &str| {
++            let path = dir.join(format!("{schema}.json"));
++            let text = format!(
++                r#"{{"schema":"{schema}","horizon_s":60,"templates":"{}","plan":[{{"cls":"priority","entries":[{{"tmpl":0,"at_s":5}}]}}]}}"#,
++                templates.display()
++            );
++            std::fs::write(&path, text).unwrap();
++            AgenticUsers::load(&path)
++        };
++        assert!(schedule(USERS_SCHEMA).is_err());
++        let users = schedule(USERS_SCHEMA_TIMED).unwrap();
++        assert_eq!(users.entry_timing(0, 0).unwrap().at_ms, 5000.0);
++    }
++
+     #[test]
+     fn a_failed_play_waits_the_loss_cooldown() {
+         let mut d = driver(3600.0);

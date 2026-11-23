@@ -271,8 +271,8 @@ inherits = "release"
 debug = true
 strip = false
 
-# Replay gate: AISimulate with PlacementPolicy::next_wakeup_ms (branch replay-gate-wakeup of
-# ai-dynamo/aisimulate at 03eadda3, the source of the pinned 0.13.0-dev.202610290000000087).
-# Clone aisimulate next to this checkout. Patch: dynamo-admission-sim dynamo-plugin/aisimulate-patches/.
+# Session scheduler: AISimulate (github.com/ai-dynamo/aisim) at 03eadda3, the source of the pinned
+# 0.13.0-dev.202610290000000087, with this repository's aisimulate-patches/ applied (git am).
+# Clone it as `aisimulate` next to this checkout (docs/mocker-quickstart.md).
 [patch.crates-io]
 aisimulate-core = { path = "../aisimulate/crates/core" }

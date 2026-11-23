@@ -1,0 +1,15 @@
+{
+  "order": [
+    "priority",
+    "standard",
+    "batch"
+  ],
+  "preempt_max_rank": 0,
+  "itl_target_ms": [
+    50.0,
+    100.0,
+    null
+  ],
+  "protect_max_rank": null,
+  "yield_decodes": false
+}

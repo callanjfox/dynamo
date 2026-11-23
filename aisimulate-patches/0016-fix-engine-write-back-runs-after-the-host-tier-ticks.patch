@@ -1,0 +1,52 @@
+From 28f73f4adcab25e42ebb7d804bc07d77407fff91 Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Thu, 12 Nov 2026 21:20:28 +1000
+Subject: [PATCH 16/38] fix(engine): write-back runs after the host tier ticks
+ due completions (it mutated the tier first and tripped its ordering check at
+ scale)
+
+---
+ crates/core/src/engine/scheduler/vllm/core.rs | 20 +++++++++++++------
+ 1 file changed, 14 insertions(+), 6 deletions(-)
+
+diff --git a/crates/core/src/engine/scheduler/vllm/core.rs b/crates/core/src/engine/scheduler/vllm/core.rs
+index 897e92187..e62ec017b 100644
+--- a/crates/core/src/engine/scheduler/vllm/core.rs
++++ b/crates/core/src/engine/scheduler/vllm/core.rs
+@@ -1736,22 +1736,30 @@ impl VllmCore {
+         let Some(adapter) = self.native_host_offload.as_mut() else {
+             return;
+         };
+-        if adapter.writes_back() {
+-            adapter.write_back_evicted(self.kv_manager.take_evicted(), now_ms);
+-        }
++        // Due host completions are ticked before write-back mutates the tier (the tier
++        // refuses a mutation past an unticked completion), and loads they finish may evict too.
+         let progress = adapter.advance(&mut self.kv_manager, now_ms);
+         self.apply_host_progress(progress);
++        if let Some(adapter) = self.native_host_offload.as_mut()
++            && adapter.writes_back()
++        {
++            adapter.write_back_evicted(self.kv_manager.take_evicted(), now_ms);
++        }
+     }
+ 
+     pub(crate) fn complete_engine_boundary(&mut self, now_ms: f64) {
+         let Some(adapter) = self.native_host_offload.as_mut() else {
+             return;
+         };
+-        if adapter.writes_back() {
+-            adapter.write_back_evicted(self.kv_manager.take_evicted(), now_ms);
+-        }
++        // Due host completions are ticked before write-back mutates the tier (the tier
++        // refuses a mutation past an unticked completion), and loads they finish may evict too.
+         let progress = adapter.complete_engine_boundary(&mut self.kv_manager, now_ms);
+         self.apply_host_progress(progress);
++        if let Some(adapter) = self.native_host_offload.as_mut()
++            && adapter.writes_back()
++        {
++            adapter.write_back_evicted(self.kv_manager.take_evicted(), now_ms);
++        }
+     }
+ 
+     fn apply_host_progress(&mut self, progress: HostTransferProgress) {

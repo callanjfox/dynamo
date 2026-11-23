@@ -1,0 +1,30 @@
+From 4ec34f160396d40f6164acde8497b82311a0eb9e Mon Sep 17 00:00:00 2001
+From: callan <callanf@nvidia.com>
+Date: Fri, 13 Nov 2026 00:53:01 +1000
+Subject: [PATCH 19/38] fix(prefetch): a prefetch run whose parent the run's
+ own room evicted loads nothing; published under a parent the router's indexer
+ no longer holds, its blocks never attached and their later removals named
+ blocks the indexer never stored (demote + prefetch stopped the replay)
+
+---
+ crates/core/src/engine/kv_manager/vllm_backend.rs | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/crates/core/src/engine/kv_manager/vllm_backend.rs b/crates/core/src/engine/kv_manager/vllm_backend.rs
+index faedc5925..53c0341bc 100644
+--- a/crates/core/src/engine/kv_manager/vllm_backend.rs
++++ b/crates/core/src/engine/kv_manager/vllm_backend.rs
+@@ -1416,6 +1416,13 @@ impl VllmKvManager {
+             return Vec::new();
+         };
+         self.publish_removed(std::mem::take(&mut outcome.removed));
++        // The room may have come from evicting the run's parent (an idle cached block). A run
++        // published under a parent the router's indexer no longer holds cannot attach there, and
++        // its later removals name blocks the indexer never stored: load nothing then.
++        if parent.is_some_and(|parent| !self.pool.has_cached(parent)) {
++            self.pool.cancel(outcome.reservation);
++            return Vec::new();
++        }
+         let mut loaded = Vec::with_capacity(hashes.len());
+         for &hash in hashes {
+             let (copy, _) = self.pool.allocate_cached(&mut outcome.reservation, hash);
