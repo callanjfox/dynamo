@@ -371,8 +371,11 @@ fn start_approximate_lru_metrics(
     });
 }
 
+/// The session context the router's plugins see. `routing` carries the request body's hints
+/// (f49p): see [`with_body_hints`].
 pub(crate) fn to_worker_selection_session_context(
     context: &crate::protocols::common::extensions::AgentContext,
+    routing: Option<&crate::protocols::common::preprocessor::RoutingHints>,
 ) -> dynamo_router_protocol::session::SessionContext {
     use crate::protocols::common::extensions::{AgentContext, InputTrigger};
     use dynamo_router_protocol::session::{SessionContext, WorkerSelectionInputTrigger};
@@ -396,7 +399,45 @@ pub(crate) fn to_worker_selection_session_context(
         *session_final,
         input_trigger,
     )
-    .with_agent_headers(agent_headers.clone())
+    .with_agent_headers(with_body_hints(agent_headers, routing))
+}
+
+/// f49p: the hint header for the expected output length (`nvext.agent_hints.osl`).
+pub(crate) const HEADER_HINT_OSL: &str = "x-dynamo-hint-osl";
+/// f49p: the hint header for the request priority (`nvext.agent_hints.priority`).
+pub(crate) const HEADER_HINT_PRIORITY: &str = "x-dynamo-hint-priority";
+
+/// f49p: the request body's `nvext.agent_hints.osl` and `.priority` as the hint headers the
+/// router plugins read, so a client may send either. The preprocessor carries them as
+/// `RoutingHints::expected_output_tokens` and `::priority` (`x-dynamo-request-priority` is already
+/// folded into the latter). A hint header the client sent wins; one with only blank values counts
+/// as missing. Without a body hint to add, the headers are shared, not copied.
+fn with_body_hints(
+    agent_headers: &std::sync::Arc<std::collections::BTreeMap<String, Vec<String>>>,
+    routing: Option<&crate::protocols::common::preprocessor::RoutingHints>,
+) -> std::sync::Arc<std::collections::BTreeMap<String, Vec<String>>> {
+    let missing = |name: &str| {
+        agent_headers
+            .get(name)
+            .is_none_or(|values| values.iter().all(|value| value.trim().is_empty()))
+    };
+    let osl = routing
+        .and_then(|hints| hints.expected_output_tokens)
+        .filter(|_| missing(HEADER_HINT_OSL));
+    let priority = routing
+        .and_then(|hints| hints.priority)
+        .filter(|_| missing(HEADER_HINT_PRIORITY));
+    if osl.is_none() && priority.is_none() {
+        return std::sync::Arc::clone(agent_headers);
+    }
+    let mut merged = agent_headers.as_ref().clone();
+    if let Some(osl) = osl {
+        merged.insert(HEADER_HINT_OSL.to_owned(), vec![osl.to_string()]);
+    }
+    if let Some(priority) = priority {
+        merged.insert(HEADER_HINT_PRIORITY.to_owned(), vec![priority.to_string()]);
+    }
+    std::sync::Arc::new(merged)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2112,7 +2153,7 @@ mod tests {
             input_trigger: Some(InputTrigger::ToolResult),
         };
 
-        let selection_context = to_worker_selection_session_context(&context);
+        let selection_context = to_worker_selection_session_context(&context, None);
 
         assert_eq!(selection_context.session_id(), "child-session");
         assert_eq!(selection_context.parent_session_id(), Some("root-session"));
@@ -2124,6 +2165,73 @@ mod tests {
         assert_eq!(
             selection_context.input_trigger(),
             Some(WorkerSelectionInputTrigger::ToolResult)
+        );
+    }
+
+    /// f49p: hint headers and body hints reach the plugin's session context; a header wins.
+    #[test]
+    fn f49p_hints_reach_session_context_and_headers_win() {
+        use crate::protocols::common::extensions::agent_context_from_headers;
+        use crate::protocols::common::preprocessor::RoutingHints;
+        use axum::http::HeaderMap;
+
+        let session = |hints: &[(&'static str, &'static str)], routing: Option<&RoutingHints>| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-dynamo-session-id", "session".parse().unwrap());
+            for (name, value) in hints {
+                headers.insert(*name, value.parse().unwrap());
+            }
+            let context = agent_context_from_headers(&headers).unwrap();
+            to_worker_selection_session_context(&context, routing)
+        };
+        let first = |context: &dynamo_router_protocol::session::SessionContext, name: &str| {
+            context
+                .agent_headers()
+                .get(name)
+                .and_then(|values| values.first())
+                .cloned()
+        };
+        let body = RoutingHints {
+            expected_output_tokens: Some(700),
+            priority: Some(-3),
+            ..Default::default()
+        };
+
+        // A header passes through, with or without routing hints.
+        let context = session(&[("x-dynamo-hint-osl", "100")], None);
+        assert_eq!(first(&context, HEADER_HINT_OSL).as_deref(), Some("100"));
+        assert_eq!(first(&context, HEADER_HINT_PRIORITY), None);
+        let context = session(
+            &[("x-dynamo-hint-next-tokens", "9")],
+            Some(&RoutingHints::default()),
+        );
+        assert_eq!(
+            first(&context, "x-dynamo-hint-next-tokens").as_deref(),
+            Some("9")
+        );
+        assert_eq!(first(&context, HEADER_HINT_OSL), None);
+
+        // The body maps.
+        let context = session(&[], Some(&body));
+        assert_eq!(first(&context, HEADER_HINT_OSL).as_deref(), Some("700"));
+        assert_eq!(first(&context, HEADER_HINT_PRIORITY).as_deref(), Some("-3"));
+
+        // The header wins; the body fills the other field.
+        let context = session(&[("x-dynamo-hint-osl", "100")], Some(&body));
+        assert_eq!(
+            context.agent_headers()[HEADER_HINT_OSL],
+            vec!["100".to_owned()]
+        );
+        assert_eq!(first(&context, HEADER_HINT_PRIORITY).as_deref(), Some("-3"));
+        let context = session(&[("x-dynamo-hint-priority", "5")], Some(&body));
+        assert_eq!(first(&context, HEADER_HINT_PRIORITY).as_deref(), Some("5"));
+        assert_eq!(first(&context, HEADER_HINT_OSL).as_deref(), Some("700"));
+
+        // A blank header counts as missing.
+        let context = session(&[("x-dynamo-hint-osl", " ")], Some(&body));
+        assert_eq!(
+            context.agent_headers()[HEADER_HINT_OSL],
+            vec!["700".to_owned()]
         );
     }
 

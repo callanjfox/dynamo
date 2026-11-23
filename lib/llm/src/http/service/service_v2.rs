@@ -1792,7 +1792,8 @@ impl HttpServiceConfigBuilder {
         }
         // A typed rate-limit refusal (for example from a request classifier) names its
         // Retry-After in the error details; send it as the header too.
-        inference_router = inference_router.layer(axum::middleware::map_response(retry_after_header));
+        inference_router =
+            inference_router.layer(axum::middleware::map_response(retry_after_header));
         inference_router = inference_router.layer(
             TraceLayer::new_for_http()
                 .make_span_with(make_inference_request_span)
@@ -4539,7 +4540,11 @@ async fn retry_after_header(response: Response<Body>) -> Response<Body> {
     };
     if let Some(seconds) = serde_json::from_slice::<serde_json::Value>(&bytes)
         .ok()
-        .and_then(|value| value.pointer("/details/retry_after_s").and_then(|v| v.as_u64()))
+        .and_then(|value| {
+            value
+                .pointer("/details/retry_after_s")
+                .and_then(|v| v.as_u64())
+        })
     {
         parts
             .headers
@@ -4565,7 +4570,9 @@ mod retry_after_tests {
         let body = r#"{"message":"Rate limit exceeded","type":"rate_limit_exceeded","code":429,"details":{"type":"rate_limit","limit":1,"remaining":0,"retry_after_s":30}}"#;
         let out = retry_after_header(json_response(429, body)).await;
         assert_eq!(out.headers().get(header::RETRY_AFTER).unwrap(), "30");
-        let bytes = axum::body::to_bytes(out.into_body(), 1 << 20).await.unwrap();
+        let bytes = axum::body::to_bytes(out.into_body(), 1 << 20)
+            .await
+            .unwrap();
         assert_eq!(bytes, body.as_bytes());
     }
 

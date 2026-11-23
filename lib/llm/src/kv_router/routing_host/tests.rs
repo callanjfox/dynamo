@@ -3225,6 +3225,47 @@ async fn classifier_uses_scheduler_token_basis() {
     runtime.shutdown();
 }
 
+/// f49p: records each `Completed`'s output tokens.
+struct OutputTokenClassifier {
+    completed: mpsc::UnboundedSender<Option<usize>>,
+}
+
+#[async_trait::async_trait]
+impl RequestClassifier for OutputTokenClassifier {
+    async fn on_event(&mut self, event: ClassifyEvent) {
+        if let ClassifyEvent::Completed { output_tokens, .. } = event {
+            self.completed.send(output_tokens).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn f49p_classifier_completed_counts_streamed_output_tokens() {
+    let (completed_tx, mut completed_rx) = mpsc::unbounded_channel();
+    let (router, runtime) = router_with_classifier(
+        OutputTokenClassifier {
+            completed: completed_tx,
+        },
+        None,
+    )
+    .await;
+    let (_request, _selection, mut guard) = track_request(&router).await;
+    guard.on_dispatched();
+    for token_ids in [vec![11, 12, 13], vec![], vec![14], vec![15, 16]] {
+        let output = LLMEngineOutput {
+            token_ids,
+            ..Default::default()
+        };
+        guard.on_item(&Annotated::from_data(output)).await;
+    }
+    assert!(completed_rx.try_recv().is_err());
+    guard.complete().await;
+    assert_eq!(completed_rx.recv().await, Some(Some(6)));
+
+    drop(router);
+    runtime.shutdown();
+}
+
 /// Build the guard for a selection a test drives by hand. Production routes get
 /// theirs through `dispatch_kv_plan`.
 async fn track_selection(

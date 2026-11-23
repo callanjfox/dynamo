@@ -794,13 +794,14 @@ impl RequestGuard {
         };
         lifecycle.responding();
         lifecycle.observe_output_tokens(new_tokens);
-        if let Some(total_tokens) = item
+        if let Some(usage) = item
             .data
             .as_ref()
             .and_then(|data| data.completion_usage.as_ref())
-            .map(|usage| usage.total_tokens as usize)
         {
-            lifecycle.observe_context_tokens(total_tokens);
+            lifecycle.observe_context_tokens(usage.total_tokens as usize);
+            // f49p: the engine's own output count floors the per-chunk count.
+            lifecycle.observe_completion_tokens(usage.completion_tokens as usize);
         }
     }
 

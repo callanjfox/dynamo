@@ -22,10 +22,11 @@ impl RoutingHost {
         let context_id = request.context().id().to_string();
         let staged_kv = StagedKv::for_request(request.content());
         let policy_class = request.metadata().get("policy-class").cloned();
+        // f49p: the body's hints fill the session context's missing hint headers.
         let session_context = request
             .agent_context
             .as_ref()
-            .map(to_worker_selection_session_context);
+            .map(|context| to_worker_selection_session_context(context, request.routing.as_ref()));
         let routing_parts = RoutingRequestParts::new(request);
         let request_context = request.context().clone();
         let selection_future = self

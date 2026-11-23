@@ -18,6 +18,13 @@ pub(crate) const HEADER_OPENCODE_PARENT_SESSION_ID: &str = "x-parent-session-id"
 pub const HEADER_DYNAMO_SESSION_ID: &str = "x-dynamo-session-id";
 pub(crate) const HEADER_DYNAMO_PARENT_SESSION_ID: &str = "x-dynamo-parent-session-id";
 pub(crate) const HEADER_DYNAMO_SESSION_FINAL: &str = "x-dynamo-session-final";
+/// f49p: client hints for the router plugins (`x-dynamo-hint-osl`, `-next-tokens`,
+/// `-next-think-s`, ...), captured verbatim into the agent headers.
+pub(crate) const HEADER_DYNAMO_HINT_PREFIX: &str = "x-dynamo-hint-";
+/// The tenant and user a request belongs to, which the router plugins read (the session
+/// scheduler's per-user and per-tenant accounting), captured verbatim into the agent headers.
+pub(crate) const HEADER_DYNAMO_TENANT: &str = "x-dynamo-tenant";
+pub(crate) const HEADER_DYNAMO_USER_ID: &str = "x-dynamo-user-id";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AgentHeaderMapping {
@@ -113,6 +120,7 @@ const MAX_AGENT_HEADER_BYTES: usize = 32 * 1024;
 fn is_agent_header(name: &str) -> bool {
     name.starts_with("x-claude-code-")
         || name.starts_with("x-codex-")
+        || name.starts_with(HEADER_DYNAMO_HINT_PREFIX)
         || matches!(
             name,
             "session-id"
@@ -121,6 +129,8 @@ fn is_agent_header(name: &str) -> bool {
                 | "x-openai-memgen-request"
                 | HEADER_OPENCODE_SESSION_ID
                 | HEADER_OPENCODE_PARENT_SESSION_ID
+                | HEADER_DYNAMO_TENANT
+                | HEADER_DYNAMO_USER_ID
         )
 }
 
@@ -332,5 +342,48 @@ mod tests {
             captured["x-codex-large"][0].len(),
             MAX_AGENT_HEADER_VALUE_BYTES
         );
+    }
+
+    #[test]
+    fn f49p_captures_dynamo_hint_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(HEADER_DYNAMO_SESSION_ID, "session".parse().unwrap());
+        headers.insert("x-dynamo-hint-osl", "512".parse().unwrap());
+        headers.insert("x-dynamo-hint-next-think-s", " 2.5 ".parse().unwrap());
+        headers.insert("x-dynamo-hintless", "no".parse().unwrap());
+        let mut sensitive = HeaderValue::from_static("private");
+        sensitive.set_sensitive(true);
+        headers.insert("x-dynamo-hint-secret", sensitive);
+
+        let context = agent_context_header_values(&headers).unwrap();
+        assert_eq!(context.session_id, "session");
+        assert_eq!(context.agent_headers["x-dynamo-hint-osl"], ["512"]);
+        assert_eq!(
+            context.agent_headers["x-dynamo-hint-next-think-s"],
+            [" 2.5 "]
+        );
+        assert!(!context.agent_headers.contains_key("x-dynamo-hintless"));
+        assert!(!context.agent_headers.contains_key("x-dynamo-hint-secret"));
+        assert!(!context.agent_headers.contains_key(HEADER_DYNAMO_SESSION_ID));
+        assert_eq!(context.agent_headers.len(), 2);
+    }
+
+    #[test]
+    fn captures_dynamo_tenant_and_user_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(HEADER_DYNAMO_SESSION_ID, "session".parse().unwrap());
+        headers.insert(HEADER_DYNAMO_TENANT, "acme".parse().unwrap());
+        headers.insert(HEADER_DYNAMO_USER_ID, "u000001".parse().unwrap());
+        headers.insert("x-dynamo-meta-policy-class", "priority".parse().unwrap());
+
+        let context = agent_context_header_values(&headers).unwrap();
+        assert_eq!(context.agent_headers[HEADER_DYNAMO_TENANT], ["acme"]);
+        assert_eq!(context.agent_headers[HEADER_DYNAMO_USER_ID], ["u000001"]);
+        assert!(
+            !context
+                .agent_headers
+                .contains_key("x-dynamo-meta-policy-class")
+        );
+        assert_eq!(context.agent_headers.len(), 2);
     }
 }

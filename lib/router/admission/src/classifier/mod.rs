@@ -359,8 +359,9 @@ pub enum ClassifyEvent {
         request_id: String,
         worker: WorkerWithDpRank,
         context_tokens: Option<usize>,
-        /// Output tokens the request produced, when the host knows them (offline replay does);
-        /// with the first-token time this gives the request's mean inter-token latency.
+        /// Output tokens the request produced, when the host knows them (offline replay does;
+        /// live, the router counts them from the response stream, f49p); with the first-token
+        /// time this gives the request's mean inter-token latency.
         output_tokens: Option<usize>,
     },
     Aborted {

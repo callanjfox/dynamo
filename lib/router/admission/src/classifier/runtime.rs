@@ -291,6 +291,7 @@ impl RequestClassifierRuntime {
             request_id: request_id.to_owned(),
             worker: None,
             context_tokens: None,
+            output_tokens: 0,
             progress_updater,
             phase: LifecyclePhase::Registered,
         })
@@ -389,6 +390,9 @@ pub struct RequestLifecycle {
     request_id: String,
     worker: Option<WorkerWithDpRank>,
     context_tokens: Option<usize>,
+    /// f49p: output tokens observed so far (per streamed chunk, floored by the engine's usage
+    /// report), over every attempt; sent on `Completed`.
+    output_tokens: usize,
     progress_updater: RequestProgressUpdater,
     phase: LifecyclePhase,
 }
@@ -445,6 +449,8 @@ impl RequestLifecycle {
         if self.phase == LifecyclePhase::Terminal {
             return;
         }
+        // f49p: the request's output count, sent on `Completed`.
+        self.output_tokens = self.output_tokens.saturating_add(output_tokens);
         let context_tokens = self
             .context_tokens
             .unwrap_or_default()
@@ -466,6 +472,15 @@ impl RequestLifecycle {
         self.progress_updater.update_context_tokens(context_tokens);
     }
 
+    /// Raise the output count to at least `completion_tokens` (an engine-reported count for
+    /// the current attempt, f49p). The context total is not touched.
+    pub fn observe_completion_tokens(&mut self, completion_tokens: usize) {
+        if self.phase == LifecyclePhase::Terminal {
+            return;
+        }
+        self.output_tokens = self.output_tokens.max(completion_tokens);
+    }
+
     pub fn prepare_retry(&mut self) {
         if self.phase != LifecyclePhase::Terminal {
             self.phase = LifecyclePhase::Registered;
@@ -482,13 +497,15 @@ impl RequestLifecycle {
         };
         self.phase = LifecyclePhase::Terminal;
         let context_tokens = self.context_tokens;
+        // f49p: the output tokens counted live; none counted reads as unknown, as before.
+        let output_tokens = (self.output_tokens > 0).then_some(self.output_tokens);
         self.runtime
             .finish_request_and_send(std::mem::take(&mut self.request_id), |request_id| {
                 ClassifyEvent::Completed {
                     request_id,
                     worker,
                     context_tokens,
-                    output_tokens: None,
+                    output_tokens,
                 }
             });
     }
@@ -1020,6 +1037,86 @@ mod tests {
             ))
         );
         assert!(event_rx.try_recv().is_err());
+    }
+
+    /// f49p: records each `Completed`'s context and output tokens.
+    struct OutputRecorder {
+        completed: mpsc::UnboundedSender<(Option<usize>, Option<usize>)>,
+    }
+
+    #[async_trait]
+    impl RequestClassifier for OutputRecorder {
+        async fn on_event(&mut self, event: ClassifyEvent) {
+            if let ClassifyEvent::Completed {
+                context_tokens,
+                output_tokens,
+                ..
+            } = event
+            {
+                let _ = self.completed.send((context_tokens, output_tokens));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn f49p_completed_carries_live_output_tokens() {
+        let (completed_tx, mut completed_rx) = mpsc::unbounded_channel();
+        let runtime = RequestClassifierRuntime::new(
+            Box::new(OutputRecorder {
+                completed: completed_tx,
+            }),
+            CancellationToken::new(),
+        );
+        let worker = WorkerWithDpRank::new(7, 2);
+        let begin = |id: &'static str| {
+            let runtime = Arc::clone(&runtime);
+            async move {
+                let lifecycle = runtime.begin_request(id).unwrap();
+                runtime
+                    .classify_with(ClassifyRequest::new(40, 0).with_request_id(id), &NoWorkers)
+                    .await
+                    .unwrap();
+                lifecycle
+            }
+        };
+
+        // Streamed chunks add up; the context carries the prompt plus the output.
+        let mut lifecycle = begin("request-1").await;
+        lifecycle.sent(worker);
+        lifecycle.observe_context_tokens(40);
+        lifecycle.observe_output_tokens(2);
+        lifecycle.observe_output_tokens(3);
+        lifecycle.complete();
+        assert_eq!(completed_rx.recv().await, Some((Some(45), Some(5))));
+
+        // The engine's usage report floors the count and never lowers it.
+        let mut lifecycle = begin("request-2").await;
+        lifecycle.sent(worker);
+        lifecycle.observe_output_tokens(1);
+        lifecycle.observe_completion_tokens(6);
+        lifecycle.observe_completion_tokens(3);
+        lifecycle.observe_output_tokens(1);
+        lifecycle.complete();
+        assert_eq!(completed_rx.recv().await, Some((Some(2), Some(7))));
+
+        // A retried request reports its output over every attempt.
+        let mut lifecycle = begin("request-3").await;
+        lifecycle.sent(worker);
+        lifecycle.observe_output_tokens(4);
+        lifecycle.prepare_retry();
+        lifecycle.sent(worker);
+        lifecycle.observe_output_tokens(3);
+        lifecycle.complete();
+        lifecycle.observe_output_tokens(100);
+        assert_eq!(completed_rx.recv().await, Some((Some(7), Some(7))));
+
+        // Nothing counted: unknown, as before.
+        let mut lifecycle = begin("request-4").await;
+        lifecycle.sent(worker);
+        lifecycle.observe_context_tokens(40);
+        lifecycle.complete();
+        assert_eq!(completed_rx.recv().await, Some((Some(40), None)));
+        assert!(completed_rx.try_recv().is_err());
     }
 
     #[tokio::test]
